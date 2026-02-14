@@ -381,6 +381,31 @@ def create_candlestick(df, s):
     fig.update_layout(title=f"{s} - Price Chart", height=450, xaxis_rangeslider_visible=False)
     return fig
 
+def create_volume_chart(df):
+    fig = go.Figure()
+    colors = ['red' if df['Close'].iloc[i] < df['Open'].iloc[i] else 'green' for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume', marker_color=colors))
+    fig.add_trace(go.Scatter(x=df.index, y=df['VSMA15'], mode='lines', line=dict(color='blue', width=2), name='Volume SMA 15'))
+    fig.update_layout(title="Volume Analysis", xaxis_title="Date/Time", yaxis_title="Volume", height=300)
+    return fig
+
+def create_macd_chart(df):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], mode='lines', line=dict(color='blue', width=2), name='MACD'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['MACDS'], mode='lines', line=dict(color='red', width=2), name='Signal'))
+    colors = ['green' if val > 0 else 'red' for val in df['Diff']]
+    fig.add_trace(go.Bar(x=df.index, y=df['Diff'], name='Histogram', marker_color=colors))
+    fig.update_layout(title="MACD Indicator", xaxis_title="Date/Time", yaxis_title="Value", height=300)
+    return fig
+
+def create_rsi_chart(df):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], mode='lines', line=dict(color='purple', width=2), name='RSI'))
+    fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
+    fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
+    fig.update_layout(title="RSI Indicator", xaxis_title="Date/Time", yaxis_title="RSI", yaxis_range=[0, 100], height=300)
+    return fig
+
 def main():
     try:
         st.markdown('<h1 class="main-header">📊 BIST Ultimate Analysis</h1>', unsafe_allow_html=True)
@@ -479,7 +504,22 @@ def main():
                         st.plotly_chart(create_gauge(vol1, "Volume 1"), use_container_width=True)
                 if ind2 >= 3 and vol2 > 0.7:
                     st.markdown('<div class="chosen-stock"><h3>⭐ CHOSEN STOCK! ⭐</h3></div>', unsafe_allow_html=True)
+                
+                st.subheader("📊 Price Chart")
                 st.plotly_chart(create_candlestick(df, stock), use_container_width=True)
+                
+                # Tabs for additional charts
+                tab1, tab2, tab3 = st.tabs(["📊 Volume", "📈 MACD", "📉 RSI"])
+                with tab1:
+                    st.plotly_chart(create_volume_chart(df), use_container_width=True)
+                with tab2:
+                    st.plotly_chart(create_macd_chart(df), use_container_width=True)
+                with tab3:
+                    st.plotly_chart(create_rsi_chart(df), use_container_width=True)
+                
+                # Raw data expander
+                with st.expander("📋 View Raw Data"):
+                    st.dataframe(df[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'MACD']].tail(100), use_container_width=True)
             else:
                 st.error(f"❌ No data available for {stock}")
         else:
