@@ -379,7 +379,12 @@ IMKB = [
     "METUR", "PKENT", "TEKTU", "ULAS", "CLEBI", "GSDDE", "GRSEL", "GZNMI", 
     "PGSUS", "PLTUR", "RYSAS", "LIDER", "TUREX", "THYAO", "TCELL", "TTKOM", 
     "DEVA", "ECILC", "GENIL", "MEDTR", "MPARK", "EGEPO", "ONCSM", "RTALB", 
-    "SELEC", "TNZTP", "TRILC", "ATLAS"
+    "SELEC", "TNZTP", "TRILC", "ATLAS", "LMKDC", "A1YEN", "ADGYO", "AGROT",
+    "AGYO", "AHSGY", "AKBNK", "AKFGY", "AKFIS", "AKHAN", "AKMGY", "AKSGY", 
+    "ALGYO", "ALKLC", "ALTNY", "ALVES", "ARFYE", "ARMGD", "ARTMS", "ASGYO",
+    "ATAGY", "ATATR", "ATEKS", "AVGYO", "AVPGY", "AYES", "BAHKM", "BALAT", 
+    "BALSU", "BASCM", "BEGYO", "BESLR", "BESTE", "BIGEN", "BIGTK", "BINBN", 
+    "BINHO", "BJKAS"," BLUME", "BORLS", "BORSK", "BULGS", "CATES", "CEMZY"
 ]
 IMKB = sorted(list(set(IMKB)))
 
@@ -414,7 +419,7 @@ BIST_100 = sorted([
     "MAGEN", "MPARK", "NETAS", "NTHOL", "NTGAZ", "OTKAR", "OYAKC",
     "OZKGY", "POLHO", "QUAGR", "SELEC", "SOKM", "SUNTK", "TATGD",
     "TMSN", "TRCAS", "TSKB", "TTKOM", "TTRAK", "TURSG", "ULKER",
-    "VAKBN", "VESBE", "VESTL", "YEOTK", "ZOREN",
+    "VAKBN", "VESBE", "VESTL", "YEOTK", "ZOREN", 
 ])
 
 # Index filter mapping
