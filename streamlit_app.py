@@ -13,16 +13,12 @@ import ta
 from datetime import date, datetime, timedelta
 import os
 import requests
-import urllib3
 try:
     from dotenv import load_dotenv
 except ImportError:
     def load_dotenv():
         pass
 from fon_analiz import display_funds_analysis
-
-# Suppress SSL warnings for isyatirim API
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(
     page_title="BIST Technical Analysis",
@@ -292,7 +288,12 @@ if 'sma50_breadth' not in st.session_state:
 FINANCIAL_STORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "financial_store.json")
 
 def _save_financial_store():
-    """Persist financial store to JSON file for cross-session use."""
+    """Persist financial store to JSON file for cross-session use.
+
+    Writes to a temp file and atomically renames it into place (os.replace)
+    so a crash or concurrent read mid-write can never leave a truncated/
+    corrupt financial_store.json behind.
+    """
     try:
         import json
         payload = {
@@ -302,8 +303,10 @@ def _save_financial_store():
         for symbol, raw_data in st.session_state.financial_store.items():
             # raw_data keys are ints (years), convert to strings for JSON
             payload["data"][symbol] = {str(y): v for y, v in raw_data.items()}
-        with open(FINANCIAL_STORE_FILE, 'w') as f:
+        tmp_path = FINANCIAL_STORE_FILE + ".tmp"
+        with open(tmp_path, 'w') as f:
             json.dump(payload, f)
+        os.replace(tmp_path, FINANCIAL_STORE_FILE)
     except Exception:
         pass  # Non-critical — store still works in session
 
@@ -425,7 +428,7 @@ BIST_100 = sorted([
     "SASA", "SISE", "TAVHL", "TCELL", "THYAO", "TKFEN", "TOASO",
     "TUPRS", "YKBNK",
     # Additional BIST 50 stocks
-    "AEFES", "AGESA", "AKFGY", "AKSA", "AKSEN", "ALFAS", "ASELSA",
+    "AEFES", "AGESA", "AKFGY", "AKSA", "AKSEN", "ALFAS", "ASELS",
     "BERA", "BRSAN", "CCOLA", "CIMSA", "DOAS", "DOHOL", "EGEEN",
     "ENJSA", "GESAN", "HALKB", "KORDS", "KONTR", "MAVI",
     # Additional BIST 100 stocks
@@ -516,6 +519,7 @@ def fetch_stock_data(symbol, start_date="2023-01-01", end_date=None, interval="1
     except:
         return None
 
+@st.cache_data(ttl=300, show_spinner=False)
 def calculate_all_indicators(df):
     if df is None or df.empty:
         return None
@@ -592,18 +596,21 @@ def calculate_original_scores(df):
 def calculate_simplified_scores(df):
     if df is None or df.empty:
         return 0, 0
-    latest = df.iloc[-1]
-    score = 0
-    if latest['RSI'] < 30: score += 1
-    elif latest['RSI'] > 70: score -= 1
-    if latest['MACD'] > latest['MACDS']: score += 1
-    else: score -= 1
-    if latest['Close'] > latest['SMA5'] > latest['SMA22']: score += 1
-    elif latest['Close'] < latest['SMA5'] < latest['SMA22']: score -= 1
-    score = max(0, min(5, score + 2.5))
-    vr = latest["Volume"] / latest["VSMA15"]
-    vs = 5 if vr > 2 else 4 if vr > 1.5 else 3 if vr > 1.2 else 2 if vr > 0.8 else 1
-    return round(score, 1), round(vs, 1)
+    try:
+        latest = df.iloc[-1]
+        score = 0
+        if latest['RSI'] < 30: score += 1
+        elif latest['RSI'] > 70: score -= 1
+        if latest['MACD'] > latest['MACDS']: score += 1
+        else: score -= 1
+        if latest['Close'] > latest['SMA5'] > latest['SMA22']: score += 1
+        elif latest['Close'] < latest['SMA5'] < latest['SMA22']: score -= 1
+        score = max(0, min(5, score + 2.5))
+        vr = latest["Volume"] / latest["VSMA15"]
+        vs = 5 if vr > 2 else 4 if vr > 1.5 else 3 if vr > 1.2 else 2 if vr > 0.8 else 1
+        return round(score, 1), round(vs, 1)
+    except Exception:
+        return 0, 0
 
 def screen_chosen_stocks(stock_list, interval="1d"):
     chosen = []
@@ -829,7 +836,7 @@ def fetch_balance_sheet(symbol, years=None):
         for attempt in range(2):
             try:
                 resp = requests.get(
-                    ISYATIRIM_API_URL, verify=False, params=params,
+                    ISYATIRIM_API_URL, params=params,
                     timeout=20,
                     headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
                 )
@@ -896,7 +903,7 @@ def _fetch_single_stock_financials(symbol, years=None):
         for attempt in range(2):
             try:
                 resp = requests.get(
-                    ISYATIRIM_API_URL, verify=False, params=params,
+                    ISYATIRIM_API_URL, params=params,
                     timeout=20,
                     headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
                 )
@@ -920,37 +927,39 @@ def _fetch_single_stock_financials(symbol, years=None):
     return all_data
 
 
-def import_all_financials(stock_list, sleep_between=1.5):
+def import_all_financials(stock_list, max_workers=5):
     """
-    Bulk import financials for all stocks. Stores in session_state.
+    Bulk import financials for all stocks (parallelized — each stock is an
+    independent İş Yatırım API call, so we fetch several concurrently instead
+    of one-by-one-with-sleep). Stores in session_state.
     Uses a progress bar. Returns (success_count, error_list).
     """
-    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     errors = []
     success = 0
     total = len(stock_list)
-    
+
     prog = st.progress(0)
     status = st.empty()
-    
-    for i, symbol in enumerate(stock_list):
-        status.text(f"📥 Importing {symbol}... ({i+1}/{total})")
-        prog.progress((i + 1) / total)
-        
-        try:
-            raw_data = _fetch_single_stock_financials(symbol)
-            if raw_data:
-                st.session_state.financial_store[symbol] = raw_data
-                success += 1
-            else:
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_fetch_single_stock_financials, symbol): symbol for symbol in stock_list}
+        for fut in as_completed(futures):
+            symbol = futures[fut]
+            done += 1
+            status.text(f"📥 Importing {symbol}... ({done}/{total})")
+            prog.progress(done / total)
+            try:
+                raw_data = fut.result()
+                if raw_data:
+                    st.session_state.financial_store[symbol] = raw_data
+                    success += 1
+                else:
+                    errors.append(symbol)
+            except Exception:
                 errors.append(symbol)
-        except Exception:
-            errors.append(symbol)
-        
-        # Gentle delay to avoid rate-limiting
-        if i < total - 1:
-            time.sleep(sleep_between)
-    
+
     prog.empty()
     status.empty()
     
@@ -990,7 +999,7 @@ def fetch_valuation_data(symbol):
     url = "https://www.isyatirim.com.tr/_layouts/15/IsYatirim.Website/Common/Data.aspx/OneEndeks498498"
     params = {"companyCode": symbol, "exchange": "TRY", "dataType": "2"}
     try:
-        resp = requests.get(url, verify=False, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             if "value" in data and data["value"]:
@@ -1009,7 +1018,7 @@ def fetch_valuation_data(symbol):
     url2 = "https://www.isyatirim.com.tr/_layouts/15/IsYatirim.Website/Common/Data.aspx/HisseTekil"
     params2 = {"hession": f"{symbol}.E.BIST"}
     try:
-        resp2 = requests.get(url2, verify=False, params=params2, timeout=15)
+        resp2 = requests.get(url2, params=params2, timeout=15)
         if resp2.status_code == 200:
             return resp2.json()
     except Exception:
@@ -3772,7 +3781,7 @@ def main():
             # Import scope selection
             import_scope = st.selectbox(
                 "Import scope",
-                ["🏦 BIST 30 (~1 min)", "📊 BIST 100 (~3 min)", "📈 All Stocks (~15 min)"],
+                ["🏦 BIST 30 (~1-2 min)", "📊 BIST 100 (~3-5 min)", "📈 All Stocks (~15-20 min)"],
                 key="import_scope"
             )
             
@@ -3784,7 +3793,7 @@ def main():
                 else:
                     target_list = IMKB
                 
-                success, errors = import_all_financials(target_list, sleep_between=1.0)
+                success, errors = import_all_financials(target_list)
                 _save_financial_store()
                 st.success(f"✅ Imported {success}/{len(target_list)} stocks!")
                 if errors:
