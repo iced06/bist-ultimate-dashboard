@@ -594,20 +594,54 @@ def calculate_original_scores(df):
         return 0, 0
 
 def calculate_simplified_scores(df):
+    """
+    Basit Trend/Momentum skoru (Indicator 1) — Indicator 2 (orijinal,
+    resmi screener skoru) ile ayni "taze sinyal" felsefesini paylasacak
+    sekilde yeniden yazildi. Onceki versiyondan farklar:
+
+    - RSI: statik "RSI < 30" esigi yerine Indicator 2'nin de kullandigi
+      Buy_RSIS bayragini (asiri satimdan 30'un ustune YENI donus) kullanir.
+      Boylece RSI de "az once oldu mu" sorusuna cevap verir - eskiden
+      RSI mean-reversion (statik durum), MACD/SMA trend-takip (yine statik
+      durum) mantigiyla calisip birbirini iptal edebiliyordu; artik ucu de
+      "yeni sinyal" felsefesinde.
+    - MACD: statik "MACD > MACDS" durumu yerine Buy_MACDS crossover
+      bayragini + fiyata oranli buyuklugu kullanir - hem "az once cross
+      oldu mu" hem "ne kadar guclu" bilgisi skora yansir.
+    - SMA: SMA5/22 ikilisine ek olarak SMA50 (orta vade) eklendi -
+      Indicator 2'nin SMA50S bayragiyla tutarli.
+
+    Not: bu hala backtest edilmemis bir sezgisel (heuristic) skor -
+    esikler/agirliklar TA folkloruna dayanir, BIST icin ampirik olarak
+    dogrulanmamistir (bkz. Faz 4 ML plani).
+    """
     if df is None or df.empty:
         return 0, 0
     try:
         latest = df.iloc[-1]
-        score = 0
-        if latest['RSI'] < 30: score += 1
-        elif latest['RSI'] > 70: score -= 1
-        if latest['MACD'] > latest['MACDS']: score += 1
-        else: score -= 1
-        if latest['Close'] > latest['SMA5'] > latest['SMA22']: score += 1
-        elif latest['Close'] < latest['SMA5'] < latest['SMA22']: score -= 1
-        score = max(0, min(5, score + 2.5))
+
+        # RSI: -1..+1 - taze "asiri satimdan donus" +1, asiri alim -1, notr 0
+        rsi_component = 1 if latest.get('Buy_RSIS', 0) == 1 else (-1 if latest['RSI'] > 70 else 0)
+
+        # MACD: yon (isaret) + fiyata oranli buyukluk, [-1, 1] araligina sikistirilmis
+        # (~%0.5'lik bir MACD-sinyal farki tam +-1'e ulasir; hisse fiyatindan
+        # bagimsiz karsilastirilabilir olsun diye Close'a oranlaniyor)
+        macd_diff_pct = (latest['MACD'] - latest['MACDS']) / latest['Close'] if latest['Close'] else 0
+        macd_component = max(-1, min(1, macd_diff_pct * 200))
+        if latest.get('Buy_MACDS', 0) == 1:
+            macd_component = max(macd_component, 0.5)  # taze cross en az orta-guclu sayilir
+
+        # SMA: 5/22/50 uc katmanli hizalama, esit agirlikli +-1/3
+        sma_component = sum(
+            (1 if latest['Close'] > latest[sma] else -1) / 3
+            for sma in ['SMA5', 'SMA22', 'SMA50']
+        )
+
+        raw = rsi_component + macd_component + sma_component  # -3..+3 araliginda (oncekiyle ayni olcek)
+        score = max(0, min(5, raw + 2.5))
+
         vr = latest["Volume"] / latest["VSMA15"]
-        vs = 5 if vr > 2 else 4 if vr > 1.5 else 3 if vr > 1.2 else 2 if vr > 0.8 else 1
+        vs = max(0, min(5, round(vr * 2.5, 1)))  # Volume 2'nin ham oranina paralel, surekli olcek
         return round(score, 1), round(vs, 1)
     except Exception:
         return 0, 0
