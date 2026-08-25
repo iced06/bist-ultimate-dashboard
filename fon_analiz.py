@@ -12,8 +12,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import plotly.graph_objects as go
-import psycopg2
 import streamlit as st
+
+try:
+    import psycopg2
+except ImportError:
+    # Ortamda psycopg2-binary kurulamamis olabilir (bazi Streamlit Cloud
+    # build'lerinde gorulen bilinen bir sorun). Bu durumda modul YINE DE
+    # import edilebilmeli - Funds sekmesi "veritabani yok" mesaji gosterir,
+    # geri kalan uygulama (Single Stock, Screener, vb.) etkilenmez.
+    psycopg2 = None
 
 try:
     import borsapy as bp
@@ -36,6 +44,8 @@ def _get_database_url():
 
 
 def _make_connection():
+    if psycopg2 is None:
+        return None
     dsn = _get_database_url()
     if not dsn:
         return None

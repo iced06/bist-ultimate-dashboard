@@ -18,7 +18,18 @@ try:
 except ImportError:
     def load_dotenv():
         pass
-from fon_analiz import display_funds_analysis, get_latest_fund_flow_map
+try:
+    from fon_analiz import display_funds_analysis, get_latest_fund_flow_map
+except Exception as _fon_analiz_import_error:
+    # fon_analiz.py veritabani baglantisi gerektiriyor (psycopg2) - bu paket
+    # bazi ortamlarda kurulamayabiliyor. Boyle bir durumda TUM uygulamayi
+    # cokertmek yerine sadece Funds sekmesini devre disi birakiyoruz.
+    def display_funds_analysis():
+        st.error("💰 Funds özelliği yüklenemedi (fon_analiz.py import hatası).")
+        st.code(str(_fon_analiz_import_error))
+
+    def get_latest_fund_flow_map(*args, **kwargs):
+        return {}
 
 st.set_page_config(
     page_title="BIST Technical Analysis",
