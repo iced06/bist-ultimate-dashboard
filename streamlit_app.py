@@ -19,6 +19,7 @@ try:
 except ImportError:
     def load_dotenv():
         pass
+from fon_analiz import display_funds_analysis
 
 # Suppress SSL warnings for isyatirim API
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -3638,7 +3639,7 @@ def main():
         
         with st.sidebar:
             st.header("⚙️ Settings")
-            mode = st.radio("Mode", ["📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "🌍 Macro Analysis"])
+            mode = st.radio("Mode", ["📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "🌍 Macro Analysis", "💰 Funds"])
             st.markdown("---")
             st.subheader("⏱️ Timeframe")
             available_tf = {k: v for k, v in TIMEFRAMES.items() if not v["auth_required"] or auth}
@@ -4407,6 +4408,12 @@ def main():
             except Exception as e:
                 st.error(f"Macro analysis error: {str(e)}")
                 st.info("Some data sources may be temporarily unavailable. Try refreshing the page.")
+        elif mode == "💰 Funds":
+            try:
+                display_funds_analysis()
+            except Exception as e:
+                st.error(f"Funds analysis error: {str(e)}")
+                st.info("Database connection may be temporarily unavailable.")
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
         st.info("Please refresh the page and try again.")
