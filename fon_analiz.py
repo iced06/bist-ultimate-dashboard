@@ -80,6 +80,37 @@ def _get_available_periods():
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def get_latest_fund_flow_map(uyruk='TC'):
+    """
+    En son donem icin ticker -> net fon alim/satimi (TL) sozlugu.
+    streamlit_app.py'daki Screener'in "Fon Net Alımı" kolonu icin -
+    tek seferde toplu cekilir, hisse basina ayri sorgu atilmaz.
+    Fon verisi olmayan hisseler sozlukte hic yer almaz (None donduruyor gibi
+    davranilmali - caller .get(ticker) ile kontrol etmeli).
+    """
+    conn = _get_live_connection()
+    if conn is None:
+        return {}
+    df = pd.read_sql("""
+        SELECT s.ticker, f.net_gercek_alim_satim_tl, f.net_fon_akisi_tl
+        FROM stock_fund_flow_monthly f
+        JOIN securities s ON s.id = f.security_id
+        WHERE s.uyruk = %(uyruk)s
+          AND (f.yil, f.ay) = (SELECT yil, ay FROM fund_holdings ORDER BY yil DESC, ay DESC LIMIT 1)
+    """, conn, params={"uyruk": uyruk})
+    if df.empty:
+        return {}
+    df['net_gercek_alim_satim_tl'] = df['net_gercek_alim_satim_tl'].astype(float)
+    df['net_fon_akisi_tl'] = df['net_fon_akisi_tl'].astype(float)
+    result = {}
+    for _, r in df.iterrows():
+        val = r['net_gercek_alim_satim_tl'] if pd.notna(r['net_gercek_alim_satim_tl']) else r['net_fon_akisi_tl']
+        if pd.notna(val):
+            result[r['ticker']] = val
+    return result
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def _get_flow_ranking(yil, ay):
     conn = _get_live_connection()
     if conn is None:

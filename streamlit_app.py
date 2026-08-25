@@ -18,7 +18,7 @@ try:
 except ImportError:
     def load_dotenv():
         pass
-from fon_analiz import display_funds_analysis
+from fon_analiz import display_funds_analysis, get_latest_fund_flow_map
 
 st.set_page_config(
     page_title="BIST Technical Analysis",
@@ -652,6 +652,9 @@ def screen_chosen_stocks(stock_list, interval="1d"):
     stat = st.empty()
     days = TIMEFRAMES[interval]["days"]
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    # Tek seferde cekilir (hisse basina ayri DB sorgusu atmamak icin) -
+    # fon verisi olmayan hisseler icin bos sozluk donebilir, sorun degil.
+    fund_flow_map = get_latest_fund_flow_map()
     for i, s in enumerate(stock_list):
         stat.text(f"Screening {s}... ({i+1}/{len(stock_list)})")
         prog.progress((i + 1) / len(stock_list))
@@ -674,6 +677,7 @@ def screen_chosen_stocks(stock_list, interval="1d"):
                         'RSI': round(rsi, 1) if rsi and pd.notna(rsi) else None,
                         'indicator_score_2': round(ind, 2),
                         'volume_score_2': round(vol, 2),
+                        'Fon Net Alımı': fund_flow_map.get(s),
                     }
                     
                     # Add valuations if financial data available
@@ -4095,12 +4099,29 @@ def main():
                 with sc3:
                     has_pe = df_c['P/E'].notna().sum()
                     st.metric("With Financials", f"{has_pe}/{len(df_c)}")
+
+                if 'Fon Net Alımı' in df_c.columns:
+                    st.caption("💰 **Fon Net Alımı**: son ay için takip edilen fonların o hissede aldığı/sattığı "
+                               "net TL tutarı (bkz. 💰 Funds sekmesi). Boş (—) satırlar 'fon almadı' değil, "
+                               "'sadece takip edilen fonların hiçbiri bu hisseyi tutmuyor' demektir.")
                 
                 # Format display columns
                 display_cols = ['symbol', 'price', 'chg%', 'RSI', 'indicator_score_2', 'volume_score_2',
+                               'Fon Net Alımı',
                                'P/E', 'PD/DD', 'EV/EBITDA', 'Fwd P/E', 'Fwd PD/DD', 'Fwd EV/EBITDA', 'P/E Δ', 'EV/EBITDA Δ']
                 available_display = [c for c in display_cols if c in df_c.columns]
-                
+
+                def _fmt_fund_flow(v):
+                    if v is None or pd.isna(v):
+                        return '—'
+                    sign = '+' if v > 0 else ''
+                    a = abs(v)
+                    if a >= 1e9:
+                        return f"{sign}{v/1e9:.2f} Mr"
+                    if a >= 1e6:
+                        return f"{sign}{v/1e6:.1f} Mn"
+                    return f"{sign}{v:,.0f}"
+
                 st.dataframe(
                     df_c[available_display].style.format({
                         'price': '₺{:.2f}',
@@ -4108,6 +4129,7 @@ def main():
                         'RSI': '{:.1f}',
                         'indicator_score_2': '{:.1f}',
                         'volume_score_2': '{:.2f}',
+                        'Fon Net Alımı': _fmt_fund_flow,
                         'P/E': '{:.1f}x',
                         'PD/DD': '{:.2f}x',
                         'EV/EBITDA': '{:.1f}x',
