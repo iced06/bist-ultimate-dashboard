@@ -84,7 +84,7 @@ def upsert_securities(cur, keys, names_by_key):
         VALUES %s
         ON CONFLICT (ticker, uyruk) DO UPDATE
             SET ad = COALESCE(securities.ad, EXCLUDED.ad)
-    """, rows)
+    """, rows, page_size=1000)
 
     cur.execute("SELECT id, ticker, uyruk FROM securities")
     return {(ticker, uyruk): sid for sid, ticker, uyruk in cur.fetchall()}
@@ -111,27 +111,40 @@ def upsert_funds(cur, fonlar_df):
             kurucu_kurum = EXCLUDED.kurucu_kurum,
             pazar = EXCLUDED.pazar,
             sub_category = EXCLUDED.sub_category
-    """, rows)
+    """, rows, page_size=1000)
     return len(rows)
 
 
 def upsert_fund_aum(cur, fonlar_df):
-    rows = []
+    """
+    NOT: "Fonlar" sayfasinda ayni (Kodu, Yil, Ay) icin BIRDEN FAZLA, birbiriyle
+    CELISEN Hacim degeri tasiyan satirlar var (pilotta HKM/PPB/GSP fonlarinda
+    goruldu - muhtemelen Excel'e iki farkli veri cekiminin birlesmesinden
+    kalma). Hangisinin dogru oldugu Excel'den anlasilamiyor; bu fonksiyon
+    SON GORULEN degeri kullanir ve celismeleri skipped_no_kodu/dupes olarak
+    caller'a bildirir - sessizce seçim yapip unutmak yerine.
+    """
+    skipped_no_kodu = int(fonlar_df['Kodu'].isna().sum())
+
+    by_key = {}
+    dupes = {}
     for _, r in fonlar_df.iterrows():
         if pd.isna(r['Kodu']) or pd.isna(r['Yıl']) or pd.isna(r['Ay']):
             continue
-        rows.append((
-            str(r['Kodu']).strip(), int(r['Yıl']), int(r['Ay']),
-            float(r['Hacim']) if pd.notna(r['Hacim']) else None,
-            'EXCEL_MANUEL',
-        ))
+        key = (str(r['Kodu']).strip(), int(r['Yıl']), int(r['Ay']))
+        val = float(r['Hacim']) if pd.notna(r['Hacim']) else None
+        if key in by_key and by_key[key] != val:
+            dupes.setdefault(key, [by_key[key]]).append(val)
+        by_key[key] = val  # son gorulen deger kazanir (bkz. fonksiyon docstring'i)
+
+    rows = [(k[0], k[1], k[2], v, 'EXCEL_MANUEL') for k, v in by_key.items()]
     execute_values(cur, """
         INSERT INTO fund_aum_monthly (fon_kodu, yil, ay, fon_toplam_degeri, kaynak)
         VALUES %s
         ON CONFLICT (fon_kodu, yil, ay) DO UPDATE SET
             fon_toplam_degeri = EXCLUDED.fon_toplam_degeri
-    """, rows)
-    return len(rows)
+    """, rows, page_size=1000)
+    return len(rows), skipped_no_kodu, dupes
 
 
 def _shift_year(yil, ay_n, ay_other):
@@ -189,7 +202,7 @@ def upsert_fund_holdings(cur, snapshots, sec_cache):
         ON CONFLICT (fon_kodu, yil, ay, security_id) DO UPDATE SET
             toplam_tutar_tl = EXCLUDED.toplam_tutar_tl,
             agirlik_pct = EXCLUDED.agirlik_pct
-    """, rows)
+    """, rows, page_size=1000)
     return len(rows), unresolved
 
 
@@ -215,7 +228,7 @@ def upsert_model_portfolio(cur, mp_df, sec_cache):
             guncel_fiyat = EXCLUDED.guncel_fiyat,
             hedef_fiyat = EXCLUDED.hedef_fiyat,
             potansiyel_pct = EXCLUDED.potansiyel_pct
-    """, rows)
+    """, rows, page_size=1000)
     return len(rows)
 
 
@@ -243,6 +256,10 @@ def main():
     try:
         with conn:
             with conn.cursor() as cur:
+                # medconcept-dashboard ile ayni Neon veritabani paylasiliyor;
+                # BIST tablolari karismasin diye ayri "bist" semasinda tutuluyor.
+                cur.execute("CREATE SCHEMA IF NOT EXISTS bist; SET search_path TO bist, public;")
+
                 if args.create_schema:
                     print("Sema olusturuluyor...")
                     with open(args.schema_file, encoding='utf-8') as f:
@@ -265,8 +282,15 @@ def main():
                 print(f"  -> {n_funds} fon")
 
                 print("Fon AUM (aylik buyukluk) upsert ediliyor...")
-                n_aum = upsert_fund_aum(cur, sheets['Fonlar'])
-                print(f"  -> {n_aum} fon-ay AUM satiri")
+                n_aum, skipped_no_kodu, aum_dupes = upsert_fund_aum(cur, sheets['Fonlar'])
+                print(f"  -> {n_aum} fon-ay AUM satiri, {skipped_no_kodu} satir atlandi (Kodu bos)")
+                if aum_dupes:
+                    print(f"  UYARI: {len(aum_dupes)} (fon,yil,ay) icin celisen Hacim degeri vardi, son gorulen deger kullanildi: {aum_dupes}")
+                    log_etl_run(cur, 'EXCEL_MANUEL', 'UYUMSUZLUK',
+                                f"Fonlar sayfasinda celisen Hacim degerleri: {aum_dupes}")
+                if skipped_no_kodu:
+                    log_etl_run(cur, 'EXCEL_MANUEL', 'UYUMSUZLUK',
+                                f"Fonlar sayfasinda Kodu bos olan {skipped_no_kodu} satir atlandi")
 
                 print("Fon-hisse dagilimi cikariliyor (n-1/n unpivot + dedup)...")
                 snapshots, skipped = extract_holding_snapshots(sheets['Fon-Hisse Dağılımı'])

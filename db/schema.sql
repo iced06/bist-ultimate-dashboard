@@ -1,8 +1,15 @@
 -- ============================================================
 -- BIST Ultimate Dashboard — Faz 1 Şema Tasarımı
--- Hedef: Neon (Postgres 15+)
+-- Hedef: Neon (Postgres 15+) — medconcept-dashboard ile PAYLAŞILAN sunucu
 -- Excel kaynağı: "fonlar (version 3).xlsx"
+--
+-- Bu veritabanı sunucusu medconcept-dashboard ile paylaşılıyor (18 tablo,
+-- public şemasında). Karışmasınlar diye BIST tablolarını ayrı bir "bist"
+-- şemasında tutuyoruz. search_path'i ayarladıktan sonra asagidaki
+-- CREATE TABLE/VIEW ifadeleri otomatik olarak bist şemasına düşer.
 -- ============================================================
+CREATE SCHEMA IF NOT EXISTS bist;
+SET search_path TO bist, public;
 
 -- 1) Menkul kıymetler (hisse/tahvil/fon) — surrogate id ile
 --    NEDEN ISIN DEĞİL SURROGATE ID? İlk tasarımda isin'i PK yapmıştım ama
