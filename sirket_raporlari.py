@@ -22,6 +22,7 @@ indirme/özetleme mantığı kaynaktan bağımsızdır.
 import json
 import os
 import re
+import time
 
 import pandas as pd
 import requests
@@ -239,6 +240,33 @@ def _parse_llm_json(raw_text):
         return json.loads(cleaned)
 
 
+def _call_gemini_with_retry(client, prompt, max_attempts=3):
+    """Gemini API bazen gecici olarak asiri yuklu oluyor (503 UNAVAILABLE,
+    canli hatada gozlemlendi) veya rate-limit'e takiliyor (429). Ikisi de
+    gecici - kisa bir bekleme ile tekrar denemek genelde yeterli. Diger
+    hatalar (400 gecersiz istek, 404 model bulunamadi vb.) tekrar denemeden
+    direkt yukari firlatilir - onlar tekrar denense de duzelmez."""
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    max_output_tokens=8000,  # ~900 kelimelik analiz + JSON overhead icin
+                    temperature=0.3,
+                    response_mime_type="application/json",
+                ),
+            )
+        except genai.errors.APIError as e:
+            last_error = e
+            if e.code in (503, 429) and attempt < max_attempts - 1:
+                time.sleep(3 * (attempt + 1))  # 3s, 6s
+                continue
+            raise
+    raise last_error
+
+
 def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
     if genai is None:
         raise RuntimeError("google-genai paketi kurulu değil (requirements.txt'e eklenmeli).")
@@ -269,15 +297,7 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
         prior_context=prior_context,
         report_text=truncated,
     )
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(
-            max_output_tokens=8000,  # ~900 kelimelik detayli analiz + JSON overhead icin (2500 yetersizdi - JSON yarida kesiliyordu)
-            temperature=0.3,
-            response_mime_type="application/json",
-        ),
-    )
+    response = _call_gemini_with_retry(client, prompt)
     raw = response.text
 
     try:
