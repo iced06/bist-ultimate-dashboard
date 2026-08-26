@@ -249,8 +249,10 @@ def _bar_chart(df, x_col, y_col, colors, title):
     return fig
 
 
-def _render_top_buys_sells(yil, ay):
+def _render_top_buys_sells(yil, ay, uyruk_filter=None):
     df = _get_flow_ranking(yil, ay)
+    if uyruk_filter:
+        df = df[df['uyruk'] == uyruk_filter]
     if df.empty:
         st.info("Bu dönem için veri bulunamadı.")
         return
@@ -359,8 +361,10 @@ def _render_market_impact(yil, ay):
                      use_container_width=True, hide_index=True)
 
 
-def _render_stock_drilldown():
+def _render_stock_drilldown(uyruk_filter=None):
     stocks = _get_stock_list()
+    if uyruk_filter:
+        stocks = stocks[stocks['uyruk'] == uyruk_filter]
     if stocks.empty:
         st.info("Fon verisi bulunan hisse yok.")
         return
@@ -421,7 +425,13 @@ def display_funds_analysis():
         st.warning("Henüz fon verisi yüklenmemiş.")
         return
 
-    yil, ay = _period_selector(periods, key="main_period")
+    pc1, pc2 = st.columns([2, 1])
+    with pc1:
+        yil, ay = _period_selector(periods, key="main_period")
+    with pc2:
+        scope_label = st.radio("Kapsam", ["🌍 Tümü", "🇹🇷 Yerli (TR)", "🌎 Yabancı (FOR)"],
+                                horizontal=True, key="uyruk_filter")
+    uyruk_filter = {"🌍 Tümü": None, "🇹🇷 Yerli (TR)": "TC", "🌎 Yabancı (FOR)": "FOR"}[scope_label]
 
     tab1, tab2, tab3 = st.tabs([
         "📈 En Çok Alınan / Satılan",
@@ -429,8 +439,12 @@ def display_funds_analysis():
         "🔍 Hisse Bazlı Fon Takibi",
     ])
     with tab1:
-        _render_top_buys_sells(yil, ay)
+        _render_top_buys_sells(yil, ay, uyruk_filter)
     with tab2:
-        _render_market_impact(yil, ay)
+        if uyruk_filter == 'FOR':
+            st.info("Piyasa değeri sadece BIST (yerli) hisseleri için hesaplanabiliyor "
+                    "(borsapy kaynaklı) — 'Yabancı (FOR)' kapsamında gösterilecek bir şey yok.")
+        else:
+            _render_market_impact(yil, ay)
     with tab3:
-        _render_stock_drilldown()
+        _render_stock_drilldown(uyruk_filter)

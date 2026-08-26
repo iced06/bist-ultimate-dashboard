@@ -11,6 +11,7 @@ import borsapy as bp
 from ta.volatility import BollingerBands
 import ta
 from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import requests
 try:
@@ -30,6 +31,13 @@ except Exception as _fon_analiz_import_error:
 
     def get_latest_fund_flow_map(*args, **kwargs):
         return {}
+
+try:
+    from sirket_raporlari import display_company_reports
+except Exception as _sirket_raporlari_import_error:
+    def display_company_reports():
+        st.error("📄 Şirket Raporları özelliği yüklenemedi (sirket_raporlari.py import hatası).")
+        st.code(str(_sirket_raporlari_import_error))
 
 st.set_page_config(
     page_title="BIST Technical Analysis",
@@ -657,8 +665,59 @@ def calculate_simplified_scores(df):
     except Exception:
         return 0, 0
 
-def screen_chosen_stocks(stock_list, interval="1d"):
-    chosen = []
+def _screen_one_stock(s, start_date, interval, fund_flow_map):
+    """Tek hisse icin fetch+indikator+skor hesabi - screen_chosen_stocks'un
+    ThreadPoolExecutor ile paralel calistirdigi is birimi."""
+    try:
+        df = fetch_stock_data(s, start_date=start_date, interval=interval)
+        if df is None or df.empty:
+            return None
+        df = calculate_all_indicators(df)
+        ind, vol = calculate_original_scores(df)
+        if not (ind >= 3 and vol > 0.7):
+            return None
+        latest = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) > 1 else latest
+        price = latest['Close']
+        price_chg = ((price - prev['Close']) / prev['Close']) * 100 if len(df) > 1 else 0
+        rsi = latest.get('RSI', None)
+
+        row = {
+            'symbol': s,
+            'price': round(price, 2),
+            'chg%': round(price_chg, 2),
+            'RSI': round(rsi, 1) if rsi and pd.notna(rsi) else None,
+            'indicator_score_2': round(ind, 2),
+            'volume_score_2': round(vol, 2),
+            'Fon Net Alımı': fund_flow_map.get(s),
+        }
+
+        vals = compute_stock_valuations(s, price)
+        row['P/E'] = vals.get('pe')
+        row['PD/DD'] = vals.get('pb')
+        row['EV/EBITDA'] = vals.get('ev_ebitda')
+        row['Fwd P/E'] = vals.get('fwd_pe')
+        row['Fwd PD/DD'] = vals.get('fwd_pb')
+        row['Fwd EV/EBITDA'] = vals.get('fwd_ev_ebitda')
+        row['P/E Δ'] = vals.get('pe_delta')
+        row['EV/EBITDA Δ'] = vals.get('ev_ebitda_delta')
+        return row
+    except Exception:
+        return None
+
+
+def screen_chosen_stocks(stock_list, interval="1d", max_workers=8):
+    """
+    Onceki versiyon 600+ hisseyi tek tek, sirayla taryordu (~1 istek/hisse,
+    her biri agdan fiyat verisi cekiyor). ThreadPoolExecutor ile paralel
+    hale getirildi - fetch_stock_data zaten @st.cache_data ile cache'li
+    oldugu icin ayni sembol tekrar taranirsa aninda doner, ama ilk taramada
+    (cache miss) asil kazanc burada.
+
+    max_workers=8 bilincli olarak orta seviyede tutuldu - Funds sekmesinde
+    (borsapy/TradingView) yuksek eszamanlilikta 429 (rate limit) gorulmustu;
+    ayni riski burada da minimize etmek icin.
+    """
     prog = st.progress(0)
     stat = st.empty()
     days = TIMEFRAMES[interval]["days"]
@@ -666,51 +725,58 @@ def screen_chosen_stocks(stock_list, interval="1d"):
     # Tek seferde cekilir (hisse basina ayri DB sorgusu atmamak icin) -
     # fon verisi olmayan hisseler icin bos sozluk donebilir, sorun degil.
     fund_flow_map = get_latest_fund_flow_map()
-    for i, s in enumerate(stock_list):
-        stat.text(f"Screening {s}... ({i+1}/{len(stock_list)})")
-        prog.progress((i + 1) / len(stock_list))
-        try:
-            df = fetch_stock_data(s, start_date=start_date, interval=interval)
-            if df is not None and not df.empty:
-                df = calculate_all_indicators(df)
-                ind, vol = calculate_original_scores(df)
-                if ind >= 3 and vol > 0.7:
-                    latest = df.iloc[-1]
-                    prev = df.iloc[-2] if len(df) > 1 else latest
-                    price = latest['Close']
-                    price_chg = ((price - prev['Close']) / prev['Close']) * 100 if len(df) > 1 else 0
-                    rsi = latest.get('RSI', None)
-                    
-                    row = {
-                        'symbol': s,
-                        'price': round(price, 2),
-                        'chg%': round(price_chg, 2),
-                        'RSI': round(rsi, 1) if rsi and pd.notna(rsi) else None,
-                        'indicator_score_2': round(ind, 2),
-                        'volume_score_2': round(vol, 2),
-                        'Fon Net Alımı': fund_flow_map.get(s),
-                    }
-                    
-                    # Add valuations if financial data available
-                    vals = compute_stock_valuations(s, price)
-                    row['P/E'] = vals.get('pe')
-                    row['PD/DD'] = vals.get('pb')
-                    row['EV/EBITDA'] = vals.get('ev_ebitda')
-                    row['Fwd P/E'] = vals.get('fwd_pe')
-                    row['Fwd PD/DD'] = vals.get('fwd_pb')
-                    row['Fwd EV/EBITDA'] = vals.get('fwd_ev_ebitda')
-                    row['P/E Δ'] = vals.get('pe_delta')
-                    row['EV/EBITDA Δ'] = vals.get('ev_ebitda_delta')
-                    
-                    chosen.append(row)
-        except:
-            continue
+
+    chosen = []
+    total = len(stock_list)
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_screen_one_stock, s, start_date, interval, fund_flow_map): s
+                   for s in stock_list}
+        for fut in as_completed(futures):
+            s = futures[fut]
+            done += 1
+            stat.text(f"Screening {s}... ({done}/{total})")
+            prog.progress(done / total)
+            row = fut.result()
+            if row:
+                chosen.append(row)
+
     prog.empty()
     stat.empty()
     return chosen
 
-def scan_market_summary(stock_list, interval="1d"):
-    """Scan all stocks and return sentiment distribution + SMA50 stats."""
+def _scan_one_stock_summary(s, start_date, interval):
+    """Tek hisse icin sentiment + SMA50 durumu - scan_market_summary'nin
+    paralel calistirdigi is birimi. Sonucu (sembol, sentiment, sma50_durum)
+    olarak doner, paylasilan listelere sadece ana thread'de eklenir."""
+    try:
+        df = fetch_stock_data(s, start_date=start_date, interval=interval)
+        if df is None or df.empty:
+            return (s, "ERROR", None)
+        df = calculate_all_indicators(df)
+        ind2, vol2 = calculate_original_scores(df)
+        latest = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) > 1 else latest
+        price_change_pct = ((latest['Close'] - prev['Close']) / prev['Close']) * 100 if len(df) > 1 else 0
+
+        sentiment_text, _, _, confidence = calculate_sentiment(
+            ind2, vol2, latest['RSI'], latest['Diff'], price_change_pct
+        )
+
+        sma50_status = None
+        if pd.notna(latest.get('SMA50', np.nan)):
+            sma50_status = 'above' if latest['Close'] > latest['SMA50'] else 'below'
+        return (s, sentiment_text, sma50_status)
+    except Exception:
+        return (s, "ERROR", None)
+
+
+def scan_market_summary(stock_list, interval="1d", max_workers=8):
+    """Scan all stocks and return sentiment distribution + SMA50 stats.
+
+    ThreadPoolExecutor ile paralellestirildi (bkz. screen_chosen_stocks'taki
+    ayni gerekce) - onceki sirali versiyon 600+ hisseyi tek tek taryordu.
+    """
     sentiment_counts = {
         "STRONG BULLISH": [], "BULLISH": [], "NEUTRAL": [],
         "BEARISH": [], "STRONG BEARISH": [], "ERROR": []
@@ -718,45 +784,32 @@ def scan_market_summary(stock_list, interval="1d"):
     above_sma50 = []
     below_sma50 = []
     sma50_na = []
-    
+
     prog = st.progress(0)
     stat = st.empty()
     days = TIMEFRAMES[interval]["days"]
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    
-    for i, s in enumerate(stock_list):
-        stat.text(f"Scanning {s}... ({i+1}/{len(stock_list)})")
-        prog.progress((i + 1) / len(stock_list))
-        try:
-            df = fetch_stock_data(s, start_date=start_date, interval=interval)
-            if df is None or df.empty:
-                sentiment_counts["ERROR"].append(s)
-                sma50_na.append(s)
-                continue
-            df = calculate_all_indicators(df)
-            ind2, vol2 = calculate_original_scores(df)
-            latest = df.iloc[-1]
-            prev = df.iloc[-2] if len(df) > 1 else latest
-            price_change_pct = ((latest['Close'] - prev['Close']) / prev['Close']) * 100 if len(df) > 1 else 0
-            
-            sentiment_text, _, _, confidence = calculate_sentiment(
-                ind2, vol2, latest['RSI'], latest['Diff'], price_change_pct
-            )
+
+    total = len(stock_list)
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_scan_one_stock_summary, s, start_date, interval): s
+                   for s in stock_list}
+        for fut in as_completed(futures):
+            s = futures[fut]
+            done += 1
+            stat.text(f"Scanning {s}... ({done}/{total})")
+            prog.progress(done / total)
+
+            _, sentiment_text, sma50_status = fut.result()
             sentiment_counts[sentiment_text].append(s)
-            
-            # SMA50 check
-            if pd.notna(latest.get('SMA50', np.nan)):
-                if latest['Close'] > latest['SMA50']:
-                    above_sma50.append(s)
-                else:
-                    below_sma50.append(s)
+            if sma50_status == 'above':
+                above_sma50.append(s)
+            elif sma50_status == 'below':
+                below_sma50.append(s)
             else:
                 sma50_na.append(s)
-        except:
-            sentiment_counts["ERROR"].append(s)
-            sma50_na.append(s)
-            continue
-    
+
     prog.empty()
     stat.empty()
     return sentiment_counts, above_sma50, below_sma50, sma50_na
@@ -983,7 +1036,6 @@ def import_all_financials(stock_list, max_workers=5):
     of one-by-one-with-sleep). Stores in session_state.
     Uses a progress bar. Returns (success_count, error_list).
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     errors = []
     success = 0
     total = len(stock_list)
@@ -3697,7 +3749,7 @@ def main():
         
         with st.sidebar:
             st.header("⚙️ Settings")
-            mode = st.radio("Mode", ["📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "🌍 Macro Analysis", "💰 Funds"])
+            mode = st.radio("Mode", ["📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "🌍 Macro Analysis", "💰 Funds", "📄 Company Reports"])
             st.markdown("---")
             st.subheader("⏱️ Timeframe")
             available_tf = {k: v for k, v in TIMEFRAMES.items() if not v["auth_required"] or auth}
@@ -3778,28 +3830,40 @@ def main():
                     st.warning("⚠️ Import financials first for best results!")
                 
                 if st.button("💎 Scan for Value", use_container_width=True, type="primary"):
-                    vf_results = []
-                    prog = st.progress(0)
-                    stat = st.empty()
-                    days = TIMEFRAMES[selected_tf]["days"]
-                    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-                    
-                    for i, s in enumerate(vf_stocks):
-                        stat.text(f"Analyzing {s}... ({i+1}/{len(vf_stocks)})")
-                        prog.progress((i + 1) / len(vf_stocks))
+                    def _scan_one_value_stock(s, start_date, interval):
                         try:
-                            df = fetch_stock_data(s, start_date=start_date, interval=selected_tf)
+                            df = fetch_stock_data(s, start_date=start_date, interval=interval)
                             if df is None or df.empty:
-                                continue
+                                return None
                             price = df['Close'].iloc[-1]
                             vals = compute_stock_valuations(s, price)
                             if vals:
                                 vals['symbol'] = s
                                 vals['price'] = round(price, 2)
+                                return vals
+                            return None
+                        except Exception:
+                            return None
+
+                    prog = st.progress(0)
+                    stat = st.empty()
+                    days = TIMEFRAMES[selected_tf]["days"]
+                    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+                    vf_results = []
+                    done = 0
+                    with ThreadPoolExecutor(max_workers=8) as ex:
+                        futures = {ex.submit(_scan_one_value_stock, s, start_date, selected_tf): s
+                                   for s in vf_stocks}
+                        for fut in as_completed(futures):
+                            s = futures[fut]
+                            done += 1
+                            stat.text(f"Analyzing {s}... ({done}/{len(vf_stocks)})")
+                            prog.progress(done / len(vf_stocks))
+                            vals = fut.result()
+                            if vals:
                                 vf_results.append(vals)
-                        except:
-                            continue
-                    
+
                     prog.empty()
                     stat.empty()
                     st.session_state.value_finder_results = vf_results
@@ -4489,6 +4553,12 @@ def main():
                 display_funds_analysis()
             except Exception as e:
                 st.error(f"Funds analysis error: {str(e)}")
+                st.info("Database connection may be temporarily unavailable.")
+        elif mode == "📄 Company Reports":
+            try:
+                display_company_reports()
+            except Exception as e:
+                st.error(f"Company reports error: {str(e)}")
                 st.info("Database connection may be temporarily unavailable.")
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")

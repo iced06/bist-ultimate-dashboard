@@ -192,3 +192,37 @@ CREATE TABLE stock_price_daily (
     hacim       NUMERIC(20,2),
     PRIMARY KEY (security_id, tarih)
 );
+
+-- 10) Sirket yatirimci raporu ozetleri (LLM ile) — sirket_raporlari.py
+--     Bu raporlar CEYREKLIK yayinlanir (faaliyet raporu / yatirimci sunumu) -
+--     bu yuzden dogal anahtar kaynak_url degil (ticker, yil, donem) uclusu:
+--     ayni ceyrege ait duzeltilmis/farkli bir link gelirse AYNI donem
+--     satirinin uzerine yazilir (yeni bir donem satiri OLUSTURULMAZ).
+--     kaynak_url ayrica UNIQUE tutuluyor - amac farkli: ayni link ikinci kez
+--     yapistirilirsa Claude'a tekrar odeme yapmadan cache'den donmek icin.
+--
+--     satis/favok/net_kar hedefi + yonu (YUKARI/ASAGI/AYNI/ILK_KEZ/BELIRSIZ):
+--     her ceyrekte acikca guncellenen yil sonu hedeflerinin bir onceki
+--     ceyreğe gore revize yonunu izlemek icin - kullanicinin asil istegi bu.
+CREATE TABLE company_report_summaries (
+    id                  BIGSERIAL PRIMARY KEY,
+    ticker              VARCHAR(24),
+    sirket_adi          TEXT,
+    kaynak_url          TEXT NOT NULL UNIQUE,
+    rapor_basligi       TEXT,
+    yil                 SMALLINT,
+    donem               VARCHAR(4),           -- 'Q1'|'Q2'|'Q3'|'Q4'|'FY'
+    satis_hedefi        TEXT,
+    satis_yonu          VARCHAR(12),          -- YUKARI|ASAGI|AYNI|ILK_KEZ|BELIRSIZ
+    favok_hedefi        TEXT,
+    favok_yonu          VARCHAR(12),
+    net_kar_hedefi      TEXT,
+    net_kar_yonu        VARCHAR(12),
+    ozet                TEXT NOT NULL,
+    ham_metin_uzunluk   INTEGER,
+    olusturma_zamani    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX idx_company_report_period
+    ON company_report_summaries(ticker, yil, donem)
+    WHERE ticker IS NOT NULL AND yil IS NOT NULL AND donem IS NOT NULL;
+CREATE INDEX idx_company_report_ticker ON company_report_summaries(ticker, olusturma_zamani DESC);
