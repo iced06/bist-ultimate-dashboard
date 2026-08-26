@@ -291,6 +291,7 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
             "favok_hedefi": None, "favok_yonu": "BELIRSIZ",
             "net_kar_hedefi": None, "net_kar_yonu": "BELIRSIZ",
             "metin_ozeti": "⚠️ *Yapısal KPI çıkarımı başarısız oldu, ham yanıt gösteriliyor:*\n\n" + (raw or ""),
+            "_parse_failed": True,  # caller bunu goruyorsa DB'ye KAYDETMEMELI (bozuk veri kalici olmasin)
         }
 
     if was_truncated:
@@ -484,20 +485,31 @@ def display_company_reports():
                 else:
                     with st.spinner(f"Gemini ile analiz ediliyor ({n_pages} sayfa, {len(text):,} karakter)..."):
                         kpis = _summarize_with_gemini(text, ticker, DONEM_LABELS[donem], int(yil), prior)
-                    saved = save_report_summary(url, ticker, int(yil) if ticker else None,
-                                                 donem if ticker else None, kpis, len(text))
-                    if saved:
-                        get_existing_summary.clear()
-                        get_all_summaries.clear()
-                        get_ticker_history.clear()
-                        st.success("✅ Analiz tamamlandı ve kalıcı olarak kaydedildi.")
+
+                    if kpis.get('_parse_failed'):
+                        # Bozuk/yarim sonucu KALICI olarak kaydetmiyoruz - aksi halde
+                        # ayni link tekrar denendiginde "zaten analiz edildi" diyip
+                        # bu bozuk sonucu sonsuza kadar cache'den gosterirdik.
+                        st.error("⚠️ Gemini'nin yanıtı yapısal olarak işlenemedi (muhtemelen "
+                                 "yanıt yarıda kesildi). Kaydedilmedi — lütfen 'Analiz Et'e "
+                                 "tekrar basmayı dene.")
+                        with st.expander("Ham yanıtı gör"):
+                            st.text(kpis.get('metin_ozeti', ''))
                     else:
-                        st.warning("⚠️ Analiz tamamlandı ama veritabanına kaydedilemedi — "
-                                   "sayfa yenilenirse kaybolabilir.")
-                    st.session_state['_last_report'] = {
-                        'ticker': ticker, 'yil': int(yil), 'donem': donem, **kpis,
-                        'ham_metin_uzunluk': len(text),
-                    }
+                        saved = save_report_summary(url, ticker, int(yil) if ticker else None,
+                                                     donem if ticker else None, kpis, len(text))
+                        if saved:
+                            get_existing_summary.clear()
+                            get_all_summaries.clear()
+                            get_ticker_history.clear()
+                            st.success("✅ Analiz tamamlandı ve kalıcı olarak kaydedildi.")
+                        else:
+                            st.warning("⚠️ Analiz tamamlandı ama veritabanına kaydedilemedi — "
+                                       "sayfa yenilenirse kaybolabilir.")
+                        st.session_state['_last_report'] = {
+                            'ticker': ticker, 'yil': int(yil), 'donem': donem, **kpis,
+                            'ham_metin_uzunluk': len(text),
+                        }
             except Exception as e:
                 st.error(f"Hata: {e}")
 
