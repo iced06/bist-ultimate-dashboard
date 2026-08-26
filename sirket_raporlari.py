@@ -3,14 +3,14 @@
 
 Kullanıcı bir PDF linki (KAP bildirimi VEYA şirketin kendi IR sitesindeki
 doğrudan PDF linki - ikisi de aynı boru hattından geçer) + hisse kodu +
-dönem (yıl/çeyrek) girer. PDF indirilir, metni çıkarılır, Claude API ile
-Türkçe özetlenir VE yıl sonu satış/FAVÖK/net kâr hedefleri yapısal olarak
-çıkarılır. Bir önceki çeyreğin hedefleriyle karşılaştırılıp YUKARI/AŞAĞI/AYNI
-yönü belirlenir - bu sayede zaman içinde hedeflerin nasıl revize edildiği
-izlenebilir.
+dönem (yıl/çeyrek) girer. PDF indirilir, metni çıkarılır, Google Gemini API
+(ücretsiz katman) ile Türkçe özetlenir VE yıl sonu satış/FAVÖK/net kâr
+hedefleri yapısal olarak çıkarılır. Bir önceki çeyreğin hedefleriyle
+karşılaştırılıp YUKARI/AŞAĞI/AYNI yönü belirlenir - bu sayede zaman içinde
+hedeflerin nasıl revize edildiği izlenebilir.
 
 Her şey "bist.company_report_summaries" tablosunda KALICI olarak saklanır -
-aynı link tekrar analiz edilirse Claude'a tekrar ödeme yapılmadan cache'den
+aynı link tekrar analiz edilirse Gemini'ye tekrar sorulmadan cache'den
 döner; aynı (ticker, yıl, dönem) tekrar girilirse üzerine yazılır (yeni bir
 düzeltilmiş link gelmiş olabilir).
 
@@ -38,12 +38,14 @@ except ImportError:
     pdfplumber = None
 
 try:
-    import anthropic
+    from google import genai
+    from google.genai import types as genai_types
 except ImportError:
-    anthropic = None
+    genai = None
+    genai_types = None
 
-MAX_SUMMARY_INPUT_CHARS = 100_000  # Claude'a gonderilecek ham metnin ust siniri (maliyet kontrolu)
-CLAUDE_MODEL = "claude-sonnet-5"
+MAX_SUMMARY_INPUT_CHARS = 100_000  # Gemini'ye gonderilecek ham metnin ust siniri (token/kota kontrolu)
+GEMINI_MODEL = "gemini-2.5-flash"  # ucretsiz katmanda mevcut, iyi kalite/kota dengesi
 
 DONEM_OPTIONS = ["Q1", "Q2", "Q3", "Q4", "FY"]
 DONEM_LABELS = {"Q1": "1. Çeyrek", "Q2": "2. Çeyrek", "Q3": "3. Çeyrek", "Q4": "4. Çeyrek", "FY": "Yıl Sonu"}
@@ -101,13 +103,13 @@ def _get_database_url():
     return os.getenv("DATABASE_URL")
 
 
-def _get_anthropic_api_key():
+def _get_gemini_api_key():
     try:
-        if "ANTHROPIC_API_KEY" in st.secrets:
-            return st.secrets["ANTHROPIC_API_KEY"]
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
     except Exception:
         pass
-    return os.getenv("ANTHROPIC_API_KEY")
+    return os.getenv("GEMINI_API_KEY")
 
 
 def _make_connection():
@@ -205,9 +207,10 @@ def _extract_pdf_text(pdf_bytes):
     return full_text, n_pages
 
 
-def _parse_claude_json(raw_text):
-    """Claude bazen JSON'u ```json ... ``` bloguna sarabiliyor - once duz
-    parse dener, olmazsa kod bloklarini temizleyip tekrar dener."""
+def _parse_llm_json(raw_text):
+    """Gemini response_mime_type='application/json' ile genelde duz JSON
+    donuyor, ama bazen yine de ```json ... ``` bloguna sarabiliyor - once
+    duz parse dener, olmazsa kod bloklarini temizleyip tekrar dener."""
     try:
         return json.loads(raw_text)
     except json.JSONDecodeError:
@@ -215,12 +218,12 @@ def _parse_claude_json(raw_text):
         return json.loads(cleaned)
 
 
-def _summarize_with_claude(report_text, ticker, donem_label, yil, prior_kpis):
-    if anthropic is None:
-        raise RuntimeError("anthropic paketi kurulu değil (requirements.txt'e eklenmeli).")
-    api_key = _get_anthropic_api_key()
+def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
+    if genai is None:
+        raise RuntimeError("google-genai paketi kurulu değil (requirements.txt'e eklenmeli).")
+    api_key = _get_gemini_api_key()
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY secrets/environment değişkeni eksik.")
+        raise RuntimeError("GEMINI_API_KEY secrets/environment değişkeni eksik.")
 
     truncated = report_text[:MAX_SUMMARY_INPUT_CHARS]
     was_truncated = len(report_text) > MAX_SUMMARY_INPUT_CHARS
@@ -237,7 +240,7 @@ def _summarize_with_claude(report_text, ticker, donem_label, yil, prior_kpis):
     else:
         prior_context = "Bu ticker için kayıtlı önceki dönem hedefi yok - bu ilk kayıt olacak."
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = genai.Client(api_key=api_key)
     prompt = SUMMARY_PROMPT_TEMPLATE.format(
         ticker=ticker or "(belirtilmedi)",
         donem_label=donem_label or "",
@@ -245,15 +248,19 @@ def _summarize_with_claude(report_text, ticker, donem_label, yil, prior_kpis):
         prior_context=prior_context,
         report_text=truncated,
     )
-    message = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=2500,
-        messages=[{"role": "user", "content": prompt}],
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            max_output_tokens=2500,
+            temperature=0.3,
+            response_mime_type="application/json",
+        ),
     )
-    raw = message.content[0].text
+    raw = response.text
 
     try:
-        parsed = _parse_claude_json(raw)
+        parsed = _parse_llm_json(raw)
     except json.JSONDecodeError:
         # Yapisal cikarma basarisiz oldu - en azindan ham yaniti metin ozeti
         # olarak goster, KPI alanlarini bos birak. Sessizce veri uydurmaktan
@@ -262,7 +269,7 @@ def _summarize_with_claude(report_text, ticker, donem_label, yil, prior_kpis):
             "satis_hedefi": None, "satis_yonu": "BELIRSIZ",
             "favok_hedefi": None, "favok_yonu": "BELIRSIZ",
             "net_kar_hedefi": None, "net_kar_yonu": "BELIRSIZ",
-            "metin_ozeti": "⚠️ *Yapısal KPI çıkarımı başarısız oldu, ham yanıt gösteriliyor:*\n\n" + raw,
+            "metin_ozeti": "⚠️ *Yapısal KPI çıkarımı başarısız oldu, ham yanıt gösteriliyor:*\n\n" + (raw or ""),
         }
 
     if was_truncated:
@@ -275,7 +282,7 @@ def _summarize_with_claude(report_text, ticker, donem_label, yil, prior_kpis):
 
 def get_previous_period_kpis(ticker, yil, donem):
     """Verilen (yil, donem)'den kronolojik olarak hemen ONCEKI kayitli
-    donemin KPI'larini getirir - Claude'a "onceki hedef neydi" baglamini
+    donemin KPI'larini getirir - Gemini'ye "onceki hedef neydi" baglamini
     vermek icin. Kayit yoksa None doner (ilk kayit demektir)."""
     conn = _get_live_connection()
     if conn is None or not (ticker and yil and donem):
@@ -417,10 +424,10 @@ def display_company_reports():
         st.error("Veritabanı bağlantısı kurulamadı — DATABASE_URL secrets/environment "
                   "değişkeni eksik olabilir.")
         return
-    if anthropic is None or not _get_anthropic_api_key():
-        st.warning("⚠️ ANTHROPIC_API_KEY secrets/environment değişkeni eksik — "
+    if genai is None or not _get_gemini_api_key():
+        st.warning("⚠️ GEMINI_API_KEY secrets/environment değişkeni eksik — "
                    "yeni özet çıkarma çalışmaz, ama daha önce kaydedilmiş özetler "
-                   "aşağıda görüntülenebilir.")
+                   "aşağıda görüntülenebilir. (Ücretsiz key: aistudio.google.com)")
 
     with st.form("report_url_form"):
         url = st.text_input("Rapor PDF linki (KAP veya şirket sitesi)",
@@ -442,7 +449,7 @@ def display_company_reports():
         existing = get_existing_summary(url)
         if existing is not None:
             st.info("✅ Bu link daha önce analiz edilmiş — kayıtlı özet gösteriliyor "
-                    "(Claude'a tekrar sorulmadı).")
+                    "(Gemini'ye tekrar sorulmadı).")
             st.session_state['_last_report'] = existing
         else:
             try:
@@ -454,8 +461,8 @@ def display_company_reports():
                 if not text.strip():
                     st.error("PDF'ten metin çıkarılamadı (taranmış/görüntü tabanlı bir PDF olabilir).")
                 else:
-                    with st.spinner(f"Claude ile analiz ediliyor ({n_pages} sayfa, {len(text):,} karakter)..."):
-                        kpis = _summarize_with_claude(text, ticker, DONEM_LABELS[donem], int(yil), prior)
+                    with st.spinner(f"Gemini ile analiz ediliyor ({n_pages} sayfa, {len(text):,} karakter)..."):
+                        kpis = _summarize_with_gemini(text, ticker, DONEM_LABELS[donem], int(yil), prior)
                     saved = save_report_summary(url, ticker, int(yil) if ticker else None,
                                                  donem if ticker else None, kpis, len(text))
                     if saved:
