@@ -59,9 +59,9 @@ YON_BADGE = {
     "BELIRSIZ": "❓ Belirsiz",
 }
 
-SUMMARY_PROMPT_TEMPLATE = """Sen bir finansal analiz asistanısın. Aşağıda bir şirketin PDF'ten çıkarılmış
-yatırımcı sunumu/faaliyet raporu metni var. Bu metin PDF'ten otomatik çıkarıldığı için
-grafik/infografik etiketleri, sayılar ve başlıklar karışık sırada gelmiş olabilir -
+SUMMARY_PROMPT_TEMPLATE = """Sen kıdemli bir yatırım fonu analistisin. Aşağıda bir şirketin PDF'ten
+çıkarılmış yatırımcı sunumu/faaliyet raporu metni var. Bu metin PDF'ten otomatik çıkarıldığı
+için grafik/infografik etiketleri, sayılar ve başlıklar karışık sırada gelmiş olabilir -
 anlamı çıkarmaya çalış, birebir sıralı okuma bekleme.
 
 Şirket: {ticker}
@@ -79,15 +79,36 @@ veya kod bloğu işareti (```) ekleme - yanıtın ilk karakteri {{ olmalı.
   "favok_yonu": "<YUKARI | ASAGI | AYNI | ILK_KEZ | BELIRSIZ>",
   "net_kar_hedefi": "<yıl sonu net kâr hedefi varsa kısa metin, yoksa null>",
   "net_kar_yonu": "<YUKARI | ASAGI | AYNI | ILK_KEZ | BELIRSIZ>",
-  "metin_ozeti": "<markdown formatlı özet, TAM OLARAK şu başlıklarla:\\n## 📊 Finansal Öne Çıkanlar\\n## 🎯 Stratejik Gelişmeler\\n## ⚠️ Risk ve Dikkat Noktaları\\n## 💡 Genel Değerlendirme>"
+  "metin_ozeti": "<UZUN, DETAYLI, profesyonel bir yatırım fonu analist raporu - yaklaşık 1 A4
+sayfası uzunluğunda (600-900 kelime). Yüzeysel maddeler değil, akıcı analiz paragrafları yaz.
+TAM OLARAK şu başlıklarla:
+## 📊 Finansal Performans
+(Gelir, kâr, FAVÖK, marjlar - önceki dönem/yıl karşılaştırmalı, rakamları yorumla: büyüme
+kaliteli mi, marj daralması/genişlemesi neden kaynaklanıyor, birkaç paragraf)
+## 🎯 Operasyonel ve Stratejik Gelişmeler
+(Kapasite, yeni yatırımlar, pazar payı, yönetim açıklamaları - bunların gelecekteki
+finansallara olası etkisini yorumla)
+## 🏭 Sektörel Konum ve Rekabet
+(Metinde sektöre/rakiplere dair bilgi varsa değerlendir; yoksa bu başlığı kısa geç)
+## ⚠️ Risk ve Dikkat Noktaları
+(Raporda geçen riskler + rakamlardan senin çıkardığın örtük riskler - örn. marj baskısı,
+borçluluk, kur riski, tek müşteri/sektör bağımlılığı)
+## 📌 Değerlendirme ve Görünüm
+(SON PARAGRAF - en az 4-5 cümle: genel tabloyu özetle ve hangi yöne işaret ettiğini net
+söyle - örn. 'sonuçlar olumlu/karışık/zayıf, X ve Y nedeniyle temkinli/iyimser bir görünüm
+öne çıkıyor, izlenmesi gereken en kritik nokta Z'. Somut ve net ol, muğlak ifadelerden kaçın.
+Bu paragrafın sonuna şunu ekle: '*Not: Bu bir yatırım tavsiyesi değildir, raporun analistçe
+yorumlanmış bir değerlendirmesidir.*')>"
 }}
 
 Kurallar:
 - Önceki dönem hedefi verilmişse (yukarıda) ve bu raporda hedef değişmemişse "AYNI" yaz.
 - Önceki dönem hedefi verilmemişse (ilk kayıt) yön alanlarına "ILK_KEZ" yaz.
 - Bu raporda o hedefe dair net bir rakam/aralık yoksa hedef alanını null, yönü "BELIRSIZ" yap.
-- Emin olmadığın rakamları uydurma.
-- Bu bir yatırım tavsiyesi değildir, sadece raporun objektif özetidir - metin_ozeti içinde bunu belirt.
+- Emin olmadığın rakamları uydurma - ama verilen rakamlar üzerinden yorum/analiz yapmaktan
+  çekinme, senden istenen tam da bu.
+- Yüzeysel/jenerik ifadelerden kaçın ("şirket iyi performans gösterdi" gibi) - somut rakam ve
+  nedensellik ver ("FAVÖK marjı %38,8 artışla X'e yükseldi, bunun nedeni Y" gibi).
 
 --- RAPOR METNİ ---
 {report_text}
@@ -252,7 +273,7 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
         model=GEMINI_MODEL,
         contents=prompt,
         config=genai_types.GenerateContentConfig(
-            max_output_tokens=2500,
+            max_output_tokens=8000,  # ~900 kelimelik detayli analiz + JSON overhead icin (2500 yetersizdi - JSON yarida kesiliyordu)
             temperature=0.3,
             response_mime_type="application/json",
         ),
