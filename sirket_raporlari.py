@@ -45,7 +45,7 @@ except ImportError:
     genai_types = None
 
 MAX_SUMMARY_INPUT_CHARS = 100_000  # Gemini'ye gonderilecek ham metnin ust siniri (token/kota kontrolu)
-GEMINI_MODEL = "gemini-2.5-flash"  # ucretsiz katmanda mevcut, iyi kalite/kota dengesi
+GEMINI_MODEL = "gemini-3.6-flash"  # ucretsiz katmanda mevcut (2.5-flash yeni kullanicilara kapatildi)
 
 DONEM_OPTIONS = ["Q1", "Q2", "Q3", "Q4", "FY"]
 DONEM_LABELS = {"Q1": "1. Çeyrek", "Q2": "2. Çeyrek", "Q3": "3. Çeyrek", "Q4": "4. Çeyrek", "FY": "Yıl Sonu"}
