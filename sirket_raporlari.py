@@ -539,16 +539,18 @@ def get_ticker_history(ticker):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def get_available_sektor_periods():
-    """Sektoru belirlenmis raporlarin bulundugu (yil, donem) kombinasyonlarini
-    en yeniden en eskiye siralar - donem secici bunu kullanir."""
+def get_available_periods_for_rollup():
+    """Ticker+yil+donem bilgisiyle kayitli TUM raporlarin bulundugu (yil, donem)
+    kombinasyonlarini en yeniden en eskiye siralar - donem secici bunu kullanir.
+    Sektor atanmis olmasi sart degil: sektor kumeleme adiminin kendisi bu
+    atamayi yapacak (bkz. compute_sector_rollup)."""
     conn = _get_live_connection()
     if conn is None:
         return pd.DataFrame()
     df = pd.read_sql("""
         SELECT DISTINCT yil, donem
         FROM company_report_summaries
-        WHERE yil IS NOT NULL AND donem IS NOT NULL AND sektor IS NOT NULL
+        WHERE yil IS NOT NULL AND donem IS NOT NULL AND ticker IS NOT NULL
     """, conn)
     if df.empty:
         return df
@@ -558,9 +560,10 @@ def get_available_sektor_periods():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_reports_for_period(yil, donem):
-    """Belirtilen (yil, donem) icin sektoru belirlenmis TUM raporlari getirir.
-    'En guncel rapor' degil, o donem icin gercekten girilmis raporlar - yeni
-    eklenen raporlar da bir sonraki hesaplamada otomatik dahil olsun diye."""
+    """Belirtilen (yil, donem) icin kayitli TUM raporlari getirir - sektoru
+    henuz atanmamis olanlar dahil ('en guncel rapor' degil, o donem icin
+    gercekten girilmis raporlar; yeni eklenen raporlar da bir sonraki
+    hesaplamada otomatik dahil olsun diye)."""
     conn = _get_live_connection()
     if conn is None:
         return pd.DataFrame()
@@ -569,7 +572,7 @@ def get_reports_for_period(yil, donem):
                gorunum_puani, gorunum_yorumu, ozet
         FROM company_report_summaries
         WHERE yil = %(yil)s AND donem = %(donem)s
-          AND ticker IS NOT NULL AND sektor IS NOT NULL
+          AND ticker IS NOT NULL
         ORDER BY ticker
     """, conn, params={"yil": int(yil), "donem": donem})
 
@@ -587,28 +590,41 @@ def get_sector_rollup(yil, donem):
     """, conn, params={"yil": int(yil), "donem": donem})
 
 
-SECTOR_ROLLUP_PROMPT_TEMPLATE = """Sen kıdemli bir portföy stratejistisin. Aşağıda çeşitli BIST
-şirketlerinin en güncel faaliyet raporu/yatırımcı sunumu analizlerinden çıkarılmış özet bilgiler
-var; sektörlere göre gruplanmış.
+SECTOR_ROLLUP_PROMPT_TEMPLATE = """Sen kıdemli bir portföy stratejistisin. Aşağıda BIST
+şirketlerinin {donem_label} {yil} dönemine ait faaliyet raporu/yatırımcı sunumu özetleri var.
+Şirketler henüz sektörlere ayrılmamış olabilir - bu senin görevinin bir parçası.
 
-Görevin: HER sektör için, o sektördeki şirketlerin verilerine dayanarak bir MAKRO SEKTÖR ANALİZİ
-yaz ve sektörleri BİRBİRİYLE KIYASLAYARAK 1-5 arası bir sektör skoru ver (5=en güçlü/olumlu
-görünümlü sektör, 1=en zayıf/olumsuz). Skorlar mutlaka birbirine göre farklılaşsın - bütün
-sektörlere aynı skoru verme, gerçek bir sıralama/kıyaslama yap.
+Görevlerin:
+1) HER şirketi, SADECE aşağıdaki listeden TEK bir sektöre ata (listedeki isimleri birebir kullan):
+   {sektor_listesi}
+2) HER şirket için, özetindeki bilgilere dayanarak 1-5 arası (yarım puan olabilir, örn 3.5) İKİ
+   PUAN ver ve her biri için 1 kısa cümlelik gerekçe yaz:
+   - marj_puani: Marjlar (brüt/net/FAVÖK) ne kadar güçlü ve iyiye mi kötüye mi gidiyor?
+     (5=çok güçlü ve iyileşiyor, 1=çok zayıf ve kötüleşiyor)
+   - gorunum_puani: Raporda yer alan pozitif/negatif beklentilerin genel değerlemesi
+     (5=çok olumlu görünüm, 1=çok olumsuz görünüm)
+3) HER sektör için, o sektördeki şirketlerin verilerine dayanarak bir MAKRO SEKTÖR ANALİZİ yaz ve
+   sektörleri BİRBİRİYLE KIYASLAYARAK 1-5 arası bir sektör skoru ver (5=en güçlü/olumlu
+   görünümlü sektör, 1=en zayıf/olumsuz). Skorlar mutlaka birbirinden farklılaşsın - bütün
+   sektörlere aynı skoru verme, gerçek bir sıralama/kıyaslama yap.
 
---- SEKTÖR VERİLERİ ---
-{sektor_verileri}
+--- ŞİRKET ÖZETLERİ ---
+{sirket_verileri}
 
 GÖREV: SADECE geçerli JSON döndür, başka hiçbir metin ekleme. Format:
 
 {{
   "sektorler": [
     {{
-      "sektor": "<sektör adı>",
+      "sektor": "<sektör adı, yukarıdaki listeden birebir>",
       "makro_analiz": "<3-5 cümlelik, o sektördeki şirketlerin ortak eğilimlerini özetleyen
 analiz - marjlar genel olarak iyiye mi kötüye mi gidiyor, hangi ortak temalar/riskler öne
 çıkıyor>",
-      "sektor_skoru": <1-5 arası, diğer sektörlerle kıyaslanmış tam sayı veya yarım puan (örn 3.5)>
+      "sektor_skoru": <1-5 arası, diğer sektörlerle kıyaslanmış tam sayı veya yarım puan (örn 3.5)>,
+      "sirketler": [
+        {{"ticker": "<TICKER>", "marj_puani": <1-5>, "marj_yorumu": "<kısa gerekçe>",
+          "gorunum_puani": <1-5>, "gorunum_yorumu": "<kısa gerekçe>"}}
+      ]
     }}
   ]
 }}
@@ -616,48 +632,50 @@ analiz - marjlar genel olarak iyiye mi kötüye mi gidiyor, hangi ortak temalar/
 
 
 def compute_sector_rollup(yil, donem):
-    """Secilen (yil, donem) icindeki TUM sektorleri TEK bir Gemini cagrisinda
-    birlikte analiz eder (ayri ayri cagirsaydik model diger sektorleri
-    gormeden "kiyaslamali" skor veremezdi).
+    """Secilen (yil, donem) icin kayitli TUM rapor ozetlerini TEK bir Gemini
+    cagrisinda hem sektorlere siniflandirir hem de sirket/sektor bazinda
+    puanlar (ayri ayri cagirsaydik model diger sektorleri/sirketleri gormeden
+    "kiyaslamali" skor veremezdi). Sektor atamasi onceden yapilmis olmasi
+    sart degil - bu fonksiyon o donemdeki TUM raporlari (sektoru bos olanlar
+    dahil) tarar ve siniflandirir.
     Sonuclari sector_rollup_analysis tablosuna (yil, donem, sektor) anahtariyla
-    kaydeder (upsert)."""
+    kaydeder (upsert); ayrica company_report_summaries uzerindeki sektor/marj/
+    gorunum alanlarini da bu siniflandirmayla gunceller."""
     if genai is None:
         raise RuntimeError("google-genai paketi kurulu değil.")
     api_key = _get_gemini_api_key()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY secrets/environment değişkeni eksik.")
 
-    latest = get_reports_for_period(yil, donem)
-    if latest.empty:
-        raise RuntimeError(f"{DONEM_LABELS.get(donem, donem)} {yil} için sektör ataması olan "
-                            f"hiç kayıtlı rapor yok.")
+    reports = get_reports_for_period(yil, donem)
+    if reports.empty:
+        raise RuntimeError(f"{DONEM_LABELS.get(donem, donem)} {yil} için hiç kayıtlı rapor yok.")
 
+    valid_tickers = set(reports['ticker'])
     lines = []
-    for sektor, grp in latest.groupby('sektor'):
-        lines.append(f"\n## Sektör: {sektor} ({len(grp)} şirket)")
-        for _, r in grp.iterrows():
-            ozet_kisa = (r['ozet'] or '')[:600]
-            lines.append(
-                f"- {r['ticker']} | Marj Puanı: {r['marj_puani']} ({r['marj_yorumu']}) | "
-                f"Görünüm Puanı: {r['gorunum_puani']} ({r['gorunum_yorumu']}) | "
-                f"Özet: {ozet_kisa}..."
-            )
-    sektor_verileri = "\n".join(lines)
+    for _, r in reports.iterrows():
+        ozet_kisa = (r['ozet'] or '')[:600]
+        lines.append(f"\n## {r['ticker']}\nÖzet: {ozet_kisa}...")
+    sirket_verileri = "\n".join(lines)
 
     client = genai.Client(api_key=api_key)
-    prompt = SECTOR_ROLLUP_PROMPT_TEMPLATE.format(sektor_verileri=sektor_verileri)
-    response = _call_gemini_with_retry(client, prompt, max_output_tokens=8000)
+    prompt = SECTOR_ROLLUP_PROMPT_TEMPLATE.format(
+        donem_label=DONEM_LABELS.get(donem, donem), yil=yil,
+        sektor_listesi=", ".join(SEKTOR_LISTESI), sirket_verileri=sirket_verileri,
+    )
+    response = _call_gemini_with_retry(client, prompt, max_output_tokens=12000)
     parsed = _parse_llm_json(response.text)
 
     conn = _get_live_connection()
     if conn is None:
         raise RuntimeError("Veritabanı bağlantısı yok - sonuçlar kaydedilemedi.")
-    sirket_sayilari = latest.groupby('sektor').size().to_dict()
+    sirket_toplam = 0
     with conn.cursor() as cur:
         for s in parsed.get('sektorler', []):
             sektor = s.get('sektor')
             if sektor not in SEKTOR_LISTESI:
                 continue  # model listeden sapmis olabilir - guvenlik icin atla
+            sirketler = [c for c in s.get('sirketler', []) if c.get('ticker') in valid_tickers]
             cur.execute("""
                 INSERT INTO sector_rollup_analysis (yil, donem, sektor, makro_analiz, sektor_skoru, sirket_sayisi)
                 VALUES (%s, %s, %s, %s, %s, %s)
@@ -667,11 +685,22 @@ def compute_sector_rollup(yil, donem):
                     sirket_sayisi = EXCLUDED.sirket_sayisi,
                     olusturma_zamani = now()
             """, (int(yil), donem, sektor, s.get('makro_analiz'), s.get('sektor_skoru'),
-                  sirket_sayilari.get(sektor, 0)))
+                  len(sirketler)))
+            for c in sirketler:
+                cur.execute("""
+                    UPDATE company_report_summaries
+                    SET sektor = %s, marj_puani = %s, marj_yorumu = %s,
+                        gorunum_puani = %s, gorunum_yorumu = %s
+                    WHERE ticker = %s AND yil = %s AND donem = %s
+                """, (sektor, c.get('marj_puani'), c.get('marj_yorumu'),
+                      c.get('gorunum_puani'), c.get('gorunum_yorumu'),
+                      c['ticker'], int(yil), donem))
+                sirket_toplam += 1
     conn.commit()
     get_sector_rollup.clear()
-    get_available_sektor_periods.clear()
-    return len(parsed.get('sektorler', []))
+    get_reports_for_period.clear()
+    get_available_periods_for_rollup.clear()
+    return len(parsed.get('sektorler', [])), sirket_toplam
 
 
 def _kpi_card(label, value, yon):
@@ -845,9 +874,9 @@ def display_company_reports():
                "bir Gemini çağrısı yapar (yeni eklenen raporlar da dahil edilir); **Göster** "
                "ise hiçbir çağrı yapmadan en son hesaplanmış tabloyu getirir.")
 
-    periods = get_available_sektor_periods()
+    periods = get_available_periods_for_rollup()
     if periods.empty:
-        st.info("Henüz sektörü belirlenmiş bir rapor yok — önce yukarıdan bir analiz yap.")
+        st.info("Henüz yıl/dönem bilgisiyle kayıtlı bir rapor yok — önce yukarıdan bir analiz yap.")
     else:
         period_options = list(periods.itertuples(index=False, name=None))  # [(yil, donem), ...]
 
@@ -874,13 +903,14 @@ def display_company_reports():
         if hesapla_clicked:
             donem_raporlari = get_reports_for_period(sel_yil, sel_donem)
             if donem_raporlari.empty:
-                st.warning(f"{_period_fmt((sel_yil, sel_donem))} için sektörü belirlenmiş rapor yok.")
+                st.warning(f"{_period_fmt((sel_yil, sel_donem))} için kayıtlı rapor yok.")
             else:
                 try:
-                    with st.spinner(f"{donem_raporlari['sektor'].nunique()} sektör, "
-                                     f"{len(donem_raporlari)} şirket analiz ediliyor..."):
-                        n = compute_sector_rollup(sel_yil, sel_donem)
-                    st.success(f"✅ {n} sektör için {_period_fmt((sel_yil, sel_donem))} analizi güncellendi.")
+                    with st.spinner(f"{len(donem_raporlari)} şirket sektörlere göre "
+                                     f"sınıflandırılıp analiz ediliyor..."):
+                        n_sektor, n_sirket = compute_sector_rollup(sel_yil, sel_donem)
+                    st.success(f"✅ {n_sirket} şirket, {n_sektor} sektöre ayrılarak "
+                               f"{_period_fmt((sel_yil, sel_donem))} analizi güncellendi.")
                     st.session_state['_sektor_rollup_shown_period'] = (sel_yil, sel_donem)
                 except Exception as e:
                     st.error(f"Hata: {e}")
