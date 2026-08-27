@@ -60,6 +60,17 @@ YON_BADGE = {
     "BELIRSIZ": "❓ Belirsiz",
 }
 
+# Sektor kumelemesinin tutarli olmasi icin Gemini'ye SABIT bir listeden secim
+# yaptiriyoruz - serbest metin birakirsak "Enerji" / "Enerji Sektoru" gibi
+# varyasyonlar kumelemeyi bozar.
+SEKTOR_LISTESI = [
+    "Bankacılık", "Sigorta ve Emeklilik", "Holding", "Enerji", "Perakende",
+    "Gıda ve İçecek", "Otomotiv", "Sanayi ve Üretim", "İnşaat ve GYO",
+    "Teknoloji", "Telekomünikasyon", "Turizm", "Sağlık",
+    "Kimya ve Petrokimya", "Madencilik", "Tekstil", "Ulaştırma ve Lojistik",
+    "Finans (Banka Dışı)", "Diğer",
+]
+
 SUMMARY_PROMPT_TEMPLATE = """Sen kıdemli bir yatırım fonu analistisin. Aşağıda bir şirketin PDF'ten
 çıkarılmış yatırımcı sunumu/faaliyet raporu metni var. Bu metin PDF'ten otomatik çıkarıldığı
 için grafik/infografik etiketleri, sayılar ve başlıklar karışık sırada gelmiş olabilir -
@@ -74,6 +85,16 @@ GÖREV: Aşağıdaki alanları SADECE geçerli JSON olarak döndür. Başka hiç
 veya kod bloğu işareti (```) ekleme - yanıtın ilk karakteri {{ olmalı.
 
 {{
+  "sektor": "<şirketin ait olduğu sektör - AŞAĞIDAKİ LİSTEDEN TAM OLARAK BİRİNİ seç, başka bir
+kelime kullanma: {sektor_listesi}>",
+  "marj_puani": <1-5 arası TAM SAYI - kârlılık marjlarının (brüt/FAVÖK/net) hem GÜCÜNÜ hem
+YÖNÜNÜ (iyileşiyor mu kötüleşiyor mu) yansıtan tek bir skor. 1=çok zayıf/hızla kötüleşen
+marjlar, 3=vasat/durağan, 5=güçlü ve iyileşen marjlar>,
+  "marj_yorumu": "<marj skorunu gerekçelendiren 1-2 cümle, somut rakamlarla>",
+  "gorunum_puani": <1-5 arası TAM SAYI - raporda şirketin kendi ifade ettiği (veya senin
+rakamlardan çıkardığın) gelecek beklentilerinin genel tonu. 1=çok negatif/karamsar,
+3=nötr/karışık, 5=çok pozitif/iyimser>,
+  "gorunum_yorumu": "<görünüm skorunu gerekçelendiren 1-2 cümle>",
   "satis_hedefi": "<yıl sonu satış/ciro hedefi varsa kısa metin (örn. '18-19 Mr TL'), yoksa null>",
   "satis_yonu": "<önceki döneme göre: YUKARI | ASAGI | AYNI | ILK_KEZ | BELIRSIZ>",
   "favok_hedefi": "<yıl sonu FAVÖK hedefi varsa kısa metin, yoksa null>",
@@ -167,11 +188,60 @@ def _make_connection():
             ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS favok_yonu VARCHAR(12);
             ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS net_kar_hedefi TEXT;
             ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS net_kar_yonu VARCHAR(12);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS sektor VARCHAR(50);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_puani NUMERIC(3,1);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_yorumu TEXT;
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS gorunum_puani NUMERIC(3,1);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS gorunum_yorumu TEXT;
             CREATE UNIQUE INDEX IF NOT EXISTS idx_company_report_period
                 ON company_report_summaries(ticker, yil, donem)
                 WHERE ticker IS NOT NULL AND yil IS NOT NULL AND donem IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_company_report_ticker
                 ON company_report_summaries(ticker, olusturma_zamani DESC);
+
+            -- Sektor bazinda derlenmis makro analiz (compute_sector_rollup() ile
+            -- tek bir Gemini cagrisinda TUM sektorler birlikte, birbirine
+            -- kiyaslanarak uretilir - ayri ayri cagirsaydik "kiyaslama" anlamsiz
+            -- olurdu, model diger sektorleri gormeden skor veremezdi).
+            CREATE TABLE IF NOT EXISTS sector_rollup_analysis (
+                id               BIGSERIAL PRIMARY KEY,
+                sektor           VARCHAR(50) NOT NULL,
+                makro_analiz     TEXT,
+                sektor_skoru     NUMERIC(3,1),
+                sirket_sayisi    INTEGER,
+                olusturma_zamani TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            -- Sektor tablosu artik yil/donem bazinda tutuluyor (once tek
+            -- sektor basina tek satirdi - eski kurulumlar icin ekleniyor).
+            ALTER TABLE sector_rollup_analysis ADD COLUMN IF NOT EXISTS yil SMALLINT;
+            ALTER TABLE sector_rollup_analysis ADD COLUMN IF NOT EXISTS donem VARCHAR(4);
+
+            -- Eski tekil UNIQUE(sektor) kisitini kaldirip yerine
+            -- (yil, donem, sektor) kisitini koy (isim bilinmeyebilir,
+            -- bu yuzden information_schema uzerinden bulup dusuruyoruz).
+            DO $$
+            DECLARE
+                _con_name TEXT;
+            BEGIN
+                SELECT tc.constraint_name INTO _con_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+                WHERE tc.table_schema = 'bist'
+                  AND tc.table_name = 'sector_rollup_analysis'
+                  AND tc.constraint_type = 'UNIQUE'
+                GROUP BY tc.constraint_name
+                HAVING COUNT(*) = 1 AND bool_and(kcu.column_name = 'sektor');
+
+                IF _con_name IS NOT NULL THEN
+                    EXECUTE format('ALTER TABLE sector_rollup_analysis DROP CONSTRAINT %I', _con_name);
+                END IF;
+            END $$;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sector_rollup_period
+                ON sector_rollup_analysis(yil, donem, sektor);
         """)
     return conn
 
@@ -240,7 +310,7 @@ def _parse_llm_json(raw_text):
         return json.loads(cleaned)
 
 
-def _call_gemini_with_retry(client, prompt, max_attempts=3):
+def _call_gemini_with_retry(client, prompt, max_attempts=3, max_output_tokens=8000):
     """Gemini API bazen gecici olarak asiri yuklu oluyor (503 UNAVAILABLE,
     canli hatada gozlemlendi) veya rate-limit'e takiliyor (429). Ikisi de
     gecici - kisa bir bekleme ile tekrar denemek genelde yeterli. Diger
@@ -253,7 +323,7 @@ def _call_gemini_with_retry(client, prompt, max_attempts=3):
                 model=GEMINI_MODEL,
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
-                    max_output_tokens=8000,  # ~900 kelimelik analiz + JSON overhead icin
+                    max_output_tokens=max_output_tokens,
                     temperature=0.3,
                     response_mime_type="application/json",
                 ),
@@ -295,6 +365,7 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
         donem_label=donem_label or "",
         yil=yil or "",
         prior_context=prior_context,
+        sektor_listesi=", ".join(SEKTOR_LISTESI),
         report_text=truncated,
     )
     response = _call_gemini_with_retry(client, prompt)
@@ -307,6 +378,8 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
         # olarak goster, KPI alanlarini bos birak. Sessizce veri uydurmaktan
         # iyidir.
         parsed = {
+            "sektor": None, "marj_puani": None, "marj_yorumu": None,
+            "gorunum_puani": None, "gorunum_yorumu": None,
             "satis_hedefi": None, "satis_yonu": "BELIRSIZ",
             "favok_hedefi": None, "favok_yonu": "BELIRSIZ",
             "net_kar_hedefi": None, "net_kar_yonu": "BELIRSIZ",
@@ -361,8 +434,11 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
     if conn is None:
         return False
     ozet = kpis.get('metin_ozeti', '')
+    sektor = kpis.get('sektor') if kpis.get('sektor') in SEKTOR_LISTESI else None
     vals = (
         ticker, url, yil, donem,
+        sektor, kpis.get('marj_puani'), kpis.get('marj_yorumu'),
+        kpis.get('gorunum_puani'), kpis.get('gorunum_yorumu'),
         kpis.get('satis_hedefi'), kpis.get('satis_yonu'),
         kpis.get('favok_hedefi'), kpis.get('favok_yonu'),
         kpis.get('net_kar_hedefi'), kpis.get('net_kar_yonu'),
@@ -372,14 +448,20 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
         if ticker and yil and donem:
             cur.execute("""
                 INSERT INTO company_report_summaries
-                    (ticker, kaynak_url, yil, donem, satis_hedefi, satis_yonu,
+                    (ticker, kaynak_url, yil, donem, sektor, marj_puani, marj_yorumu,
+                     gorunum_puani, gorunum_yorumu, satis_hedefi, satis_yonu,
                      favok_hedefi, favok_yonu, net_kar_hedefi, net_kar_yonu,
                      ozet, ham_metin_uzunluk)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (ticker, yil, donem) WHERE ticker IS NOT NULL
                     AND yil IS NOT NULL AND donem IS NOT NULL
                 DO UPDATE SET
                     kaynak_url = EXCLUDED.kaynak_url,
+                    sektor = EXCLUDED.sektor,
+                    marj_puani = EXCLUDED.marj_puani,
+                    marj_yorumu = EXCLUDED.marj_yorumu,
+                    gorunum_puani = EXCLUDED.gorunum_puani,
+                    gorunum_yorumu = EXCLUDED.gorunum_yorumu,
                     satis_hedefi = EXCLUDED.satis_hedefi,
                     satis_yonu = EXCLUDED.satis_yonu,
                     favok_hedefi = EXCLUDED.favok_hedefi,
@@ -393,12 +475,16 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
         else:
             cur.execute("""
                 INSERT INTO company_report_summaries
-                    (ticker, kaynak_url, yil, donem, satis_hedefi, satis_yonu,
+                    (ticker, kaynak_url, yil, donem, sektor, marj_puani, marj_yorumu,
+                     gorunum_puani, gorunum_yorumu, satis_hedefi, satis_yonu,
                      favok_hedefi, favok_yonu, net_kar_hedefi, net_kar_yonu,
                      ozet, ham_metin_uzunluk)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (kaynak_url) DO UPDATE SET
-                    ozet = EXCLUDED.ozet, ham_metin_uzunluk = EXCLUDED.ham_metin_uzunluk
+                    ozet = EXCLUDED.ozet, ham_metin_uzunluk = EXCLUDED.ham_metin_uzunluk,
+                    sektor = EXCLUDED.sektor, marj_puani = EXCLUDED.marj_puani,
+                    marj_yorumu = EXCLUDED.marj_yorumu, gorunum_puani = EXCLUDED.gorunum_puani,
+                    gorunum_yorumu = EXCLUDED.gorunum_yorumu
             """, vals)
     return True
 
@@ -409,7 +495,8 @@ def get_existing_summary(url):
     if conn is None:
         return None
     df = pd.read_sql("""
-        SELECT ticker, yil, donem, satis_hedefi, satis_yonu, favok_hedefi, favok_yonu,
+        SELECT ticker, yil, donem, sektor, marj_puani, marj_yorumu, gorunum_puani, gorunum_yorumu,
+               satis_hedefi, satis_yonu, favok_hedefi, favok_yonu,
                net_kar_hedefi, net_kar_yonu, ozet, ham_metin_uzunluk, olusturma_zamani
         FROM company_report_summaries WHERE kaynak_url = %(url)s
     """, conn, params={"url": url})
@@ -424,10 +511,13 @@ def get_all_summaries():
     if conn is None:
         return pd.DataFrame()
     return pd.read_sql("""
-        SELECT id, ticker, yil, donem, kaynak_url, satis_yonu, favok_yonu, net_kar_yonu,
-               ozet, olusturma_zamani
+        SELECT id, ticker, yil, donem, kaynak_url, sektor, marj_puani, gorunum_puani,
+               satis_yonu, favok_yonu, net_kar_yonu, ozet, olusturma_zamani
         FROM company_report_summaries
-        ORDER BY olusturma_zamani DESC
+        ORDER BY yil DESC NULLS LAST,
+                 CASE donem WHEN 'FY' THEN 5 WHEN 'Q4' THEN 4 WHEN 'Q3' THEN 3
+                            WHEN 'Q2' THEN 2 WHEN 'Q1' THEN 1 ELSE 0 END DESC,
+                 olusturma_zamani DESC
     """, conn)
 
 
@@ -446,6 +536,142 @@ def get_ticker_history(ticker):
         return df
     df['_sira'] = df['donem'].map(DONEM_SIRA).fillna(99)
     return df.sort_values(['yil', '_sira']).drop(columns=['_sira'])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_available_sektor_periods():
+    """Sektoru belirlenmis raporlarin bulundugu (yil, donem) kombinasyonlarini
+    en yeniden en eskiye siralar - donem secici bunu kullanir."""
+    conn = _get_live_connection()
+    if conn is None:
+        return pd.DataFrame()
+    df = pd.read_sql("""
+        SELECT DISTINCT yil, donem
+        FROM company_report_summaries
+        WHERE yil IS NOT NULL AND donem IS NOT NULL AND sektor IS NOT NULL
+    """, conn)
+    if df.empty:
+        return df
+    df['_sira'] = df['donem'].map(DONEM_SIRA).fillna(0)
+    return df.sort_values(['yil', '_sira'], ascending=[False, False]).drop(columns=['_sira'])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_reports_for_period(yil, donem):
+    """Belirtilen (yil, donem) icin sektoru belirlenmis TUM raporlari getirir.
+    'En guncel rapor' degil, o donem icin gercekten girilmis raporlar - yeni
+    eklenen raporlar da bir sonraki hesaplamada otomatik dahil olsun diye."""
+    conn = _get_live_connection()
+    if conn is None:
+        return pd.DataFrame()
+    return pd.read_sql("""
+        SELECT ticker, yil, donem, sektor, marj_puani, marj_yorumu,
+               gorunum_puani, gorunum_yorumu, ozet
+        FROM company_report_summaries
+        WHERE yil = %(yil)s AND donem = %(donem)s
+          AND ticker IS NOT NULL AND sektor IS NOT NULL
+        ORDER BY ticker
+    """, conn, params={"yil": int(yil), "donem": donem})
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_sector_rollup(yil, donem):
+    conn = _get_live_connection()
+    if conn is None:
+        return pd.DataFrame()
+    return pd.read_sql("""
+        SELECT sektor, makro_analiz, sektor_skoru, sirket_sayisi, olusturma_zamani
+        FROM sector_rollup_analysis
+        WHERE yil = %(yil)s AND donem = %(donem)s
+        ORDER BY sektor_skoru DESC NULLS LAST
+    """, conn, params={"yil": int(yil), "donem": donem})
+
+
+SECTOR_ROLLUP_PROMPT_TEMPLATE = """Sen kıdemli bir portföy stratejistisin. Aşağıda çeşitli BIST
+şirketlerinin en güncel faaliyet raporu/yatırımcı sunumu analizlerinden çıkarılmış özet bilgiler
+var; sektörlere göre gruplanmış.
+
+Görevin: HER sektör için, o sektördeki şirketlerin verilerine dayanarak bir MAKRO SEKTÖR ANALİZİ
+yaz ve sektörleri BİRBİRİYLE KIYASLAYARAK 1-5 arası bir sektör skoru ver (5=en güçlü/olumlu
+görünümlü sektör, 1=en zayıf/olumsuz). Skorlar mutlaka birbirine göre farklılaşsın - bütün
+sektörlere aynı skoru verme, gerçek bir sıralama/kıyaslama yap.
+
+--- SEKTÖR VERİLERİ ---
+{sektor_verileri}
+
+GÖREV: SADECE geçerli JSON döndür, başka hiçbir metin ekleme. Format:
+
+{{
+  "sektorler": [
+    {{
+      "sektor": "<sektör adı>",
+      "makro_analiz": "<3-5 cümlelik, o sektördeki şirketlerin ortak eğilimlerini özetleyen
+analiz - marjlar genel olarak iyiye mi kötüye mi gidiyor, hangi ortak temalar/riskler öne
+çıkıyor>",
+      "sektor_skoru": <1-5 arası, diğer sektörlerle kıyaslanmış tam sayı veya yarım puan (örn 3.5)>
+    }}
+  ]
+}}
+"""
+
+
+def compute_sector_rollup(yil, donem):
+    """Secilen (yil, donem) icindeki TUM sektorleri TEK bir Gemini cagrisinda
+    birlikte analiz eder (ayri ayri cagirsaydik model diger sektorleri
+    gormeden "kiyaslamali" skor veremezdi).
+    Sonuclari sector_rollup_analysis tablosuna (yil, donem, sektor) anahtariyla
+    kaydeder (upsert)."""
+    if genai is None:
+        raise RuntimeError("google-genai paketi kurulu değil.")
+    api_key = _get_gemini_api_key()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY secrets/environment değişkeni eksik.")
+
+    latest = get_reports_for_period(yil, donem)
+    if latest.empty:
+        raise RuntimeError(f"{DONEM_LABELS.get(donem, donem)} {yil} için sektör ataması olan "
+                            f"hiç kayıtlı rapor yok.")
+
+    lines = []
+    for sektor, grp in latest.groupby('sektor'):
+        lines.append(f"\n## Sektör: {sektor} ({len(grp)} şirket)")
+        for _, r in grp.iterrows():
+            ozet_kisa = (r['ozet'] or '')[:600]
+            lines.append(
+                f"- {r['ticker']} | Marj Puanı: {r['marj_puani']} ({r['marj_yorumu']}) | "
+                f"Görünüm Puanı: {r['gorunum_puani']} ({r['gorunum_yorumu']}) | "
+                f"Özet: {ozet_kisa}..."
+            )
+    sektor_verileri = "\n".join(lines)
+
+    client = genai.Client(api_key=api_key)
+    prompt = SECTOR_ROLLUP_PROMPT_TEMPLATE.format(sektor_verileri=sektor_verileri)
+    response = _call_gemini_with_retry(client, prompt, max_output_tokens=8000)
+    parsed = _parse_llm_json(response.text)
+
+    conn = _get_live_connection()
+    if conn is None:
+        raise RuntimeError("Veritabanı bağlantısı yok - sonuçlar kaydedilemedi.")
+    sirket_sayilari = latest.groupby('sektor').size().to_dict()
+    with conn.cursor() as cur:
+        for s in parsed.get('sektorler', []):
+            sektor = s.get('sektor')
+            if sektor not in SEKTOR_LISTESI:
+                continue  # model listeden sapmis olabilir - guvenlik icin atla
+            cur.execute("""
+                INSERT INTO sector_rollup_analysis (yil, donem, sektor, makro_analiz, sektor_skoru, sirket_sayisi)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (yil, donem, sektor) DO UPDATE SET
+                    makro_analiz = EXCLUDED.makro_analiz,
+                    sektor_skoru = EXCLUDED.sektor_skoru,
+                    sirket_sayisi = EXCLUDED.sirket_sayisi,
+                    olusturma_zamani = now()
+            """, (int(yil), donem, sektor, s.get('makro_analiz'), s.get('sektor_skoru'),
+                  sirket_sayilari.get(sektor, 0)))
+    conn.commit()
+    get_sector_rollup.clear()
+    get_available_sektor_periods.clear()
+    return len(parsed.get('sektorler', []))
 
 
 def _kpi_card(label, value, yon):
@@ -489,11 +715,18 @@ def display_company_reports():
     if submitted and url:
         ticker = (ticker or "").strip().upper() or None
         existing = get_existing_summary(url)
-        if existing is not None:
+        # sektor/marj_puani ozelligi eklenmeden ONCE kaydedilmis raporlarda bu
+        # alanlar bos - byle bir kayitla karsilasirsak "zaten analiz edildi"
+        # deyip sonsuza kadar eksik birakmak yerine otomatik yeniden analiz
+        # ediyoruz (tek seferlik, sessiz bir "backfill").
+        if existing is not None and existing.get('sektor') is not None:
             st.info("✅ Bu link daha önce analiz edilmiş — kayıtlı özet gösteriliyor "
                     "(Gemini'ye tekrar sorulmadı).")
             st.session_state['_last_report'] = existing
         else:
+            if existing is not None:
+                st.caption("ℹ️ Bu link daha önce analiz edilmiş ama sektör/skor bilgisi "
+                           "eksik (eski bir kayıt) — otomatik olarak yeniden analiz ediliyor.")
             try:
                 prior = get_previous_period_kpis(ticker, int(yil), donem) if ticker else None
                 with st.spinner("PDF indiriliyor..."):
@@ -536,7 +769,16 @@ def display_company_reports():
     r = st.session_state.get('_last_report')
     if r:
         st.markdown("---")
-        st.markdown(f"#### 🎯 Hedef Özeti — {r.get('ticker') or ''} {DONEM_LABELS.get(r.get('donem'), '')} {r.get('yil') or ''}")
+        sektor_str = f" | 🏭 {r['sektor']}" if r.get('sektor') else ""
+        st.markdown(f"#### 🎯 Hedef Özeti — {r.get('ticker') or ''} {DONEM_LABELS.get(r.get('donem'), '')} {r.get('yil') or ''}{sektor_str}")
+        if r.get('marj_puani') is not None or r.get('gorunum_puani') is not None:
+            m1, m2 = st.columns(2)
+            with m1:
+                st.metric("📊 Marj Puanı", f"{r.get('marj_puani') or '—'} / 5")
+                st.caption(r.get('marj_yorumu') or '')
+            with m2:
+                st.metric("🔮 Görünüm Puanı", f"{r.get('gorunum_puani') or '—'} / 5")
+                st.caption(r.get('gorunum_yorumu') or '')
         k1, k2, k3 = st.columns(3)
         with k1:
             _kpi_card("💰 Satış/Ciro Hedefi", r.get('satis_hedefi'), r.get('satis_yonu'))
@@ -561,15 +803,116 @@ def display_company_reports():
                              use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.markdown("#### 📚 Tüm Kayıtlı Özetler")
+    st.markdown("#### 📚 Tüm Kayıtlı Özetler — Yıl / Dönem Bazında")
     df = get_all_summaries()
     if df.empty:
         st.info("Henüz kayıtlı özet yok.")
-        return
+    else:
+        # Yil -> Donem -> satirlar seklinde grupla (get_all_summaries zaten bu
+        # sirada donuyor ama burada acikca gruplu basliklar olusturuyoruz -
+        # kullanicinin talebi: "quarter ve yil bazinda classified olsun,
+        # yoksa ilerde cok karisir").
+        no_period = df[df['yil'].isna()]
+        with_period = df[df['yil'].notna()]
 
-    for _, row in df.iterrows():
-        donem_str = f" — {DONEM_LABELS.get(row['donem'], '')} {int(row['yil'])}" if pd.notna(row['yil']) else ""
-        title = f"{row['ticker'] or row['kaynak_url'][:60]}{donem_str}"
-        with st.expander(f"{title} — {row['olusturma_zamani']:%d.%m.%Y %H:%M}"):
-            st.caption(row['kaynak_url'])
-            st.markdown(row['ozet'])
+        for yil, yil_grp in with_period.groupby('yil', sort=False):
+            st.markdown(f"##### 📅 {int(yil)}")
+            for donem, donem_grp in yil_grp.groupby('donem', sort=False):
+                st.markdown(f"**{DONEM_LABELS.get(donem, donem)}**")
+                for _, row in donem_grp.iterrows():
+                    sektor_badge = f" · 🏭 {row['sektor']}" if pd.notna(row.get('sektor')) else ""
+                    title = f"{row['ticker'] or row['kaynak_url'][:60]}{sektor_badge}"
+                    with st.expander(f"{title} — {row['olusturma_zamani']:%d.%m.%Y %H:%M}"):
+                        st.caption(row['kaynak_url'])
+                        if pd.notna(row.get('marj_puani')) or pd.notna(row.get('gorunum_puani')):
+                            st.caption(f"Marj Puanı: {row.get('marj_puani', '—')}/5 · "
+                                       f"Görünüm Puanı: {row.get('gorunum_puani', '—')}/5")
+                        st.markdown(row['ozet'])
+
+        if not no_period.empty:
+            st.markdown("##### ❓ Dönem Belirtilmemiş")
+            for _, row in no_period.iterrows():
+                title = row['ticker'] or row['kaynak_url'][:60]
+                with st.expander(f"{title} — {row['olusturma_zamani']:%d.%m.%Y %H:%M}"):
+                    st.caption(row['kaynak_url'])
+                    st.markdown(row['ozet'])
+
+    # ── Sektor Analizi ──
+    st.markdown("---")
+    st.markdown("#### 🏭 Sektör Analizi")
+    st.caption("Seçilen yıl/dönem içindeki raporları sektörlere göre kümeleyip, sektörleri "
+               "birbirleriyle kıyaslayarak analiz eder. **Hesapla/Yenile** o dönem için yeni "
+               "bir Gemini çağrısı yapar (yeni eklenen raporlar da dahil edilir); **Göster** "
+               "ise hiçbir çağrı yapmadan en son hesaplanmış tabloyu getirir.")
+
+    periods = get_available_sektor_periods()
+    if periods.empty:
+        st.info("Henüz sektörü belirlenmiş bir rapor yok — önce yukarıdan bir analiz yap.")
+    else:
+        period_options = list(periods.itertuples(index=False, name=None))  # [(yil, donem), ...]
+
+        def _period_fmt(p):
+            y, d = p
+            return f"{DONEM_LABELS.get(d, d)} {int(y)}"
+
+        sel_yil, sel_donem = st.selectbox(
+            "Yıl / Dönem", period_options, format_func=_period_fmt, key="sektor_rollup_period",
+        )
+
+        col_hesapla, col_goster = st.columns(2)
+        with col_hesapla:
+            hesapla_clicked = st.button(
+                "🔄 Hesapla / Yenile", use_container_width=True,
+                help="Bu dönem için raporları yeniden tarar ve YENİ bir Gemini çağrısı yapar.",
+            )
+        with col_goster:
+            goster_clicked = st.button(
+                "👁️ Göster", use_container_width=True,
+                help="Gemini çağrısı yapmadan, bu dönem için en son hesaplanmış tabloyu gösterir.",
+            )
+
+        if hesapla_clicked:
+            donem_raporlari = get_reports_for_period(sel_yil, sel_donem)
+            if donem_raporlari.empty:
+                st.warning(f"{_period_fmt((sel_yil, sel_donem))} için sektörü belirlenmiş rapor yok.")
+            else:
+                try:
+                    with st.spinner(f"{donem_raporlari['sektor'].nunique()} sektör, "
+                                     f"{len(donem_raporlari)} şirket analiz ediliyor..."):
+                        n = compute_sector_rollup(sel_yil, sel_donem)
+                    st.success(f"✅ {n} sektör için {_period_fmt((sel_yil, sel_donem))} analizi güncellendi.")
+                    st.session_state['_sektor_rollup_shown_period'] = (sel_yil, sel_donem)
+                except Exception as e:
+                    st.error(f"Hata: {e}")
+
+        if goster_clicked:
+            st.session_state['_sektor_rollup_shown_period'] = (sel_yil, sel_donem)
+
+        shown_period = st.session_state.get('_sektor_rollup_shown_period')
+        if shown_period:
+            rollup = get_sector_rollup(*shown_period)
+            donem_raporlari = get_reports_for_period(*shown_period)
+            if rollup.empty:
+                st.info(f"{_period_fmt(shown_period)} için sektör analizi henüz "
+                        f"hesaplanmadı — \"Hesapla / Yenile\" butonuna bas.")
+            else:
+                for _, srow in rollup.iterrows():
+                    skor = srow['sektor_skoru']
+                    skor_str = f"{skor:.1f}/5" if pd.notna(skor) else "—"
+                    with st.expander(f"🏭 {srow['sektor']} — Sektör Skoru: {skor_str} "
+                                      f"({int(srow['sirket_sayisi'] or 0)} şirket)"):
+                        st.markdown(srow['makro_analiz'] or '_Analiz yok._')
+                        st.markdown("---")
+                        companies = donem_raporlari[donem_raporlari['sektor'] == srow['sektor']]
+                        show = companies.copy()
+                        show['Dönem'] = show.apply(
+                            lambda x: f"{DONEM_LABELS.get(x['donem'], x['donem'])} {int(x['yil'])}"
+                            if pd.notna(x['yil']) else '—', axis=1)
+                        show['Marj Puanı'] = show['marj_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
+                        show['Görünüm Puanı'] = show['gorunum_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
+                        show['Özet Değerleme'] = show['marj_yorumu'].fillna('') + " " + show['gorunum_yorumu'].fillna('')
+                        st.dataframe(
+                            show[['ticker', 'Dönem', 'Marj Puanı', 'Görünüm Puanı', 'Özet Değerleme']]
+                                .rename(columns={'ticker': 'Hisse'}),
+                            use_container_width=True, hide_index=True,
+                        )
