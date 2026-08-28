@@ -511,7 +511,8 @@ def get_all_summaries():
     if conn is None:
         return pd.DataFrame()
     return pd.read_sql("""
-        SELECT id, ticker, yil, donem, kaynak_url, sektor, marj_puani, gorunum_puani,
+        SELECT id, ticker, yil, donem, kaynak_url, sektor,
+               marj_puani, marj_yorumu, gorunum_puani, gorunum_yorumu,
                satis_yonu, favok_yonu, net_kar_yonu, ozet, olusturma_zamani
         FROM company_report_summaries
         ORDER BY yil DESC NULLS LAST,
@@ -854,8 +855,16 @@ def display_company_reports():
                     with st.expander(f"{title} — {row['olusturma_zamani']:%d.%m.%Y %H:%M}"):
                         st.caption(row['kaynak_url'])
                         if pd.notna(row.get('marj_puani')) or pd.notna(row.get('gorunum_puani')):
-                            st.caption(f"Marj Puanı: {row.get('marj_puani', '—')}/5 · "
-                                       f"Görünüm Puanı: {row.get('gorunum_puani', '—')}/5")
+                            m1, m2 = st.columns(2)
+                            with m1:
+                                st.markdown(f"**📊 Marj Puanı: {row.get('marj_puani', '—')}/5**")
+                                if pd.notna(row.get('marj_yorumu')):
+                                    st.caption(row['marj_yorumu'])
+                            with m2:
+                                st.markdown(f"**🔮 Görünüm Puanı: {row.get('gorunum_puani', '—')}/5**")
+                                if pd.notna(row.get('gorunum_yorumu')):
+                                    st.caption(row['gorunum_yorumu'])
+                            st.markdown("---")
                         st.markdown(row['ozet'])
 
         if not no_period.empty:
@@ -933,7 +942,9 @@ def display_company_reports():
                                       f"({int(srow['sirket_sayisi'] or 0)} şirket)"):
                         st.markdown(srow['makro_analiz'] or '_Analiz yok._')
                         st.markdown("---")
-                        companies = donem_raporlari[donem_raporlari['sektor'] == srow['sektor']]
+                        companies = donem_raporlari[donem_raporlari['sektor'] == srow['sektor']].copy()
+                        companies['_skor'] = companies[['marj_puani', 'gorunum_puani']].mean(axis=1, skipna=True)
+                        companies = companies.sort_values('_skor', ascending=False, na_position='last')
                         show = companies.copy()
                         show['Dönem'] = show.apply(
                             lambda x: f"{DONEM_LABELS.get(x['donem'], x['donem'])} {int(x['yil'])}"
