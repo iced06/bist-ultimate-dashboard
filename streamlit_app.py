@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import requests
+import time
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -527,16 +528,28 @@ def setup_tradingview_auth():
 
 @st.cache_data(ttl=300)
 def fetch_stock_data(symbol, start_date="2023-01-01", end_date=None, interval="1d"):
-    try:
-        if end_date is None:
-            end_date = date.today().strftime("%Y-%m-%d")
-        ticker = bp.Ticker(symbol)
-        df = ticker.history(start=start_date, end=end_date, interval=interval)
-        if df is not None and not df.empty:
-            df.columns = [col.title() for col in df.columns]
-        return df
-    except:
-        return None
+    """
+    borsapy/TradingView, yuksek eszamanlilikta (orn. Screener'in ThreadPoolExecutor'u)
+    ara sira 429 (Too Many Requests) donuyor - once bu hatalar sessizce yutulup
+    None donduruluyordu, yani o hisse o taramada HIC degerlendirilmeden atlaniyordu.
+    429'a ozel TEK bir kisa bekleme + tekrar deneme eklendi (429'lar tipik olarak
+    aninda gecici, tekrar denemek genelde yeterli); baska bir hata turunde
+    (sembol gecersiz, ag hatasi vb.) hemen None donup bekletmiyor.
+    """
+    if end_date is None:
+        end_date = date.today().strftime("%Y-%m-%d")
+    for attempt in range(2):
+        try:
+            ticker = bp.Ticker(symbol)
+            df = ticker.history(start=start_date, end=end_date, interval=interval)
+            if df is not None and not df.empty:
+                df.columns = [col.title() for col in df.columns]
+            return df
+        except Exception as e:
+            if attempt == 0 and "429" in str(e):
+                time.sleep(2)
+                continue
+            return None
 
 @st.cache_data(ttl=300, show_spinner=False)
 def calculate_all_indicators(df):
@@ -706,7 +719,7 @@ def _screen_one_stock(s, start_date, interval, fund_flow_map):
         return None
 
 
-def screen_chosen_stocks(stock_list, interval="1d", max_workers=8):
+def screen_chosen_stocks(stock_list, interval="1d", max_workers=5):
     """
     Onceki versiyon 600+ hisseyi tek tek, sirayla taryordu (~1 istek/hisse,
     her biri agdan fiyat verisi cekiyor). ThreadPoolExecutor ile paralel
@@ -714,9 +727,11 @@ def screen_chosen_stocks(stock_list, interval="1d", max_workers=8):
     oldugu icin ayni sembol tekrar taranirsa aninda doner, ama ilk taramada
     (cache miss) asil kazanc burada.
 
-    max_workers=8 bilincli olarak orta seviyede tutuldu - Funds sekmesinde
-    (borsapy/TradingView) yuksek eszamanlilikta 429 (rate limit) gorulmustu;
-    ayni riski burada da minimize etmek icin.
+    max_workers=8 iken canli testte 611 hisselik tam taramada gercek 429
+    (rate limit) hatalari gozlemlendi (~%3 - sessizce None donup o hisseyi
+    taramadan atliyordu, screener'in "hic hisse bulamama" sikayetine kismen
+    katkida bulunuyordu). 5'e dusuruldu + fetch_stock_data'ya 429'a ozel
+    tek-seferlik retry eklendi (bkz. fetch_stock_data docstring'i).
     """
     prog = st.progress(0)
     stat = st.empty()

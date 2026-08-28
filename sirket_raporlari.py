@@ -87,10 +87,13 @@ veya kod bloğu işareti (```) ekleme - yanıtın ilk karakteri {{ olmalı.
 {{
   "sektor": "<şirketin ait olduğu sektör - AŞAĞIDAKİ LİSTEDEN TAM OLARAK BİRİNİ seç, başka bir
 kelime kullanma: {sektor_listesi}>",
-  "marj_puani": <1-5 arası TAM SAYI - kârlılık marjlarının (brüt/FAVÖK/net) hem GÜCÜNÜ hem
-YÖNÜNÜ (iyileşiyor mu kötüleşiyor mu) yansıtan tek bir skor. 1=çok zayıf/hızla kötüleşen
-marjlar, 3=vasat/durağan, 5=güçlü ve iyileşen marjlar>,
-  "marj_yorumu": "<marj skorunu gerekçelendiren 1-2 cümle, somut rakamlarla>",
+  "marj_development_puani": <0-5 arası (yarım puan olabilir) - SADECE marjların (brüt/net kâr)
+YÖNÜNÜ/GELİŞİMİNİ ölçen bir skor - şirketin KENDİ geçmiş dönemine göre karşılaştır, başka
+şirketle kıyaslama (bu ayrı bir adımda yapılacak). Raporda önceki döneme/yıla göre karşılaştırma
+varsa ona dayan. 0=marjlar belirgin şekilde DÜŞMÜŞ, 2.5=yatay/karışık sinyal, 5=marjlar belirgin
+şekilde YÜKSELMİŞ. Sadece yön/değişim büyüklüğünü yansıtır, mevcut marj seviyesinin GÜCÜNÜ değil>,
+  "marj_development_yorumu": "<skoru gerekçelendiren 1-2 cümle, somut rakamlarla (örn. 'brüt
+marj %8,1'den %8,6'ya yükseldi')>",
   "gorunum_puani": <1-5 arası TAM SAYI - raporda şirketin kendi ifade ettiği (veya senin
 rakamlardan çıkardığın) gelecek beklentilerinin genel tonu. 1=çok negatif/karamsar,
 3=nötr/karışık, 5=çok pozitif/iyimser>,
@@ -193,6 +196,20 @@ def _make_connection():
             ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_yorumu TEXT;
             ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS gorunum_puani NUMERIC(3,1);
             ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS gorunum_yorumu TEXT;
+
+            -- Marj puani ikiye ayrildi: "development" (marjin KENDI gecmisine
+            -- gore yonu/gucu - tek rapordan cikarilabilir) ve "current" (marjin
+            -- SEKTOR ORTALAMASINA gore su anki konumu - sadece sektorun TUM
+            -- sirketlerini bir arada goren sektor rollup cagrisi hesaplayabilir).
+            -- Eski marj_puani/marj_yorumu artik "development" anlamina geliyor;
+            -- gecmis kayitlar bir kerelik asagida development'a kopyalaniyor.
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_development_puani NUMERIC(3,1);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_development_yorumu TEXT;
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_current_puani NUMERIC(3,1);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_current_yorumu TEXT;
+            UPDATE company_report_summaries
+                SET marj_development_puani = marj_puani, marj_development_yorumu = marj_yorumu
+                WHERE marj_development_puani IS NULL AND marj_puani IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS idx_company_report_period
                 ON company_report_summaries(ticker, yil, donem)
                 WHERE ticker IS NOT NULL AND yil IS NOT NULL AND donem IS NOT NULL;
@@ -378,7 +395,7 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
         # olarak goster, KPI alanlarini bos birak. Sessizce veri uydurmaktan
         # iyidir.
         parsed = {
-            "sektor": None, "marj_puani": None, "marj_yorumu": None,
+            "sektor": None, "marj_development_puani": None, "marj_development_yorumu": None,
             "gorunum_puani": None, "gorunum_yorumu": None,
             "satis_hedefi": None, "satis_yonu": "BELIRSIZ",
             "favok_hedefi": None, "favok_yonu": "BELIRSIZ",
@@ -437,7 +454,7 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
     sektor = kpis.get('sektor') if kpis.get('sektor') in SEKTOR_LISTESI else None
     vals = (
         ticker, url, yil, donem,
-        sektor, kpis.get('marj_puani'), kpis.get('marj_yorumu'),
+        sektor, kpis.get('marj_development_puani'), kpis.get('marj_development_yorumu'),
         kpis.get('gorunum_puani'), kpis.get('gorunum_yorumu'),
         kpis.get('satis_hedefi'), kpis.get('satis_yonu'),
         kpis.get('favok_hedefi'), kpis.get('favok_yonu'),
@@ -448,7 +465,7 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
         if ticker and yil and donem:
             cur.execute("""
                 INSERT INTO company_report_summaries
-                    (ticker, kaynak_url, yil, donem, sektor, marj_puani, marj_yorumu,
+                    (ticker, kaynak_url, yil, donem, sektor, marj_development_puani, marj_development_yorumu,
                      gorunum_puani, gorunum_yorumu, satis_hedefi, satis_yonu,
                      favok_hedefi, favok_yonu, net_kar_hedefi, net_kar_yonu,
                      ozet, ham_metin_uzunluk)
@@ -458,8 +475,8 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
                 DO UPDATE SET
                     kaynak_url = EXCLUDED.kaynak_url,
                     sektor = EXCLUDED.sektor,
-                    marj_puani = EXCLUDED.marj_puani,
-                    marj_yorumu = EXCLUDED.marj_yorumu,
+                    marj_development_puani = EXCLUDED.marj_development_puani,
+                    marj_development_yorumu = EXCLUDED.marj_development_yorumu,
                     gorunum_puani = EXCLUDED.gorunum_puani,
                     gorunum_yorumu = EXCLUDED.gorunum_yorumu,
                     satis_hedefi = EXCLUDED.satis_hedefi,
@@ -472,18 +489,21 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
                     ham_metin_uzunluk = EXCLUDED.ham_metin_uzunluk,
                     olusturma_zamani = now()
             """, vals)
+            # marj_current_puani/yorumu kasten bu UPDATE'e dahil edilmedi -
+            # sadece sektor rollup hesaplayabilir (peer karsilastirmasi gerekir),
+            # rutin metin ozeti yenilemesi onu SIFIRLAMAMALI.
         else:
             cur.execute("""
                 INSERT INTO company_report_summaries
-                    (ticker, kaynak_url, yil, donem, sektor, marj_puani, marj_yorumu,
+                    (ticker, kaynak_url, yil, donem, sektor, marj_development_puani, marj_development_yorumu,
                      gorunum_puani, gorunum_yorumu, satis_hedefi, satis_yonu,
                      favok_hedefi, favok_yonu, net_kar_hedefi, net_kar_yonu,
                      ozet, ham_metin_uzunluk)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (kaynak_url) DO UPDATE SET
                     ozet = EXCLUDED.ozet, ham_metin_uzunluk = EXCLUDED.ham_metin_uzunluk,
-                    sektor = EXCLUDED.sektor, marj_puani = EXCLUDED.marj_puani,
-                    marj_yorumu = EXCLUDED.marj_yorumu, gorunum_puani = EXCLUDED.gorunum_puani,
+                    sektor = EXCLUDED.sektor, marj_development_puani = EXCLUDED.marj_development_puani,
+                    marj_development_yorumu = EXCLUDED.marj_development_yorumu, gorunum_puani = EXCLUDED.gorunum_puani,
                     gorunum_yorumu = EXCLUDED.gorunum_yorumu
             """, vals)
     return True
@@ -495,7 +515,10 @@ def get_existing_summary(url):
     if conn is None:
         return None
     df = pd.read_sql("""
-        SELECT ticker, yil, donem, sektor, marj_puani, marj_yorumu, gorunum_puani, gorunum_yorumu,
+        SELECT ticker, yil, donem, sektor,
+               marj_development_puani, marj_development_yorumu,
+               marj_current_puani, marj_current_yorumu,
+               gorunum_puani, gorunum_yorumu,
                satis_hedefi, satis_yonu, favok_hedefi, favok_yonu,
                net_kar_hedefi, net_kar_yonu, ozet, ham_metin_uzunluk, olusturma_zamani
         FROM company_report_summaries WHERE kaynak_url = %(url)s
@@ -512,7 +535,9 @@ def get_all_summaries():
         return pd.DataFrame()
     return pd.read_sql("""
         SELECT id, ticker, yil, donem, kaynak_url, sektor,
-               marj_puani, marj_yorumu, gorunum_puani, gorunum_yorumu,
+               marj_development_puani, marj_development_yorumu,
+               marj_current_puani, marj_current_yorumu,
+               gorunum_puani, gorunum_yorumu,
                satis_yonu, favok_yonu, net_kar_yonu, ozet, olusturma_zamani
         FROM company_report_summaries
         ORDER BY yil DESC NULLS LAST,
@@ -569,7 +594,9 @@ def get_reports_for_period(yil, donem):
     if conn is None:
         return pd.DataFrame()
     return pd.read_sql("""
-        SELECT ticker, yil, donem, sektor, marj_puani, marj_yorumu,
+        SELECT ticker, yil, donem, sektor,
+               marj_development_puani, marj_development_yorumu,
+               marj_current_puani, marj_current_yorumu,
                gorunum_puani, gorunum_yorumu, ozet
         FROM company_report_summaries
         WHERE yil = %(yil)s AND donem = %(donem)s
@@ -592,18 +619,24 @@ def get_sector_rollup(yil, donem):
 
 
 SECTOR_ROLLUP_PROMPT_TEMPLATE = """Sen kıdemli bir portföy stratejistisin. Aşağıda BIST
-şirketlerinin {donem_label} {yil} dönemine ait faaliyet raporu/yatırımcı sunumu özetleri var.
+şirketlerinin {donem_label} {yil} dönemine ait faaliyet raporu/yatırımcı sunumu özetleri var
+(bazılarında ayrıca şirketin KENDİ geçmişine göre önceden hesaplanmış bir "marj gelişimi" notu
+da bulunuyor - bu SENİN görevin değil, sadece bağlam için verildi).
 Şirketler henüz sektörlere ayrılmamış olabilir - bu senin görevinin bir parçası.
 
 Görevlerin:
 1) HER şirketi, SADECE aşağıdaki listeden TEK bir sektöre ata (listedeki isimleri birebir kullan):
    {sektor_listesi}
-2) HER şirket için, özetindeki bilgilere dayanarak 1-5 arası (yarım puan olabilir, örn 3.5) İKİ
-   PUAN ver ve her biri için 1 kısa cümlelik gerekçe yaz:
-   - marj_puani: Marjlar (brüt/net/FAVÖK) ne kadar güçlü ve iyiye mi kötüye mi gidiyor?
-     (5=çok güçlü ve iyileşiyor, 1=çok zayıf ve kötüleşiyor)
+2) HER şirket için, ÖZETİNDEKİ bilgilere dayanarak, o şirketi AYNI SEKTÖRDEKİ DİĞER
+   şirketlerle KIYASLAYARAK 1-5 arası (yarım puan olabilir, örn 3.5) bir puan ver:
+   - marj_current_puani: Net ve brüt kâr marjları, SEKTÖR ORTALAMASINA göre şu anda ne
+     durumda? (5=sektördeki en güçlü marjlara sahip/liderlerden, 3=sektör ortalaması civarı,
+     1=sektördeki en zayıf marjlara sahip). Bu SEKTÖR İÇİ KIYASLAMALI bir puan - şirketin
+     kendi geçmişiyle değil, AYNI SEKTÖRDEKİ DİĞER şirketlerle kıyasla.
+   - marj_current_yorumu: "<1 kısa cümlelik gerekçe, somut rakamla mümkünse>"
    - gorunum_puani: Raporda yer alan pozitif/negatif beklentilerin genel değerlemesi
      (5=çok olumlu görünüm, 1=çok olumsuz görünüm)
+   - gorunum_yorumu: "<1 kısa cümlelik gerekçe>"
 3) HER sektör için, o sektördeki şirketlerin verilerine dayanarak bir MAKRO SEKTÖR ANALİZİ yaz ve
    sektörleri BİRBİRİYLE KIYASLAYARAK 1-5 arası bir sektör skoru ver (5=en güçlü/olumlu
    görünümlü sektör, 1=en zayıf/olumsuz). Skorlar mutlaka birbirinden farklılaşsın - bütün
@@ -623,7 +656,7 @@ analiz - marjlar genel olarak iyiye mi kötüye mi gidiyor, hangi ortak temalar/
 çıkıyor>",
       "sektor_skoru": <1-5 arası, diğer sektörlerle kıyaslanmış tam sayı veya yarım puan (örn 3.5)>,
       "sirketler": [
-        {{"ticker": "<TICKER>", "marj_puani": <1-5>, "marj_yorumu": "<kısa gerekçe>",
+        {{"ticker": "<TICKER>", "marj_current_puani": <1-5>, "marj_current_yorumu": "<kısa gerekçe>",
           "gorunum_puani": <1-5>, "gorunum_yorumu": "<kısa gerekçe>"}}
       ]
     }}
@@ -656,7 +689,11 @@ def compute_sector_rollup(yil, donem):
     lines = []
     for _, r in reports.iterrows():
         ozet_kisa = (r['ozet'] or '')[:600]
-        lines.append(f"\n## {r['ticker']}\nÖzet: {ozet_kisa}...")
+        dev_note = ""
+        if pd.notna(r.get('marj_development_puani')):
+            dev_note = (f"\n(Bağlam - marj gelişimi notu: {r['marj_development_puani']}/5, "
+                        f"{r.get('marj_development_yorumu') or ''})")
+        lines.append(f"\n## {r['ticker']}\nÖzet: {ozet_kisa}...{dev_note}")
     sirket_verileri = "\n".join(lines)
 
     client = genai.Client(api_key=api_key)
@@ -690,10 +727,10 @@ def compute_sector_rollup(yil, donem):
             for c in sirketler:
                 cur.execute("""
                     UPDATE company_report_summaries
-                    SET sektor = %s, marj_puani = %s, marj_yorumu = %s,
+                    SET sektor = %s, marj_current_puani = %s, marj_current_yorumu = %s,
                         gorunum_puani = %s, gorunum_yorumu = %s
                     WHERE ticker = %s AND yil = %s AND donem = %s
-                """, (sektor, c.get('marj_puani'), c.get('marj_yorumu'),
+                """, (sektor, c.get('marj_current_puani'), c.get('marj_current_yorumu'),
                       c.get('gorunum_puani'), c.get('gorunum_yorumu'),
                       c['ticker'], int(yil), donem))
                 sirket_toplam += 1
@@ -801,14 +838,16 @@ def display_company_reports():
         st.markdown("---")
         sektor_str = f" | 🏭 {r['sektor']}" if r.get('sektor') else ""
         st.markdown(f"#### 🎯 Hedef Özeti — {r.get('ticker') or ''} {DONEM_LABELS.get(r.get('donem'), '')} {r.get('yil') or ''}{sektor_str}")
-        if r.get('marj_puani') is not None or r.get('gorunum_puani') is not None:
+        if r.get('marj_development_puani') is not None or r.get('gorunum_puani') is not None:
             m1, m2 = st.columns(2)
             with m1:
-                st.metric("📊 Marj Puanı", f"{r.get('marj_puani') or '—'} / 5")
-                st.caption(r.get('marj_yorumu') or '')
+                st.metric("📊 Marj Gelişimi", f"{r.get('marj_development_puani') or '—'} / 5")
+                st.caption(r.get('marj_development_yorumu') or '')
             with m2:
                 st.metric("🔮 Görünüm Puanı", f"{r.get('gorunum_puani') or '—'} / 5")
                 st.caption(r.get('gorunum_yorumu') or '')
+            st.caption("ℹ️ Marj Current (sektör ortalamasına göre konum) sadece \"Sektör Analizi\" "
+                       "bölümünde \"Hesapla/Yenile\" çalıştırıldıktan sonra hesaplanır.")
         k1, k2, k3 = st.columns(3)
         with k1:
             _kpi_card("💰 Satış/Ciro Hedefi", r.get('satis_hedefi'), r.get('satis_yonu'))
@@ -854,16 +893,32 @@ def display_company_reports():
                     title = f"{row['ticker'] or row['kaynak_url'][:60]}{sektor_badge}"
                     with st.expander(f"{title} — {row['olusturma_zamani']:%d.%m.%Y %H:%M}"):
                         st.caption(row['kaynak_url'])
-                        if pd.notna(row.get('marj_puani')) or pd.notna(row.get('gorunum_puani')):
-                            m1, m2 = st.columns(2)
+                        has_scores = (pd.notna(row.get('marj_current_puani'))
+                                      or pd.notna(row.get('marj_development_puani'))
+                                      or pd.notna(row.get('gorunum_puani')))
+                        if has_scores:
+                            m1, m2, m3 = st.columns(3)
                             with m1:
-                                st.markdown(f"**📊 Marj Puanı: {row.get('marj_puani', '—')}/5**")
-                                if pd.notna(row.get('marj_yorumu')):
-                                    st.caption(row['marj_yorumu'])
+                                st.markdown(f"**📈 Marj Current: {row.get('marj_current_puani', '—') if pd.notna(row.get('marj_current_puani')) else '—'}/5**")
+                                if pd.notna(row.get('marj_current_yorumu')):
+                                    st.caption(row['marj_current_yorumu'])
+                                else:
+                                    st.caption("Sektör analizi çalıştırılınca hesaplanır.")
                             with m2:
-                                st.markdown(f"**🔮 Görünüm Puanı: {row.get('gorunum_puani', '—')}/5**")
+                                st.markdown(f"**📊 Marj Development: {row.get('marj_development_puani', '—') if pd.notna(row.get('marj_development_puani')) else '—'}/5**")
+                                if pd.notna(row.get('marj_development_yorumu')):
+                                    st.caption(row['marj_development_yorumu'])
+                            with m3:
+                                st.markdown(f"**🔮 Görünüm Puanı: {row.get('gorunum_puani', '—') if pd.notna(row.get('gorunum_puani')) else '—'}/5**")
                                 if pd.notna(row.get('gorunum_yorumu')):
                                     st.caption(row['gorunum_yorumu'])
+                            marj_parts = [v for v in (row.get('marj_current_puani'), row.get('marj_development_puani')) if pd.notna(v)]
+                            if marj_parts:
+                                marj_avg = sum(marj_parts) / len(marj_parts)
+                                total_parts = [v for v in (marj_avg, row.get('gorunum_puani')) if pd.notna(v)]
+                                total_score = sum(total_parts) / len(total_parts) if total_parts else None
+                                st.caption(f"**Marj Avg: {marj_avg:.1f}/5**" +
+                                           (f" · **Total Score: {total_score:.1f}/5**" if total_score is not None else ""))
                             st.markdown("---")
                         st.markdown(row['ozet'])
 
@@ -943,17 +998,30 @@ def display_company_reports():
                         st.markdown(srow['makro_analiz'] or '_Analiz yok._')
                         st.markdown("---")
                         companies = donem_raporlari[donem_raporlari['sektor'] == srow['sektor']].copy()
-                        companies['_skor'] = companies[['marj_puani', 'gorunum_puani']].mean(axis=1, skipna=True)
-                        companies = companies.sort_values('_skor', ascending=False, na_position='last')
+                        # Marj Avg = (Marj Current + Marj Development) ortalaması;
+                        # Total Score = (Marj Avg + Görünüm Puanı) ortalaması - siralama
+                        # bu nihai skora gore yapiliyor (sektorlerin kendisi de skora
+                        # gore siraliydi, ayni mantik sirketler icin de gecerli).
+                        companies['_marj_avg'] = companies[['marj_current_puani', 'marj_development_puani']].mean(axis=1, skipna=True)
+                        companies['_total_score'] = companies[['_marj_avg', 'gorunum_puani']].mean(axis=1, skipna=True)
+                        companies = companies.sort_values('_total_score', ascending=False, na_position='last')
                         show = companies.copy()
                         show['Dönem'] = show.apply(
                             lambda x: f"{DONEM_LABELS.get(x['donem'], x['donem'])} {int(x['yil'])}"
                             if pd.notna(x['yil']) else '—', axis=1)
-                        show['Marj Puanı'] = show['marj_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
+                        show['Marj Current'] = show['marj_current_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
+                        show['Marj Development'] = show['marj_development_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
+                        show['Marj Avg'] = show['_marj_avg'].apply(lambda v: f"{v:.1f}/5" if pd.notna(v) else "—")
                         show['Görünüm Puanı'] = show['gorunum_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
-                        show['Özet Değerleme'] = show['marj_yorumu'].fillna('') + " " + show['gorunum_yorumu'].fillna('')
+                        show['Total Score'] = show['_total_score'].apply(lambda v: f"{v:.1f}/5" if pd.notna(v) else "—")
+                        show['Özet Değerleme'] = (
+                            show['marj_current_yorumu'].fillna('') + " " +
+                            show['marj_development_yorumu'].fillna('') + " " +
+                            show['gorunum_yorumu'].fillna('')
+                        ).str.strip()
                         st.dataframe(
-                            show[['ticker', 'Dönem', 'Marj Puanı', 'Görünüm Puanı', 'Özet Değerleme']]
+                            show[['ticker', 'Dönem', 'Marj Current', 'Marj Development', 'Marj Avg',
+                                  'Görünüm Puanı', 'Total Score', 'Özet Değerleme']]
                                 .rename(columns={'ticker': 'Hisse'}),
                             use_container_width=True, hide_index=True,
                         )
