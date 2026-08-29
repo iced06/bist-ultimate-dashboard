@@ -36,7 +36,7 @@ except Exception as _fon_analiz_import_error:
 try:
     from sirket_raporlari import display_company_reports
 except Exception as _sirket_raporlari_import_error:
-    def display_company_reports():
+    def display_company_reports(*args, **kwargs):
         st.error("📄 Şirket Raporları özelliği yüklenemedi (sirket_raporlari.py import hatası).")
         st.code(str(_sirket_raporlari_import_error))
 
@@ -610,17 +610,54 @@ def calculate_all_indicators(df):
     except:
         return df
 
+BIST_OPEN_HOUR = 10
+BIST_CLOSE_HOUR = 18
+
+def _projected_volume_ratio(latest):
+    """
+    Volume / VSMA15 oranini hesaplar - ama en son bar BUGUNUN HENUZ
+    KAPANMAMIS bari ise (piyasa hala acikken taraniyorsa), o barin hacmi
+    GUN SONUNA KADAR BEKLENEN toplamin sadece bir parcasidir. VSMA15
+    (15 GECMIS TAM gunun ortalamasi) ile DOGRUDAN kiyaslamak erken saatte
+    neredeyse HER hisseyi 'dusuk hacimli' gosterir (canli testte dogrulandi:
+    ayni hisse ogle saatinde 0.31 iken, gun kapandiktan sonra 0.94 cikti -
+    ayni gunun ayni verisi, sadece saat farkli).
+
+    Gecen sure oranina gore hacmi projekte ederek bu carpitmayi azaltir.
+    Kaba bir yaklasim - gun ici hacim dagilimi duz degildir (acilis/kapanista
+    yogunlasir) - ama hic duzeltmemekten ve tum gun boyunca sistematik
+    olarak "hicbir hisse bulunamiyor" sonucundan iyidir.
+    """
+    volume = latest.get("Volume")
+    vsma15 = latest.get("VSMA15")
+    if not volume or not vsma15:
+        return 0.0
+    bar_ts = latest.name
+    try:
+        tz = getattr(bar_ts, 'tzinfo', None)
+        now = datetime.now(tz) if tz else datetime.now()
+        is_today = bar_ts.date() == now.date()
+    except Exception:
+        is_today = False
+    if is_today and BIST_OPEN_HOUR <= now.hour < BIST_CLOSE_HOUR:
+        elapsed_hours = max(0.25, (now.hour + now.minute / 60) - BIST_OPEN_HOUR)
+        total_hours = BIST_CLOSE_HOUR - BIST_OPEN_HOUR
+        frac = min(1.0, elapsed_hours / total_hours)
+        volume = volume / frac
+    return volume / vsma15
+
+
 def calculate_original_scores(df):
     if df is None or df.empty:
         return 0, 0
     try:
         latest = df.iloc[-1]
         indicator_score_2 = (
-            latest["Buy_MACDS2"] + latest["Buy_AOS"] + latest["Buy_EMA10_EMA30S"] + 
-            latest["Buy_SMA5S"] + latest["Buy_SMA22S"] + latest["Buy_RSIS"] + 
+            latest["Buy_MACDS2"] + latest["Buy_AOS"] + latest["Buy_EMA10_EMA30S"] +
+            latest["Buy_SMA5S"] + latest["Buy_SMA22S"] + latest["Buy_RSIS"] +
             latest["Stochastic_BuyS"] + latest["Buy_CCIS"] + latest["Buy_KAMAS"] + latest["Buy_CMFS"]
         )
-        volume_score_2 = latest["Volume"] / latest["VSMA15"]
+        volume_score_2 = _projected_volume_ratio(latest)
         return float(indicator_score_2), float(volume_score_2)
     except:
         return 0, 0
@@ -672,7 +709,7 @@ def calculate_simplified_scores(df):
         raw = rsi_component + macd_component + sma_component  # -3..+3 araliginda (oncekiyle ayni olcek)
         score = max(0, min(5, raw + 2.5))
 
-        vr = latest["Volume"] / latest["VSMA15"]
+        vr = _projected_volume_ratio(latest)
         vs = max(0, min(5, round(vr * 2.5, 1)))  # Volume 2'nin ham oranina paralel, surekli olcek
         return round(score, 1), round(vs, 1)
     except Exception:
@@ -1509,7 +1546,8 @@ def calculate_fundamentals(df_bs):
         revenue = get_val("revenue", p)
         gross_profit = get_val("gross_profit", p)
         operating_profit = get_val("operating_profit", p)
-        
+        depreciation = get_val("depreciation", p)
+
         # Current Ratio
         if current_assets and current_liab and current_liab != 0:
             ratios.setdefault("Current Ratio", []).append((p, round(current_assets / current_liab, 2)))
@@ -1530,12 +1568,77 @@ def calculate_fundamentals(df_bs):
         # Gross Margin
         if gross_profit and revenue and revenue != 0:
             ratios.setdefault("Gross Margin %", []).append((p, round(gross_profit / revenue * 100, 2)))
-        
+
+        # FAVÖK (EBITDA) Margin - ayni formul valuation tarafinda da kullaniliyor:
+        # EBITDA = Esas Faaliyet Kari + |Amortisman|
+        if operating_profit is not None and revenue and revenue != 0:
+            ebitda = operating_profit + (abs(depreciation) if depreciation is not None else 0)
+            ratios.setdefault("EBITDA Margin %", []).append((p, round(ebitda / revenue * 100, 2)))
+
         # Equity Ratio
         if total_equity and total_assets and total_assets != 0:
             ratios.setdefault("Equity Ratio %", []).append((p, round(total_equity / total_assets * 100, 2)))
-    
+
     return ratios
+
+
+def get_financial_margin_snapshot():
+    """
+    Import edilmis (st.session_state.financial_store'daki) her hisse icin
+    en son iki DONEMIN Brut Kar Marji %, FAVOK Marji % ve Net Kar Marji %
+    degerlerini doner (Company Reports'un istedigi UC oran).
+
+    Bu, Company Reports'taki Marj Current/Development skorlarinin GIRDISIDIR -
+    LLM'in faaliyet raporu metninden TAHMIN etmesi yerine, zaten import
+    edilmis GERCEK finansal verilerden DETERMINISTIK olarak hesaplanir (daha
+    dogru + Gemini kotasi harcamiyor).
+
+    Donen format: {ticker: {"period_latest", "period_prev",
+                             "gross_margin", "gross_margin_prev",
+                             "ebitda_margin", "ebitda_margin_prev",
+                             "net_margin", "net_margin_prev"}}
+    Bir hisse icin financial_store'da veri yoksa veya UCUNDE de marj
+    hesaplanamiyorsa (orn. gelir tablosu kalemleri eslesmedi) o hisse
+    sozlukte YER ALMAZ - caller "yok" durumunu ayirt edebilsin diye.
+    """
+    all_key_items = {**KEY_ITEMS_BY_DESC, **KEY_INCOME_BY_DESC}
+    snapshot = {}
+    for symbol, raw_data in st.session_state.financial_store.items():
+        try:
+            df_bs = parse_balance_sheet_to_df(raw_data, item_filter=all_key_items)
+            if df_bs is None or df_bs.empty:
+                continue
+            ratios = calculate_fundamentals(df_bs)
+            if not ratios:
+                continue
+            gm_d = dict(ratios.get("Gross Margin %", []))
+            em_d = dict(ratios.get("EBITDA Margin %", []))
+            nm_d = dict(ratios.get("Net Margin %", []))
+            if not gm_d and not em_d and not nm_d:
+                continue
+            # Donem hizalamasi icin GERCEK donem kolonlarina (zaten kronolojik
+            # sirali) ankorla - uc oranin listesi bagimsiz olustugu icin
+            # (bir donemde orn. sadece net kar var, brut kar yoksa o donem o
+            # listede hic yer almaz) index bazli ([0], [1]) hizalama YANLIS
+            # doneme denk gelebilirdi.
+            period_cols = [c for c in df_bs.columns if "/" in c]
+            if not period_cols:
+                continue
+            period_latest = period_cols[0]
+            period_prev = period_cols[1] if len(period_cols) > 1 else None
+            snapshot[symbol] = {
+                "period_latest": period_latest,
+                "period_prev": period_prev,
+                "gross_margin": gm_d.get(period_latest),
+                "gross_margin_prev": gm_d.get(period_prev) if period_prev else None,
+                "ebitda_margin": em_d.get(period_latest),
+                "ebitda_margin_prev": em_d.get(period_prev) if period_prev else None,
+                "net_margin": nm_d.get(period_latest),
+                "net_margin_prev": nm_d.get(period_prev) if period_prev else None,
+            }
+        except Exception:
+            continue
+    return snapshot
 
 
 def _make_quarterly_bar_chart(df_source, logical_key, title, color, fallback_key=None, forecasts=None):
@@ -3809,7 +3912,12 @@ def main():
                     with st.spinner("Screening..."):
                         results = screen_chosen_stocks(IMKB, interval=selected_tf)
                         st.session_state.chosen_stocks[selected_tf] = results
-                    st.success(f"✅ Found {len(results)} stocks!")
+                    if results:
+                        st.success(f"✅ Found {len(results)} stocks!")
+                    else:
+                        st.warning("⚠️ Tarama tamamlandı ama kriterlere uyan hisse bulunamadı "
+                                   "(ind ≥ 3 VE hacim > ortalamanın %70'i şartı bugün için çok "
+                                   "az/hiç hisseyi karşılamıyor olabilir - piyasa sakin olabilir).")
             
             if mode == "📋 Market Summary":
                 if st.button("🔎 Scan All Stocks", use_container_width=True):
@@ -4250,9 +4358,14 @@ def main():
                             <p><b>EV/EBITDA:</b> {ev_str} → {fev_str}</p>
                         </div>
                         """, unsafe_allow_html=True)
+            elif selected_tf in st.session_state.chosen_stocks:
+                # Tarama calisti ama sonuc bos - "hic taramadin" mesajiyla karistirilmasin.
+                st.info("Bu taramada kriterlere uyan hisse bulunamadı. Farklı bir zaman "
+                        "diliminde tekrar deneyebilir veya piyasa daha hareketlendiğinde "
+                        "yeniden tarayabilirsin.")
             else:
                 st.info("Click 'Run Screener'")
-        
+
         elif mode == "📋 Market Summary":
             st.subheader(f"📋 Market Summary - {TIMEFRAMES[selected_tf]['label']}")
             
@@ -4571,7 +4684,7 @@ def main():
                 st.info("Database connection may be temporarily unavailable.")
         elif mode == "📄 Company Reports":
             try:
-                display_company_reports()
+                display_company_reports(financial_margins=get_financial_margin_snapshot())
             except Exception as e:
                 st.error(f"Company reports error: {str(e)}")
                 st.info("Database connection may be temporarily unavailable.")

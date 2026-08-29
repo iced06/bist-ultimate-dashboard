@@ -71,6 +71,89 @@ SEKTOR_LISTESI = [
     "Finans (Banka Dışı)", "Diğer",
 ]
 
+_MARGIN_FIELDS = [
+    ("gross_margin", "gross_margin_prev", "brüt kâr marjı"),
+    ("ebitda_margin", "ebitda_margin_prev", "FAVÖK marjı"),
+    ("net_margin", "net_margin_prev", "net kâr marjı"),
+]
+
+
+def _composite_margin(fm):
+    """Brut kar marji, FAVOK marji ve net kar marjinin ORTALAMASI - kullanici
+    talebi: uc oranin ortalama durumuna gore hesapla. Mevcut olanlarin
+    ortalamasi alinir (biri/ikisi eksikse geri kalanlarla hesaplanir);
+    UCU DE yoksa None. Marj Current'in "tek sayi" girdisi."""
+    if not fm:
+        return None
+    vals = [fm.get(latest_key) for latest_key, _, _ in _MARGIN_FIELDS]
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def compute_marj_development_from_financials(fm):
+    """Import edilmis GERCEK finansallardan (LLM tahmini DEGIL) bir onceki
+    CEYREGE gore (QoQ) - brut kar marji, FAVOK marji ve net kar marjinin
+    UCUNUN ORTALAMA degisimine dayali 0-5 skor hesaplar.
+    fm: streamlit_app.get_financial_margin_snapshot()'un tek bir ticker
+    icin dondurdugu sozluk (None olabilir - financial_store'da yoksa).
+    Donus: (puan, yorumu) - yeterli veri yoksa (None, None)."""
+    if not fm:
+        return None, None
+    deltas, parts = [], []
+    for latest_key, prev_key, label in _MARGIN_FIELDS:
+        if fm.get(latest_key) is not None and fm.get(prev_key) is not None:
+            d = fm[latest_key] - fm[prev_key]
+            deltas.append(d)
+            parts.append(f"{label} %{fm[prev_key]:.1f} → %{fm[latest_key]:.1f} "
+                          f"({'+' if d >= 0 else ''}{d:.1f} puan)")
+    if not deltas:
+        return None, None
+    avg_delta = sum(deltas) / len(deltas)
+    # +-5 puanlik ortalama degisim skoru tam uclara tasir (2.5 +- 2.5)
+    score = max(0.0, min(5.0, 2.5 + avg_delta * 0.5))
+    period_note = (f" ({fm['period_prev']} → {fm['period_latest']})"
+                    if fm.get('period_latest') and fm.get('period_prev') else "")
+    yorumu = (", ".join(parts) + period_note + ".")
+    return round(score, 1), yorumu[0].upper() + yorumu[1:]
+
+
+def compute_marj_current_for_sector(ticker, sektor_tickers, financial_margins):
+    """Import edilmis GERCEK finansallardan, bir sirketin kompozit (brut kar+
+    FAVOK+net kar marji ortalamasi) marjini AYNI SEKTORDEKI DIGER sirketlerle
+    (z-score ile) kiyaslayip 1-5 arasi bir skor uretir - LLM'in "tahmin"
+    etmesine gerek kalmaz.
+    En az 1 DIGER sirkette veri varsa hesaplar (kendisiyle birlikte toplam
+    2); tek basinaysa (None, None) doner."""
+    financial_margins = financial_margins or {}
+    my_val = _composite_margin(financial_margins.get(ticker))
+    if my_val is None:
+        return None, None
+    all_vals = {}
+    for t in sektor_tickers:
+        v = _composite_margin(financial_margins.get(t))
+        if v is not None:
+            all_vals[t] = v
+    all_vals[ticker] = my_val
+    others = [v for t, v in all_vals.items() if t != ticker]
+    if len(others) < 1:
+        return None, None
+    mean = sum(others) / len(others)
+    variance = sum((v - mean) ** 2 for v in others) / len(others)
+    std = variance ** 0.5
+    if std == 0:
+        score = 5.0 if my_val > mean else (1.0 if my_val < mean else 3.0)
+    else:
+        z = max(-1.5, min(1.5, (my_val - mean) / std))
+        score = 3.0 + z * (2.0 / 1.5)
+    score = max(1.0, min(5.0, score))
+    ranked = sorted(all_vals.items(), key=lambda kv: -kv[1])
+    rank = next((i + 1 for i, (t, _) in enumerate(ranked) if t == ticker), None)
+    yorumu = (f"Kompozit marj (brüt kâr+FAVÖK+net kâr ort.) %{my_val:.1f}, sektördeki "
+              f"diğer şirketlerin ortalaması %{mean:.1f}"
+              + (f" — {rank}. sırada / {len(all_vals)} şirket arasında" if rank else "") + ".")
+    return round(score, 1), yorumu
+
+
 SUMMARY_PROMPT_TEMPLATE = """Sen kıdemli bir yatırım fonu analistisin. Aşağıda bir şirketin PDF'ten
 çıkarılmış yatırımcı sunumu/faaliyet raporu metni var. Bu metin PDF'ten otomatik çıkarıldığı
 için grafik/infografik etiketleri, sayılar ve başlıklar karışık sırada gelmiş olabilir -
@@ -80,6 +163,8 @@ anlamı çıkarmaya çalış, birebir sıralı okuma bekleme.
 Rapor dönemi: {donem_label} {yil}
 
 {prior_context}
+
+{financial_context}
 
 GÖREV: Aşağıdaki alanları SADECE geçerli JSON olarak döndür. Başka hiçbir metin, açıklama
 veya kod bloğu işareti (```) ekleme - yanıtın ilk karakteri {{ olmalı.
@@ -108,8 +193,11 @@ rakamlardan çıkardığın) gelecek beklentilerinin genel tonu. 1=çok negatif/
 sayfası uzunluğunda (600-900 kelime). Yüzeysel maddeler değil, akıcı analiz paragrafları yaz.
 TAM OLARAK şu başlıklarla:
 ## 📊 Finansal Performans
-(Gelir, kâr, FAVÖK, marjlar - önceki dönem/yıl karşılaştırmalı, rakamları yorumla: büyüme
-kaliteli mi, marj daralması/genişlemesi neden kaynaklanıyor, birkaç paragraf)
+(Gelir, kâr, FAVÖK - önceki dönem/yıl karşılaştırmalı, rakamları yorumla: büyüme kaliteli mi,
+marj daralması/genişlemesi neden kaynaklanıyor, birkaç paragraf. ZORUNLU: brüt kâr marjı,
+FAVÖK marjı ve net kâr marjının ÜÇÜNÜ DE yüzde değerleriyle ve önceki döneme göre gelişim
+yönüyle (yükseldi/düştü/sabit, kaç puan) AÇIKÇA belirt - GERÇEK FİNANSAL VERİLER bölümü
+aşağıda verilmişse o rakamları BİREBİR kullan, verilmemişse rapor metninden çıkar)
 ## 🎯 Operasyonel ve Stratejik Gelişmeler
 (Kapasite, yeni yatırımlar, pazar payı, yönetim açıklamaları - bunların gelecekteki
 finansallara olası etkisini yorumla)
@@ -122,6 +210,9 @@ borçluluk, kur riski, tek müşteri/sektör bağımlılığı)
 (SON PARAGRAF - en az 4-5 cümle: genel tabloyu özetle ve hangi yöne işaret ettiğini net
 söyle - örn. 'sonuçlar olumlu/karışık/zayıf, X ve Y nedeniyle temkinli/iyimser bir görünüm
 öne çıkıyor, izlenmesi gereken en kritik nokta Z'. Somut ve net ol, muğlak ifadelerden kaçın.
+ZORUNLU: bu paragrafta da brüt kâr marjı, FAVÖK marjı ve net kâr marjının üçünün genel
+gelişim yönünü (iyileşiyor/kötüleşiyor/karışık) kısaca yeniden vurgula - final
+değerlendirmenin marj tablosuyla tutarlı olduğu net olsun.
 Bu paragrafın sonuna şunu ekle: '*Not: Bu bir yatırım tavsiyesi değildir, raporun analistçe
 yorumlanmış bir değerlendirmesidir.*')>"
 }}
@@ -354,7 +445,31 @@ def _call_gemini_with_retry(client, prompt, max_attempts=3, max_output_tokens=80
     raise last_error
 
 
-def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
+def _format_financial_context(fm):
+    """Import edilmis GERCEK finansallardan (varsa) brut kar/FAVOK/net kar
+    marjlarini, oncekiyle karsilastirmali, LLM promptuna eklenecek bir metin
+    blogu olarak hazirlar - boylece metin_ozeti'nin "Finansal Performans" ve
+    "Degerlendirme" bolumleri TAHMIN degil GERCEK rakamlarla yazilir."""
+    if not fm:
+        return ("GERÇEK FİNANSAL VERİLER: Bu ticker için import edilmiş finansal veri yok - "
+                "brüt kâr/FAVÖK/net kâr marjlarını rapor metninden çıkarman gerekiyor.")
+    lines = ["GERÇEK FİNANSAL VERİLER (import edilmiş, KESIN doğru - rapor metnindeki "
+             "olası farklı rakamlar yerine BUNLARI kullan):"]
+    for key, prev_key, label in _MARGIN_FIELDS:
+        v, vp = fm.get(key), fm.get(prev_key)
+        if v is not None and vp is not None:
+            d = v - vp
+            yon = "yükseldi" if d > 0 else ("düştü" if d < 0 else "sabit kaldı")
+            lines.append(f"- {label}: %{vp:.1f} → %{v:.1f} ({yon}, "
+                         f"{'+' if d >= 0 else ''}{d:.1f} puan)")
+        elif v is not None:
+            lines.append(f"- {label}: %{v:.1f} (önceki dönem verisi yok)")
+    if fm.get('period_latest') and fm.get('period_prev'):
+        lines.append(f"(Dönemler: {fm['period_prev']} → {fm['period_latest']})")
+    return "\n".join(lines)
+
+
+def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis, financial_margins=None):
     if genai is None:
         raise RuntimeError("google-genai paketi kurulu değil (requirements.txt'e eklenmeli).")
     api_key = _get_gemini_api_key()
@@ -376,12 +491,16 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
     else:
         prior_context = "Bu ticker için kayıtlı önceki dönem hedefi yok - bu ilk kayıt olacak."
 
+    fm = (financial_margins or {}).get(ticker) if ticker else None
+    financial_context = _format_financial_context(fm)
+
     client = genai.Client(api_key=api_key)
     prompt = SUMMARY_PROMPT_TEMPLATE.format(
         ticker=ticker or "(belirtilmedi)",
         donem_label=donem_label or "",
         yil=yil or "",
         prior_context=prior_context,
+        financial_context=financial_context,
         sektor_listesi=", ".join(SEKTOR_LISTESI),
         report_text=truncated,
     )
@@ -409,6 +528,16 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis):
             f"\n\n---\n*Not: Rapor metni çok uzun olduğu için ilk "
             f"{MAX_SUMMARY_INPUT_CHARS:,} karakteri analiz edildi.*"
         )
+
+    # Marj Development icin import edilmis GERCEK finansal veri varsa (fm,
+    # yukarida prompt icin de hazirlandi), LLM'in metinden yaptigi TAHMINI
+    # onunla EZ - deterministik ve daha dogru, Gemini kotasi da harcamiyor.
+    # Yoksa LLM'in tahmini fallback olarak kalir.
+    dev_score, dev_yorumu = compute_marj_development_from_financials(fm)
+    if dev_score is not None:
+        parsed["marj_development_puani"] = dev_score
+        parsed["marj_development_yorumu"] = dev_yorumu + " (kaynak: import edilmiş finansallar)"
+
     return parsed
 
 
@@ -620,20 +749,14 @@ def get_sector_rollup(yil, donem):
 
 SECTOR_ROLLUP_PROMPT_TEMPLATE = """Sen kıdemli bir portföy stratejistisin. Aşağıda BIST
 şirketlerinin {donem_label} {yil} dönemine ait faaliyet raporu/yatırımcı sunumu özetleri var
-(bazılarında ayrıca şirketin KENDİ geçmişine göre önceden hesaplanmış bir "marj gelişimi" notu
-da bulunuyor - bu SENİN görevin değil, sadece bağlam için verildi).
+(bazılarında ayrıca şirketin gerçek finansallarından hesaplanmış bir "marj gelişimi" notu da
+bulunuyor - bu sadece bağlam için verildi, sen bu puanı DEĞİL, aşağıdaki görevleri üreteceksin).
 Şirketler henüz sektörlere ayrılmamış olabilir - bu senin görevinin bir parçası.
 
 Görevlerin:
 1) HER şirketi, SADECE aşağıdaki listeden TEK bir sektöre ata (listedeki isimleri birebir kullan):
    {sektor_listesi}
-2) HER şirket için, ÖZETİNDEKİ bilgilere dayanarak, o şirketi AYNI SEKTÖRDEKİ DİĞER
-   şirketlerle KIYASLAYARAK 1-5 arası (yarım puan olabilir, örn 3.5) bir puan ver:
-   - marj_current_puani: Net ve brüt kâr marjları, SEKTÖR ORTALAMASINA göre şu anda ne
-     durumda? (5=sektördeki en güçlü marjlara sahip/liderlerden, 3=sektör ortalaması civarı,
-     1=sektördeki en zayıf marjlara sahip). Bu SEKTÖR İÇİ KIYASLAMALI bir puan - şirketin
-     kendi geçmişiyle değil, AYNI SEKTÖRDEKİ DİĞER şirketlerle kıyasla.
-   - marj_current_yorumu: "<1 kısa cümlelik gerekçe, somut rakamla mümkünse>"
+2) HER şirket için, ÖZETİNDEKİ bilgilere dayanarak 1-5 arası (yarım puan olabilir, örn 3.5):
    - gorunum_puani: Raporda yer alan pozitif/negatif beklentilerin genel değerlemesi
      (5=çok olumlu görünüm, 1=çok olumsuz görünüm)
    - gorunum_yorumu: "<1 kısa cümlelik gerekçe>"
@@ -641,6 +764,9 @@ Görevlerin:
    sektörleri BİRBİRİYLE KIYASLAYARAK 1-5 arası bir sektör skoru ver (5=en güçlü/olumlu
    görünümlü sektör, 1=en zayıf/olumsuz). Skorlar mutlaka birbirinden farklılaşsın - bütün
    sektörlere aynı skoru verme, gerçek bir sıralama/kıyaslama yap.
+
+Not: Şirketlerin sektör ortalamasına göre marj konumu (Marj Current) BURADA senin isin degil -
+gercek finansal verilerden ayrica ve deterministik olarak hesaplanacak.
 
 --- ŞİRKET ÖZETLERİ ---
 {sirket_verileri}
@@ -656,8 +782,7 @@ analiz - marjlar genel olarak iyiye mi kötüye mi gidiyor, hangi ortak temalar/
 çıkıyor>",
       "sektor_skoru": <1-5 arası, diğer sektörlerle kıyaslanmış tam sayı veya yarım puan (örn 3.5)>,
       "sirketler": [
-        {{"ticker": "<TICKER>", "marj_current_puani": <1-5>, "marj_current_yorumu": "<kısa gerekçe>",
-          "gorunum_puani": <1-5>, "gorunum_yorumu": "<kısa gerekçe>"}}
+        {{"ticker": "<TICKER>", "gorunum_puani": <1-5>, "gorunum_yorumu": "<kısa gerekçe>"}}
       ]
     }}
   ]
@@ -665,16 +790,24 @@ analiz - marjlar genel olarak iyiye mi kötüye mi gidiyor, hangi ortak temalar/
 """
 
 
-def compute_sector_rollup(yil, donem):
+def compute_sector_rollup(yil, donem, financial_margins=None):
     """Secilen (yil, donem) icin kayitli TUM rapor ozetlerini TEK bir Gemini
-    cagrisinda hem sektorlere siniflandirir hem de sirket/sektor bazinda
-    puanlar (ayri ayri cagirsaydik model diger sektorleri/sirketleri gormeden
+    cagrisinda sektorlere siniflandirir + sektor/gorunum analizini uretir
+    (ayri ayri cagirsaydik model diger sektorleri/sirketleri gormeden
     "kiyaslamali" skor veremezdi). Sektor atamasi onceden yapilmis olmasi
     sart degil - bu fonksiyon o donemdeki TUM raporlari (sektoru bos olanlar
     dahil) tarar ve siniflandirir.
+
+    Marj Current, Gemini'nin DEGIL, bu fonksiyonun Python tarafinin isi:
+    Gemini'nin DONDURDUGU sektor gruplarina gore, her sirketin (varsa)
+    import edilmis GERCEK finansallardan hesaplanan kompozit marjini AYNI
+    SEKTORDEKI diger sirketlerle kiyaslar (bkz. compute_marj_current_for_sector).
+    Ayrica Marj Development de (varsa) finansallardan tazelenir - ilk analiz
+    sirasinda financial_store'da olmayip sonradan import edilmis olabilir.
+
     Sonuclari sector_rollup_analysis tablosuna (yil, donem, sektor) anahtariyla
     kaydeder (upsert); ayrica company_report_summaries uzerindeki sektor/marj/
-    gorunum alanlarini da bu siniflandirmayla gunceller."""
+    gorunum alanlarini da gunceller."""
     if genai is None:
         raise RuntimeError("google-genai paketi kurulu değil.")
     api_key = _get_gemini_api_key()
@@ -685,6 +818,7 @@ def compute_sector_rollup(yil, donem):
     if reports.empty:
         raise RuntimeError(f"{DONEM_LABELS.get(donem, donem)} {yil} için hiç kayıtlı rapor yok.")
 
+    financial_margins = financial_margins or {}
     valid_tickers = set(reports['ticker'])
     lines = []
     for _, r in reports.iterrows():
@@ -714,6 +848,7 @@ def compute_sector_rollup(yil, donem):
             if sektor not in SEKTOR_LISTESI:
                 continue  # model listeden sapmis olabilir - guvenlik icin atla
             sirketler = [c for c in s.get('sirketler', []) if c.get('ticker') in valid_tickers]
+            sektor_tickers = [c['ticker'] for c in sirketler]
             cur.execute("""
                 INSERT INTO sector_rollup_analysis (yil, donem, sektor, makro_analiz, sektor_skoru, sirket_sayisi)
                 VALUES (%s, %s, %s, %s, %s, %s)
@@ -725,14 +860,33 @@ def compute_sector_rollup(yil, donem):
             """, (int(yil), donem, sektor, s.get('makro_analiz'), s.get('sektor_skoru'),
                   len(sirketler)))
             for c in sirketler:
-                cur.execute("""
+                ticker = c['ticker']
+                cur_score, cur_yorumu = compute_marj_current_for_sector(
+                    ticker, sektor_tickers, financial_margins)
+                dev_score, dev_yorumu = compute_marj_development_from_financials(
+                    financial_margins.get(ticker))
+
+                set_values = {
+                    "sektor": sektor,
+                    "gorunum_puani": c.get('gorunum_puani'),
+                    "gorunum_yorumu": c.get('gorunum_yorumu'),
+                }
+                # marj_current/development SADECE finansal veriyle hesaplanabildiginde
+                # guncelleniyor - hesaplanamiyorsa (peer/finansal veri yok) mevcut
+                # deger (varsa onceki bir hesaplamadan kalan) SIFIRLANMIYOR.
+                if cur_score is not None:
+                    set_values["marj_current_puani"] = cur_score
+                    set_values["marj_current_yorumu"] = cur_yorumu
+                if dev_score is not None:
+                    set_values["marj_development_puani"] = dev_score
+                    set_values["marj_development_yorumu"] = dev_yorumu + " (kaynak: import edilmiş finansallar)"
+
+                set_sql = ", ".join(f"{col} = %s" for col in set_values)
+                cur.execute(f"""
                     UPDATE company_report_summaries
-                    SET sektor = %s, marj_current_puani = %s, marj_current_yorumu = %s,
-                        gorunum_puani = %s, gorunum_yorumu = %s
+                    SET {set_sql}
                     WHERE ticker = %s AND yil = %s AND donem = %s
-                """, (sektor, c.get('marj_current_puani'), c.get('marj_current_yorumu'),
-                      c.get('gorunum_puani'), c.get('gorunum_yorumu'),
-                      c['ticker'], int(yil), donem))
+                """, list(set_values.values()) + [ticker, int(yil), donem])
                 sirket_toplam += 1
     conn.commit()
     get_sector_rollup.clear()
@@ -747,7 +901,13 @@ def _kpi_card(label, value, yon):
     st.caption(YON_BADGE.get(yon, "❓ Belirsiz"))
 
 
-def display_company_reports():
+def display_company_reports(financial_margins=None):
+    """financial_margins: streamlit_app.get_financial_margin_snapshot()'un
+    ciktisi - {ticker: {net_margin, net_margin_prev, gross_margin, ...}}.
+    Verilmezse ({} / None) Marj Development LLM tahminine, Marj Current ise
+    hesaplanamadigi icin bos ('—') kalir - modul streamlit_app olmadan da
+    (izole testlerde) calismaya devam eder."""
+    financial_margins = financial_margins or {}
     st.markdown("### 📄 Şirket Yatırımcı Raporu Analizi")
     st.caption("Bir KAP bildirim linki veya şirketin kendi yatırımcı ilişkileri "
                "sayfasındaki doğrudan PDF linkini yapıştırın — AI ile özetlenir ve "
@@ -804,7 +964,8 @@ def display_company_reports():
                     st.error("PDF'ten metin çıkarılamadı (taranmış/görüntü tabanlı bir PDF olabilir).")
                 else:
                     with st.spinner(f"Gemini ile analiz ediliyor ({n_pages} sayfa, {len(text):,} karakter)..."):
-                        kpis = _summarize_with_gemini(text, ticker, DONEM_LABELS[donem], int(yil), prior)
+                        kpis = _summarize_with_gemini(text, ticker, DONEM_LABELS[donem], int(yil), prior,
+                                                       financial_margins=financial_margins)
 
                     if kpis.get('_parse_failed'):
                         # Bozuk/yarim sonucu KALICI olarak kaydetmiyoruz - aksi halde
@@ -937,6 +1098,12 @@ def display_company_reports():
                "birbirleriyle kıyaslayarak analiz eder. **Hesapla/Yenile** o dönem için yeni "
                "bir Gemini çağrısı yapar (yeni eklenen raporlar da dahil edilir); **Göster** "
                "ise hiçbir çağrı yapmadan en son hesaplanmış tabloyu getirir.")
+    if not financial_margins:
+        st.caption("ℹ️ Marj Current/Development, sidebar'dan **Import Financials** çalıştırılmış "
+                   "hisseler için gerçek finansal verilerden hesaplanır (daha doğru, Gemini "
+                   "kotası harcamaz). Henüz hiç finansal import edilmemiş — Marj Current "
+                   "hesaplanamıyor, Marj Development ise şimdilik faaliyet raporu metninden "
+                   "LLM tahminine dayanıyor.")
 
     periods = get_available_periods_for_rollup()
     if periods.empty:
@@ -972,7 +1139,8 @@ def display_company_reports():
                 try:
                     with st.spinner(f"{len(donem_raporlari)} şirket sektörlere göre "
                                      f"sınıflandırılıp analiz ediliyor..."):
-                        n_sektor, n_sirket = compute_sector_rollup(sel_yil, sel_donem)
+                        n_sektor, n_sirket = compute_sector_rollup(sel_yil, sel_donem,
+                                                                    financial_margins=financial_margins)
                     st.success(f"✅ {n_sirket} şirket, {n_sektor} sektöre ayrılarak "
                                f"{_period_fmt((sel_yil, sel_donem))} analizi güncellendi.")
                     st.session_state['_sektor_rollup_shown_period'] = (sel_yil, sel_donem)
