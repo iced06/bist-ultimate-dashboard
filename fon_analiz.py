@@ -177,6 +177,57 @@ def _get_stock_list():
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def _get_fund_list():
+    """Fon bazlı drill-down için: sadece gerçekten hisse verisi olan fonlar
+    (funds tablosunda fon_holdings'i olmayan bir kayıt varsa listelenmez)."""
+    conn = _get_live_connection()
+    if conn is None:
+        return pd.DataFrame()
+    return pd.read_sql("""
+        SELECT DISTINCT f.fon_kodu, f.fon_adi
+        FROM funds f
+        JOIN fund_holdings fh ON fh.fon_kodu = f.fon_kodu
+        ORDER BY f.fon_kodu
+    """, conn)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_positions_for_fund(fon_kodu):
+    """Bir fonun TÜM aylara ait pozisyonları + fund_holdings_change'den
+    (fiyat/miktar ayrıştırması) o ayki değişimi - _get_holders_for_stock'un
+    hisse yerine fon eksenindeki simetriği."""
+    conn = _get_live_connection()
+    if conn is None:
+        return pd.DataFrame()
+    return pd.read_sql("""
+        SELECT s.ticker, s.uyruk, fh.yil, fh.ay,
+               fh.toplam_tutar_tl, fh.agirlik_pct,
+               fhc.miktar_etkisi_tl, fhc.fiyat_etkisi_tl, fhc.degisim_tl, fhc.degisim_agirlik_pct
+        FROM fund_holdings fh
+        JOIN securities s ON s.id = fh.security_id
+        LEFT JOIN fund_holdings_change fhc
+               ON fhc.fon_kodu = fh.fon_kodu AND fhc.security_id = fh.security_id
+              AND fhc.yil = fh.yil AND fhc.ay = fh.ay
+        WHERE fh.fon_kodu = %(fk)s
+        ORDER BY fh.yil, fh.ay, fh.agirlik_pct DESC
+    """, conn, params={"fk": fon_kodu})
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_fund_aum(fon_kodu, yil, ay):
+    """Secilen ay icin fonun buyukluk/nakit akisi bilgisi (varsa) - katilma
+    payi giris/cikisi baglam vermek icin (fon buyuyor mu kuculuyor mu)."""
+    conn = _get_live_connection()
+    if conn is None:
+        return None
+    df = pd.read_sql("""
+        SELECT fon_toplam_degeri, pay_fiyati, katilma_payi_giris_tl, katilma_payi_cikis_tl
+        FROM fund_aum_monthly WHERE fon_kodu = %(fk)s AND yil = %(yil)s AND ay = %(ay)s
+    """, conn, params={"fk": fon_kodu, "yil": yil, "ay": ay})
+    return df.iloc[0] if not df.empty else None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def _get_holders_for_stock(security_id):
     conn = _get_live_connection()
     if conn is None:
@@ -424,6 +475,76 @@ def _render_stock_drilldown(uyruk_filter=None):
     st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
 
+def _render_fund_drilldown():
+    """Hisse bazlı drill-down'un (_render_stock_drilldown) fon eksenindeki
+    simetriği: bir FON seçip, secilen ayda o fonun TÜM pozisyonlarını ve
+    bir önceki aya göre (fiyat/miktar ayrıştırılmış) değişimini gösterir."""
+    funds = _get_fund_list()
+    if funds.empty:
+        st.info("Fon verisi bulunamadı.")
+        return
+
+    funds = funds.copy()
+    funds['label'] = funds['fon_kodu'] + ' - ' + funds['fon_adi'].fillna('').str.slice(0, 55)
+    sel_label = st.selectbox("Fon seç", options=funds['label'].tolist(), key="fund_drilldown_fon")
+    fon_kodu = funds.loc[funds['label'] == sel_label, 'fon_kodu'].iloc[0]
+
+    df = _get_positions_for_fund(fon_kodu)
+    if df.empty:
+        st.info("Bu fon için pozisyon verisi bulunamadı.")
+        return
+    for col in ['toplam_tutar_tl', 'agirlik_pct', 'miktar_etkisi_tl', 'fiyat_etkisi_tl',
+                'degisim_tl', 'degisim_agirlik_pct']:
+        df[col] = df[col].astype(float)
+
+    periods = sorted(df[['yil', 'ay']].drop_duplicates().itertuples(index=False, name=None))
+    yil, ay = _period_selector(periods, key="fund_drilldown_period")
+    period_df = df[(df['yil'] == yil) & (df['ay'] == ay)].copy()
+    # nominal_deger olmayan (tarihsel Excel) aylarda miktar_etkisi_tl NULL olur;
+    # bu durumda ham degisime (fiyat+miktar karisik) fallback yapiyoruz - bkz.
+    # _render_stock_drilldown'daki ayni mantik/not.
+    period_df['degisim_gosterilecek'] = period_df['miktar_etkisi_tl'].fillna(period_df['degisim_tl'])
+    period_df = period_df.sort_values('agirlik_pct', ascending=False, na_position='last')
+
+    aum = _get_fund_aum(fon_kodu, yil, ay)
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Pozisyon Sayısı", len(period_df))
+    with m2:
+        st.metric("Toplam Ağırlık (Hisse)", f"{period_df['agirlik_pct'].sum():.1f}%")
+    with m3:
+        giris = aum['katilma_payi_giris_tl'] if aum is not None else None
+        st.metric("Katılma Payı Girişi", _fmt_tl(giris) if pd.notna(giris) else "—")
+    with m4:
+        cikis = aum['katilma_payi_cikis_tl'] if aum is not None else None
+        st.metric("Katılma Payı Çıkışı", _fmt_tl(cikis) if pd.notna(cikis) else "—")
+
+    if period_df['miktar_etkisi_tl'].isna().all():
+        st.caption("ℹ️ Bu ay için adet verisi yok — 'Bu Ay Değişim' sütunu ham TL değişimidir "
+                   "(fiyat hareketini de içerir).")
+
+    st.markdown(f"#### {sel_label} — {TR_MONTHS_SHORT.get(ay, ay)} {yil} pozisyonları")
+    show = period_df.copy()
+    show['Hisse'] = show['ticker'] + show['uyruk'].apply(lambda u: '' if u == 'TC' else f" ({u})")
+    show['Ağırlık'] = show['agirlik_pct'].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
+    show['TL Tutar'] = show['toplam_tutar_tl'].apply(_fmt_tl)
+    show['Ağırlık Değişimi'] = show['degisim_agirlik_pct'].apply(lambda v: f"{v:+.2f}pp" if pd.notna(v) else "-")
+    show['Bu Ay Değişim'] = show['degisim_gosterilecek'].apply(_fmt_tl)
+    st.dataframe(show[['Hisse', 'Ağırlık', 'TL Tutar', 'Ağırlık Değişimi', 'Bu Ay Değişim']],
+                 use_container_width=True, hide_index=True,
+                 height=min(500, 38 * len(show) + 38))
+
+    # Fonun hisse portföyünün TL büyüklüğü zaman içinde
+    trend = df.groupby(['yil', 'ay'], as_index=False)['toplam_tutar_tl'].sum()
+    trend = trend.sort_values(['yil', 'ay'])
+    trend['label'] = trend.apply(lambda r: f"{TR_MONTHS_SHORT.get(int(r['ay']), r['ay'])} {int(r['yil'])}", axis=1)
+    fig = go.Figure(go.Scatter(x=trend['label'], y=trend['toplam_tutar_tl'], mode='lines+markers',
+                                line=dict(color='#10b981', width=2)))
+    fig.update_layout(title=f"{fon_kodu} — Toplam Hisse Portföyü (Zaman İçinde)", height=300,
+                       margin=dict(l=10, r=10, t=40, b=10), yaxis_title="TL")
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+
+
 def _render_kap_import_section():
     """Yeni ay icin KAP 'Fon Portfoy Dagilim Raporu' PDF'lerini ice aktarma
     paneli - db/import_kap_fund_report.py'daki import_one()'i reuse eder.
@@ -535,10 +656,11 @@ def display_funds_analysis():
                                 horizontal=True, key="uyruk_filter")
     uyruk_filter = {"🌍 Tümü": None, "🇹🇷 Yerli (TR)": "TC", "🌎 Yabancı (FOR)": "FOR"}[scope_label]
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📈 En Çok Alınan / Satılan",
         "🎯 Piyasa Değerine Göre Etki",
         "🔍 Hisse Bazlı Fon Takibi",
+        "🏦 Fon Bazlı Pozisyonlar",
     ])
     with tab1:
         _render_top_buys_sells(yil, ay, uyruk_filter)
@@ -550,3 +672,5 @@ def display_funds_analysis():
             _render_market_impact(yil, ay)
     with tab3:
         _render_stock_drilldown(uyruk_filter)
+    with tab4:
+        _render_fund_drilldown()
