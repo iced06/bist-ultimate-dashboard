@@ -202,7 +202,8 @@ def _get_positions_for_fund(fon_kodu):
     return pd.read_sql("""
         SELECT s.ticker, s.uyruk, fh.yil, fh.ay,
                fh.toplam_tutar_tl, fh.agirlik_pct,
-               fhc.miktar_etkisi_tl, fhc.fiyat_etkisi_tl, fhc.degisim_tl, fhc.degisim_agirlik_pct
+               fhc.miktar_etkisi_tl, fhc.fiyat_etkisi_tl, fhc.degisim_tl,
+               fhc.degisim_agirlik_pct, fhc.degisim_nominal
         FROM fund_holdings fh
         JOIN securities s ON s.id = fh.security_id
         LEFT JOIN fund_holdings_change fhc
@@ -296,6 +297,23 @@ def _fmt_tl(x):
     return f"{sign}{a:,.0f} TL"
 
 
+def _fmt_tl_signed(x):
+    """_fmt_tl gibi ama pozitif değerlere de '+' önekler - artış/azalış
+    ayrımının tabloda/grafikte tek bakışta görülmesi için (bkz. fon
+    drilldown'daki fiyat/miktar etkisi kırılımı)."""
+    if x is None or pd.isna(x):
+        return "-"
+    s = _fmt_tl(x)
+    return f"+{s}" if x > 0 else s
+
+
+def _fmt_adet_signed(x):
+    if x is None or pd.isna(x):
+        return "-"
+    sign = "+" if x > 0 else ""
+    return f"{sign}{x:,.0f} adet"
+
+
 def _period_selector(periods, key):
     labels = [f"{TR_MONTHS_SHORT.get(ay, ay)} {yil}" for yil, ay in periods]
     idx = st.selectbox("Dönem", options=list(range(len(periods))),
@@ -310,6 +328,25 @@ def _bar_chart(df, x_col, y_col, colors, title):
         text=[_fmt_tl(v) for v in df[x_col]], textposition='auto',
     ))
     fig.update_layout(title=title, height=max(300, 28 * len(df)),
+                       margin=dict(l=10, r=10, t=40, b=10),
+                       yaxis=dict(autorange="reversed"))
+    return fig
+
+
+def _signed_bar_chart(df, value_col, label_col, title, fmt_func):
+    """_bar_chart'ın işaretli (pozitif/negatif) versiyonu - artış yeşil,
+    azalış kırmızı. Fon drilldown'daki metrik seçiciyle (Ağırlık/TL/Fiyat
+    Etkisi/Miktar Etkisi/Adet Değişimi) kullanılır."""
+    d = df.dropna(subset=[value_col]).copy()
+    if d.empty:
+        return None
+    d = d.reindex(d[value_col].abs().sort_values(ascending=False).index)
+    colors = ['#22c55e' if v > 0 else '#ef4444' if v < 0 else '#94a3b8' for v in d[value_col]]
+    fig = go.Figure(go.Bar(
+        x=d[value_col], y=d[label_col], orientation='h', marker_color=colors,
+        text=[fmt_func(v) for v in d[value_col]], textposition='auto',
+    ))
+    fig.update_layout(title=title, height=max(300, 28 * len(d)),
                        margin=dict(l=10, r=10, t=40, b=10),
                        yaxis=dict(autorange="reversed"))
     return fig
@@ -494,7 +531,7 @@ def _render_fund_drilldown():
         st.info("Bu fon için pozisyon verisi bulunamadı.")
         return
     for col in ['toplam_tutar_tl', 'agirlik_pct', 'miktar_etkisi_tl', 'fiyat_etkisi_tl',
-                'degisim_tl', 'degisim_agirlik_pct']:
+                'degisim_tl', 'degisim_agirlik_pct', 'degisim_nominal']:
         df[col] = df[col].astype(float)
 
     periods = sorted(df[['yil', 'ay']].drop_duplicates().itertuples(index=False, name=None))
@@ -505,6 +542,7 @@ def _render_fund_drilldown():
     # _render_stock_drilldown'daki ayni mantik/not.
     period_df['degisim_gosterilecek'] = period_df['miktar_etkisi_tl'].fillna(period_df['degisim_tl'])
     period_df = period_df.sort_values('agirlik_pct', ascending=False, na_position='last')
+    period_df['Hisse'] = period_df['ticker'] + period_df['uyruk'].apply(lambda u: '' if u == 'TC' else f" ({u})")
 
     aum = _get_fund_aum(fon_kodu, yil, ay)
     m1, m2, m3, m4 = st.columns(4)
@@ -525,14 +563,41 @@ def _render_fund_drilldown():
 
     st.markdown(f"#### {sel_label} — {TR_MONTHS_SHORT.get(ay, ay)} {yil} pozisyonları")
     show = period_df.copy()
-    show['Hisse'] = show['ticker'] + show['uyruk'].apply(lambda u: '' if u == 'TC' else f" ({u})")
     show['Ağırlık'] = show['agirlik_pct'].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
     show['TL Tutar'] = show['toplam_tutar_tl'].apply(_fmt_tl)
     show['Ağırlık Değişimi'] = show['degisim_agirlik_pct'].apply(lambda v: f"{v:+.2f}pp" if pd.notna(v) else "-")
-    show['Bu Ay Değişim'] = show['degisim_gosterilecek'].apply(_fmt_tl)
-    st.dataframe(show[['Hisse', 'Ağırlık', 'TL Tutar', 'Ağırlık Değişimi', 'Bu Ay Değişim']],
+    show['Toplam Değişim (TL)'] = show['degisim_tl'].apply(_fmt_tl_signed)
+    show['Fiyat Etkisi (TL)'] = show['fiyat_etkisi_tl'].apply(_fmt_tl_signed)
+    show['Miktar Etkisi / Gerçek Al-Sat (TL)'] = show['miktar_etkisi_tl'].apply(_fmt_tl_signed)
+    show['Adet Değişimi'] = show['degisim_nominal'].apply(_fmt_adet_signed)
+    st.caption("💡 **Fiyat Etkisi**: TL değerindeki değişimin sadece fiyat hareketinden gelen kısmı. "
+               "**Miktar Etkisi**: fonun o hissede tuttuğu adedin değişmesinden gelen kısım — yani "
+               "**gerçek alım/satım sinyali**. **Adet Değişimi**: elde tutulan nominal adedin kendisi "
+               "ne kadar değişti (0 ise fon o hissede hiç işlem yapmamış, sadece fiyat hareket etmiş demektir).")
+    st.dataframe(show[['Hisse', 'Ağırlık', 'TL Tutar', 'Ağırlık Değişimi', 'Toplam Değişim (TL)',
+                        'Fiyat Etkisi (TL)', 'Miktar Etkisi / Gerçek Al-Sat (TL)', 'Adet Değişimi']],
                  use_container_width=True, hide_index=True,
                  height=min(500, 38 * len(show) + 38))
+
+    st.markdown("##### 📊 Değişim Grafiği")
+    metric_options = {
+        "Miktar Etkisi — Gerçek Alım/Satım (TL)": ('miktar_etkisi_tl', _fmt_tl_signed),
+        "Fiyat Etkisi (TL)": ('fiyat_etkisi_tl', _fmt_tl_signed),
+        "Adet Değişimi (Nominal)": ('degisim_nominal', _fmt_adet_signed),
+        "Ağırlık Değişimi (pp)": ('degisim_agirlik_pct', lambda v: f"{v:+.2f}pp"),
+        "Toplam Değişim (TL)": ('degisim_tl', _fmt_tl_signed),
+    }
+    metric_label = st.selectbox("Grafikte gösterilecek metrik", options=list(metric_options.keys()),
+                                 key="fund_drilldown_metric")
+    value_col, fmt_func = metric_options[metric_label]
+    fig_metric = _signed_bar_chart(
+        period_df, value_col, 'Hisse',
+        f"{fon_kodu} — {metric_label} ({TR_MONTHS_SHORT.get(ay, ay)} {yil})", fmt_func)
+    if fig_metric is None:
+        st.info("Bu dönem için bu metrik hesaplanamadı — muhtemelen bu fonun ilk kayıtlı dönemi "
+                 "(karşılaştırılacak önceki ay yok) ya da bu ayda adet verisi mevcut değil.")
+    else:
+        st.plotly_chart(fig_metric, use_container_width=True, config=PLOTLY_CONFIG)
 
     # Fonun hisse portföyünün TL büyüklüğü zaman içinde
     trend = df.groupby(['yil', 'ay'], as_index=False)['toplam_tutar_tl'].sum()
