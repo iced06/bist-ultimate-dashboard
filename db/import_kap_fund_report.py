@@ -115,7 +115,11 @@ def _log_etl(conn, fon_kodu, yil, ay, durum, detay):
 
 def import_one(conn, path_or_url):
     """Tek bir KAP fon portfoy raporu PDF'ini parse edip DB'ye yazar.
-    Donus: (basarili_mi: bool, detay_mesaji: str)."""
+    Donus: (basarili_mi: bool, detay_mesaji: str, meta: dict).
+    meta her zaman (basarisiz olsa bile, PDF parse edilebildiyse) fon_kodu/
+    yil/ay/sirket_sayisi/agirlik/katilma_payi alanlarini icerir - caller'in
+    (orn. bir UI'daki "beklenen donem") PDF'in kendi donemiyle uyusup
+    uyusmadigini kontrol edebilmesi icin."""
     text = _load_pdf_text(path_or_url)
     result = parse_pdf_text(text)
     holdings = aggregate_by_isin(result, 'HISSE_SENEDI')
@@ -124,10 +128,18 @@ def import_one(conn, path_or_url):
     recon_ok = printed_total is not None and abs(printed_total - total_weight) < 0.05
 
     fon_kodu, yil, ay = result.fon_kodu, result.donem_yil, result.donem_ay
+    meta = {
+        'fon_kodu': fon_kodu, 'fon_adi': result.fon_adi, 'yil': yil, 'ay': ay,
+        'sirket_sayisi': len(holdings), 'agirlik_pct': total_weight,
+        'printed_total': printed_total,
+        'katilma_payi_giris_tl': result.katilma_payi_giris_tl,
+        'katilma_payi_cikis_tl': result.katilma_payi_cikis_tl,
+    }
+
     if not fon_kodu or not yil or not ay:
         detay = f"Fon kodu/donem parse edilemedi (fon_kodu={fon_kodu!r}, yil={yil}, ay={ay})"
         _log_etl(conn, fon_kodu, yil, ay, 'HATA', detay)
-        return False, detay
+        return False, detay, meta
 
     if not recon_ok:
         detay = (f"Reconciliation basarisiz: hesaplanan agirlik {total_weight:.2f}% != "
@@ -135,7 +147,7 @@ def import_one(conn, path_or_url):
                  f"unmatched_prefix_tokens={result.unmatched_prefix_tokens}, "
                  f"unknown_sections={len(result.unknown_sections)} satir")
         _log_etl(conn, fon_kodu, yil, ay, 'UYUMSUZLUK', detay)
-        return False, detay
+        return False, detay, meta
 
     with conn.cursor() as cur:
         cur.execute("""
@@ -181,7 +193,7 @@ def import_one(conn, path_or_url):
     if result.katilma_payi_extract_method == 'UNRESOLVED':
         detay += " | UYARI katilma payi giris/cikis bulunamadi (NULL birakildi)"
     _log_etl(conn, fon_kodu, yil, ay, 'OK', detay)
-    return True, detay
+    return True, detay, meta
 
 
 def main():
@@ -211,7 +223,7 @@ def main():
     for src in args.sources:
         print(f"\n=== {src} ===")
         try:
-            ok, detay = import_one(conn, src)
+            ok, detay, _meta = import_one(conn, src)
             print(("OK: " if ok else "ATLANDI: ") + detay)
             if not ok:
                 exit_code = 1

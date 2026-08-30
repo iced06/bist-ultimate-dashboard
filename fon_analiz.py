@@ -8,7 +8,9 @@ Three views:
   3. Per-stock drill-down: which funds bought/sold it, and how much
 """
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -27,6 +29,19 @@ try:
     import borsapy as bp
 except ImportError:
     bp = None
+
+# KAP fon raporu import script'i db/ altinda, standalone bir CLI olarak
+# yazildi - Funds sekmesindeki "Yeni Ay Icin Ice Aktar" butonu icin ayni
+# import_one() fonksiyonunu tekrar yazmadan reuse ediyoruz.
+_DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'db')
+try:
+    if _DB_DIR not in sys.path:
+        sys.path.insert(0, _DB_DIR)
+    from import_kap_fund_report import import_one as _kap_import_one
+    _KAP_IMPORT_ERROR = None
+except Exception as _e:
+    _kap_import_one = None
+    _KAP_IMPORT_ERROR = _e
 
 PLOTLY_CONFIG = {'displayModeBar': False, 'scrollZoom': False, 'responsive': True}
 
@@ -409,6 +424,90 @@ def _render_stock_drilldown(uyruk_filter=None):
     st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
 
+def _render_kap_import_section():
+    """Yeni ay icin KAP 'Fon Portfoy Dagilim Raporu' PDF'lerini ice aktarma
+    paneli - db/import_kap_fund_report.py'daki import_one()'i reuse eder.
+    Yil/Ay secimi bir OVERRIDE degil, sadece BEKLENTI kontrolu: her PDF
+    kendi donemini kendi basligindan okur (guvenilir, 4 gercek fonda
+    dogrulandi) - burada secilen Yil/Ay sadece "yukledigim gercekten bu
+    donem miydi" diye kullaniciya gorunur bir uyari vermek icin kullanilir,
+    PDF'in kendi soyledigi donem HER ZAMAN esas alinir."""
+    with st.expander("📤 Yeni Ay İçin Fon Raporu İçe Aktar (KAP PDF)"):
+        st.caption("KAP'tan indirdiğin (veya şirketin sunduğu) 'Fon Portföy Dağılım Raporu' "
+                   "PDF linklerini ya da yerel dosya yollarını yapıştır — her satıra bir tane. "
+                   "Sistem her PDF'in kendi başlığından fon kodunu ve dönemi otomatik okur; "
+                   "reconciliation (PDF'in kendi yazdığı toplamla karşılaştırma) başarısız "
+                   "olursa o rapor GÜVENLİK İÇİN hiç yazılmaz.")
+
+        if _kap_import_one is None:
+            st.error(f"İçe aktarma modülü yüklenemedi: {_KAP_IMPORT_ERROR}")
+            return
+
+        c1, c2 = st.columns(2)
+        with c1:
+            exp_yil = st.number_input("Beklenen Yıl", min_value=2015, max_value=2035,
+                                       value=datetime.now().year, step=1, key="kap_import_yil")
+        with c2:
+            exp_ay = st.selectbox("Beklenen Ay", list(range(1, 13)),
+                                   format_func=lambda m: TR_MONTHS_SHORT.get(m, m),
+                                   index=datetime.now().month - 1, key="kap_import_ay")
+        st.caption("↑ Sadece uyarı amaçlı — PDF farklı bir dönem için çıkarsa engellenmez, "
+                   "sadece 'beklenenle uyuşmuyor' diye işaretlenir.")
+
+        sources_text = st.text_area(
+            "PDF URL'leri veya dosya yolları (satır satır)", height=110,
+            key="kap_import_sources",
+            placeholder="https://www.kap.org.tr/tr/api/file/download/...\nhttps://www.kap.org.tr/tr/api/file/download/...",
+        )
+
+        if st.button("📥 İçe Aktar", use_container_width=True):
+            sources = [s.strip() for s in sources_text.splitlines() if s.strip()]
+            if not sources:
+                st.warning("En az bir URL veya dosya yolu girin.")
+                return
+
+            conn = _get_live_connection()
+            if conn is None:
+                st.error("Veritabanı bağlantısı yok — içe aktarılamadı.")
+                return
+
+            results = []
+            prog = st.progress(0)
+            for i, src in enumerate(sources):
+                try:
+                    ok, detay, meta = _kap_import_one(conn, src)
+                except Exception as e:
+                    ok, detay, meta = False, str(e), {}
+                results.append((src, ok, detay, meta))
+                prog.progress((i + 1) / len(sources))
+            prog.empty()
+
+            n_ok = sum(1 for _, ok, _, _ in results if ok)
+            (st.success if n_ok == len(results) else st.warning)(
+                f"{n_ok}/{len(results)} rapor başarıyla içe aktarıldı."
+            )
+
+            for src, ok, detay, meta in results:
+                fon_kodu = meta.get('fon_kodu') or '?'
+                donem_str = (f"{TR_MONTHS_SHORT.get(meta.get('ay'), meta.get('ay'))} {meta.get('yil')}"
+                             if meta.get('yil') and meta.get('ay') else 'dönem okunamadı')
+                mismatch = (meta.get('yil') and meta.get('ay')
+                            and (int(meta['yil']) != int(exp_yil) or int(meta['ay']) != int(exp_ay)))
+                icon = "✅" if ok else "⚠️"
+                title = f"{icon} {fon_kodu} — {donem_str}"
+                if mismatch:
+                    title += f" (BEKLENEN {TR_MONTHS_SHORT.get(exp_ay, exp_ay)} {exp_yil} İLE UYUŞMUYOR!)"
+                with st.expander(title):
+                    st.caption(src)
+                    st.write(detay)
+
+            # Yeni veri hemen gorunsun diye ilgili cache'leri temizle.
+            _get_available_periods.clear()
+            get_latest_fund_flow_map.clear()
+            _get_flow_ranking.clear()
+            _get_stock_list.clear()
+
+
 def display_funds_analysis():
     st.markdown("### 💰 Fund Flow Analysis")
     st.caption("Aylık fon portföy değişimleri — KAP 'Portföy Dağılım Raporu' verisine dayanır. "
@@ -420,9 +519,12 @@ def display_funds_analysis():
                   "değişkeni eksik olabilir.")
         return
 
+    _render_kap_import_section()
+
     periods = _get_available_periods()
     if not periods:
-        st.warning("Henüz fon verisi yüklenmemiş.")
+        st.warning("Henüz fon verisi yüklenmemiş — yukarıdaki 'Yeni Ay İçin Fon Raporu İçe "
+                   "Aktar' bölümünden başlayabilirsin.")
         return
 
     pc1, pc2 = st.columns([2, 1])
