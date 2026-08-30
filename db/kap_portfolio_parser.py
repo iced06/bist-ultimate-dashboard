@@ -61,6 +61,16 @@ TURKISH_MONTHS = {
     'ekim': 10, 'kasım': 11, 'kasim': 11, 'aralık': 12, 'aralik': 12,
 }
 
+
+def _tr_lower(s):
+    """Python'un varsayilan str.lower()'i Turkce buyuk 'İ' harfini 'i' +
+    BIRLESIK NOKTA (U+0307) olarak kucultur, duz ASCII 'i' DEGIL - bu yuzden
+    "HAZİRAN".lower() 'haziran' ile EŞLEŞMEZ (klasik "Turkish-I" hatasi).
+    Gercek veriyle yakalandi: AYA fonunun Haziran raporunda ay=0 cikti,
+    Temmuz raporunda İ olmadigi icin sansla calismisti. Once 'İ'/'I' harflerini
+    ACIKCA degistirip sonra kucultuyoruz."""
+    return s.replace('İ', 'i').replace('I', 'ı').lower()
+
 # ── Format B (Ata Portföy'de gozlemlendi) ──
 # Ingilizce sayi formati (virgul=binlik, nokta=ondalik) - Format A'nin
 # Turkce formatindan (nokta=binlik, virgul=ondalik) TAM TERSI.
@@ -219,7 +229,7 @@ def _parse_header(all_text):
     if len(first_lines) > 1:
         m = re.match(r'([A-Za-zçğıöşüÇĞİÖŞÜ]+)-(\d{4})', first_lines[1])
         if m:
-            ay = TURKISH_MONTHS.get(m.group(1).lower(), 0)
+            ay = TURKISH_MONTHS.get(_tr_lower(m.group(1)), 0)
             yil = int(m.group(2))
     return fon_kodu, fon_adi, yil, ay
 
@@ -335,7 +345,7 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
     m = FORMAT_B_TITLE_RE.search(first_line)
     if m:
         result.fon_kodu = m.group(1)
-        result.donem_ay = TURKISH_MONTHS.get(m.group(2).lower(), 0)
+        result.donem_ay = TURKISH_MONTHS.get(_tr_lower(m.group(2)), 0)
         result.donem_yil = int(m.group(3))
     for line in lines:
         m = FORMAT_B_FON_ADI_RE.match(line)
