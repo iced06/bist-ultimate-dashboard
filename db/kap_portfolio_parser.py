@@ -111,6 +111,10 @@ SECTION_HEADERS = {
     'REPO': 'REPO',
     'T.REPO': 'REPO',
     'TPP': 'TPP',
+    'TÜREV': 'TUREV',  # VIOP/futures - BV Portfoy sablonunda gozlemlendi (bkz.
+                        # readme_findings.md); HISSE_SENEDI'ye SIZMAMASI icin
+                        # ayri bolum olarak isaretleniyor (import script'i
+                        # sadece HISSE_SENEDI'yi DB'ye yaziyor).
 }
 # Bu satirlar bolum degistirmez, sadece alt-etiket (Hisse Turk / Hisse Yabanci vb.)
 SUB_LABEL_LINES = {
@@ -222,6 +226,11 @@ def _parse_header(all_text):
     fon_kodu, fon_adi, yil, ay = '', '', 0, 0
     if first_lines:
         m = re.match(r'^([A-ZÇĞİÖŞÜ0-9]+)\s*-\s*(.+)$', first_lines[0])
+        if not m:
+            # BV Portfoy gibi bazi fonlarda kod ile fon adi arasinda tire
+            # YOK, sadece bosluk var: "BV1 BV PORTFÖY ... FON". Kisa (<=6
+            # karakter) buyuk harf/rakam ilk token'i kod olarak kabul et.
+            m = re.match(r'^([A-ZÇĞİÖŞÜ0-9]{2,6})\s+(.+)$', first_lines[0])
         if m:
             fon_kodu, fon_adi = m.group(1), m.group(2)
         else:
@@ -257,6 +266,30 @@ def parse_pdf_text(all_text: str) -> ParseResult:
     return _parse_pdf_text_format_a(all_text)
 
 
+def _is_data_line(line):
+    """Ticker+nominal/toplam/yuzde iceren bir satir mi (ISIN bu satirda
+    olmasi SART degil - bkz. _find_isin_in_window)."""
+    return len(NUM_RE.findall(line)) >= 4 and DATE_RE.search(line) is not None
+
+
+def _find_isin_in_window(lines, start_idx, max_lookahead=10):
+    """BV Portfoy sablonunda gozlemlendi: sirket adi uzun oldugunda ISIN,
+    ticker+sayisal-veri satiriyla AYNI satirda degil, adin sardigi
+    satirlardan BIRINDE cikabiliyor (orn. 'ASTOR TL 15.000,00 ...' veri
+    satirindan SONRA gelen 'ENERJİ TREASTR00013' satirinda). Bir sonraki
+    veri satirina / bolum basligina / stop-line'a kadar ileri arar."""
+    for j in range(start_idx + 1, min(len(lines), start_idx + 1 + max_lookahead)):
+        nxt = lines[j]
+        if not nxt:
+            continue
+        if nxt in SECTION_HEADERS or STOP_LINE_RE.match(nxt) or _is_data_line(nxt):
+            break
+        m = ISIN_RE.search(nxt)
+        if m:
+            return m.group(0)
+    return None
+
+
 def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
     result = ParseResult()
     result.dialect = 'A'
@@ -267,7 +300,7 @@ def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
     current_section = 'UNKNOWN'
     lines = [l.strip() for l in all_text.split('\n')]
 
-    for line in lines:
+    for i, line in enumerate(lines):
         if not line:
             continue
         if line in SUB_LABEL_LINES:
@@ -282,12 +315,21 @@ def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
                     result.printed_group_totals[current_section] = _to_float(nums[-1])
             continue
 
-        isin_match = ISIN_RE.search(line)
-        if not isin_match:
+        if not _is_data_line(line):
+            # ISIN tasimayan/sayisal alanlari eksik satir (baslik tekrari,
+            # sirket adi devam satiri, vb.) - atla.
             continue
-        isin = isin_match.group(0)
 
-        prefix = line[:isin_match.start()].split()
+        isin_match = ISIN_RE.search(line)
+        if isin_match:
+            isin = isin_match.group(0)
+            prefix = line[:isin_match.start()].split()
+        else:
+            # ISIN bu satirda yok - komsu satirlarda ara (bkz. yukaridaki not).
+            isin = _find_isin_in_window(lines, i)
+            split_pos = min(m.start() for m in (NUM_RE.search(line), DATE_RE.search(line)) if m)
+            prefix = line[:split_pos].split()
+
         ticker, flagged = _extract_ticker(prefix, result.unmatched_prefix_tokens, line)
         if not ticker:
             continue
@@ -300,10 +342,6 @@ def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
 
         nums = NUM_RE.findall(line)
         dates = DATE_RE.findall(line)
-        if len(nums) < 4 or not dates:
-            # ISIN tasiyan ama beklenen sayisal alanlara sahip olmayan satir
-            # (ör. baslik tekrari) - atla.
-            continue
 
         nominal = _to_float(nums[0])
         toplam_tutar = _to_float(nums[-4]) if len(nums) >= 4 else 0.0
