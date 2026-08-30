@@ -30,7 +30,7 @@ import io
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kap_portfolio_parser import parse_pdf_text, aggregate_by_isin
+from kap_portfolio_parser import parse_pdf_text, aggregate_by_isin, check_reconciliation
 
 try:
     import requests
@@ -71,31 +71,58 @@ def _load_pdf_text(path_or_url):
 
 
 def _infer_uyruk(isin):
+    # Format B'nin (bkz. kap_portfolio_parser.py) hisse senedi satirlarinda
+    # ISIN yok - su ana kadar gozlemlenen tek ornekte (Ata Portföy) hepsi
+    # yerli BIST tickeriydi, bu yuzden ISIN yoksa 'TC' varsayiliyor. Format
+    # B'de yabanci hisse iceren bir fon cikarsa bu varsayim revize edilmeli.
+    if not isin:
+        return 'TC'
     return 'TC' if isin.startswith('TR') else 'FOR'
 
 
 def _upsert_security(cur, isin, ticker, uyruk):
-    """securities'te isin UNIQUE'dir; (ticker, uyruk) ise SADECE isin BOS
-    olan (tarihsel Excel kaynakli) kayitlar icin partial-unique'dir (bkz.
-    schema.sql - idx_securities_ticker_uyruk_legacy). Bu FARK bilerek boyle:
-    yabanci hisselerde ayni ticker'i FARKLI sirketlerin paylasmasi COK
-    yaygin (orn. "SAN" hem Sanofi=FR0000120578 hem Santander=ES0113900J37
-    olabiliyor; TMG fonu pilotunda gercek veriyle yakalandi) - bu yuzden
-    ticker+uyruk'e gore eslestirme SADECE isin'i hala BOS olan eski bir
-    Excel kaydini doldurmak icin kullanilir, ISIN'i DOLU baska bir sirketle
-    ASLA birlestirilmez (o zaman guvenle yeni bir satir acilir)."""
-    cur.execute("SELECT id FROM securities WHERE isin = %s", (isin,))
-    row = cur.fetchone()
-    if row:
-        cur.execute("UPDATE securities SET ticker = %s WHERE id = %s", (ticker, row[0]))
-        return row[0]
+    """securities'te isin UNIQUE'dir; (ticker, uyruk) esleme kurali UYRUK'A
+    GORE FARKLI (bkz. schema.sql - idx_securities_ticker_uyruk_legacy):
 
-    cur.execute("SELECT id FROM securities WHERE ticker = %s AND uyruk = %s AND isin IS NULL",
-                (ticker, uyruk))
-    row = cur.fetchone()
-    if row:
-        cur.execute("UPDATE securities SET isin = %s WHERE id = %s", (isin, row[0]))
-        return row[0]
+    - TC (yerli): BIST tickerlari BIST/SPK kurallari geregi tekildir -
+      farkli sirketlerin ayni yerli ticker'i paylasmasi soz konusu degil.
+      Bu yuzden mevcut bir kaydin ISIN'i DOLU olsa bile (ticker, 'TC') ile
+      guvenle eslestirilip (ISIN yoksa) doldurulabilir. Bunu YAPMAZSAK
+      (sadece isin IS NULL kayitlarla eslestirseydik) Format B gibi ISIN'siz
+      kaynaklardan gelen HER TC hisse, zaten ISIN'i bilinenayni sirket icin
+      IKINCI bir security_id yaratirdi - canli veriyle (AYA fonu, 21/31
+      hisse) tam olarak bu bulundu ve duzeltildi.
+    - FOR (yabanci): ayni ticker'i FARKLI sirketlerin paylasmasi COK
+      yaygin (orn. "SAN" hem Sanofi=FR0000120578 hem Santander=ES0113900J37
+      olabiliyor; TMG fonu pilotunda gercek veriyle yakalandi) - bu yuzden
+      SADECE isin'i hala BOS olan bir kaydi doldurmak icin eslestirilir,
+      ISIN'i DOLU baska bir sirketle ASLA birlestirilmez.
+
+    isin=None ise (Format B) dogrudan ISIN aramasi atlanir - SQL'de
+    "= NULL" hicbir zaman eslesmez."""
+    if isin:
+        cur.execute("SELECT id FROM securities WHERE isin = %s", (isin,))
+        row = cur.fetchone()
+        if row:
+            cur.execute("UPDATE securities SET ticker = %s WHERE id = %s", (ticker, row[0]))
+            return row[0]
+
+    if uyruk == 'TC':
+        cur.execute("SELECT id, isin FROM securities WHERE ticker = %s AND uyruk = 'TC'", (ticker,))
+        row = cur.fetchone()
+        if row:
+            existing_id, existing_isin = row
+            if isin and not existing_isin:
+                cur.execute("UPDATE securities SET isin = %s WHERE id = %s", (isin, existing_id))
+            return existing_id
+    else:
+        cur.execute("SELECT id FROM securities WHERE ticker = %s AND uyruk = 'FOR' AND isin IS NULL",
+                    (ticker,))
+        row = cur.fetchone()
+        if row:
+            if isin:
+                cur.execute("UPDATE securities SET isin = %s WHERE id = %s", (isin, row[0]))
+            return row[0]
 
     cur.execute("""
         INSERT INTO securities (isin, ticker, uyruk, varlik_sinifi)
@@ -123,15 +150,14 @@ def import_one(conn, path_or_url):
     text = _load_pdf_text(path_or_url)
     result = parse_pdf_text(text)
     holdings = aggregate_by_isin(result, 'HISSE_SENEDI')
-    total_weight = sum(h['agirlik_ftd_pct'] for h in holdings)
-    printed_total = result.printed_group_totals.get('HISSE_SENEDI')
-    recon_ok = printed_total is not None and abs(printed_total - total_weight) < 0.05
+    calculated, printed_total, recon_ok, recon_unit = check_reconciliation(result, holdings)
 
     fon_kodu, yil, ay = result.fon_kodu, result.donem_yil, result.donem_ay
     meta = {
         'fon_kodu': fon_kodu, 'fon_adi': result.fon_adi, 'yil': yil, 'ay': ay,
-        'sirket_sayisi': len(holdings), 'agirlik_pct': total_weight,
-        'printed_total': printed_total,
+        'sirket_sayisi': len(holdings), 'dialect': result.dialect,
+        'reconciliation_metric': result.reconciliation_metric,
+        'calculated': calculated, 'printed_total': printed_total,
         'katilma_payi_giris_tl': result.katilma_payi_giris_tl,
         'katilma_payi_cikis_tl': result.katilma_payi_cikis_tl,
     }
@@ -142,8 +168,9 @@ def import_one(conn, path_or_url):
         return False, detay, meta
 
     if not recon_ok:
-        detay = (f"Reconciliation basarisiz: hesaplanan agirlik {total_weight:.2f}% != "
-                 f"PDF GRUP TOPLAMI {printed_total}% - GUVENLIK ICIN YAZILMADI. "
+        detay = (f"Reconciliation basarisiz ({result.dialect} sablonu, {recon_unit} bazli): "
+                 f"hesaplanan {calculated:.2f}{recon_unit} != PDF'in yazdigi {printed_total}{recon_unit} "
+                 f"- GUVENLIK ICIN YAZILMADI. "
                  f"unmatched_prefix_tokens={result.unmatched_prefix_tokens}, "
                  f"unknown_sections={len(result.unknown_sections)} satir")
         _log_etl(conn, fon_kodu, yil, ay, 'UYUMSUZLUK', detay)
@@ -186,7 +213,8 @@ def import_one(conn, path_or_url):
                   h['agirlik_ftd_pct'], h['lot_sayisi']))
             n_written += 1
 
-    detay = (f"{n_written} hisse yazildi, agirlik {total_weight:.2f}% (PDF: {printed_total}%), "
+    detay = (f"{n_written} hisse yazildi ({result.dialect} sablonu), "
+             f"toplam {calculated:.2f}{recon_unit} (PDF: {printed_total}{recon_unit}), "
              f"katilma payi giris/cikis yontemi: {result.katilma_payi_extract_method}")
     if result.unmatched_prefix_tokens:
         detay += f" | UYARI unmatched_prefix_tokens={result.unmatched_prefix_tokens}"

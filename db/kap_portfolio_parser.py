@@ -3,7 +3,22 @@ KAP "Fon Portföy Dağılım Raporu" PDF parser - pilot v2.
 
 Girdi: KAP'tan indirilmiş, Java-serialization zarfindan temizlenmis PDF.
 Cikti: fon icindeki her menkul kiymet lotu icin normalize edilmis satirlar +
-       ISIN bazinda aggregate edilmis (fon, donem, hisse) tablosu.
+       ISIN (veya ISIN yoksa ticker) bazinda aggregate edilmis (fon, donem,
+       hisse) tablosu.
+
+IKI FARKLI RAPOR SABLONU ("dialect") gozlemlendi - ilk 4 fonluk pilotta
+(Tera/HSBC/İş Portföy/Neo) hepsi AYNI sablonu (Format A) kullaniyordu, bu
+yuzden "SPK'nin tek bir zorunlu formati var" varsayimi yapilmisti. 5. fonda
+(Ata Portföy) FARKLI bir sablon (Format B) cikti - bu yuzden iki ayri
+ayristirici var, ilk satirdaki basliga gore otomatik secilir:
+  - Format A ("{KOD}-{FON ADI}" basligi): satirlarda ISIN var, Turkce sayi
+    formati (1.234.567,89), bolumler "HİSSE SENETLERİ" duz satir, toplam
+    "GRUP TOPLAMI ... %" satirinda.
+  - Format B ("{KOD} FON {AY} {YIL} PORTFÖY DAĞILIM RAPORU" basligi):
+    hisse senedi satirlarinda ISIN YOK (sadece BIST ticker), Ingilizce sayi
+    formati (1,234,567.89), bolumler "A) HİSSE SENETLERİ" harfli, toplam
+    "TOPLAM: <nominal> <rayic>" satirinda (yuzde YOK - reconciliation TL
+    toplamina gore yapiliyor, % degil).
 
 Bilinen sinirlamalar (readme_findings.md'de detayli):
 - "Tem.Ver." gibi az sayida bilinen on-ek disinda yeni bir on-ek turu
@@ -12,6 +27,11 @@ Bilinen sinirlamalar (readme_findings.md'de detayli):
 - Bolum basliklari (HISSE SENETLERI / BORCLANMA SENETLERI / DIGER / ...)
   KAP sablonunda gozlemlenen isimlerle esleseiyor; yeni bir fon turunde
   farkli bir baslik cikarsa o blok "UNKNOWN" bolumune duser ve rapor edilir.
+- Iki dialect disinda UCUNCU bir sablon cikarsa (baslik hicbirine
+  uymazsa), Format A varsayilan olarak denenir - muhtemelen 0 satir
+  yakalar ve reconciliation basarisiz olup GUVENLI sekilde reddedilir
+  (yanlis veri yazmaz), ama parse_pdf_text'e yeni bir dialect eklemek
+  gerekecektir.
 """
 import re
 import sys
@@ -41,6 +61,37 @@ TURKISH_MONTHS = {
     'ekim': 10, 'kasım': 11, 'kasim': 11, 'aralık': 12, 'aralik': 12,
 }
 
+# ── Format B (Ata Portföy'de gozlemlendi) ──
+# Ingilizce sayi formati (virgul=binlik, nokta=ondalik) - Format A'nin
+# Turkce formatindan (nokta=binlik, virgul=ondalik) TAM TERSI.
+FORMAT_B_TITLE_RE = re.compile(
+    r'^([A-ZÇĞİÖŞÜ0-9]+)\s+FON\s+([A-ZÇĞİÖŞÜ]+)\s+(\d{4})\s+PORTF[ÖO]Y\s+DA[ĞG]ILIM\s+RAPORU',
+    re.IGNORECASE,
+)
+FORMAT_B_FON_ADI_RE = re.compile(r'^A\.\s*FONUN ADI\s*:\s*(.+)$', re.IGNORECASE)
+FORMAT_B_SECTION_RE = re.compile(r'^([A-ZÇĞİÖŞÜ])\)\s*(.+)$')
+FORMAT_B_ROW_RE = re.compile(
+    r'^([A-ZÇĞİÖŞÜ0-9]{2,8})\s+.+?\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d.]+)%\s*$'
+)
+FORMAT_B_TOPLAM_RE = re.compile(r'^TOPLAM:\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$')
+FORMAT_B_GIRIS_RE = re.compile(
+    r'KATILMA PAYI İHRA[ÇC]LARINDAN KAYNAKLANAN NAK[İI]T G[İI]R[İI][ŞS]LER[İI]\s*:\s*([\d,]+\.\d+)',
+    re.IGNORECASE,
+)
+FORMAT_B_CIKIS_RE = re.compile(
+    r'KATILMA PAYI İADELER[İI]NDEN KAYNAKLANAN NAK[İI]T [ÇC]IK[İI][ŞS]LAR[İI]\s*:\s*([\d,]+\.\d+)',
+    re.IGNORECASE,
+)
+FORMAT_B_SECTION_MAP = {
+    'HİSSE SENETLERİ': 'HISSE_SENEDI',
+    'YABANCI HİSSE SENETLERİ': 'HISSE_SENEDI',
+}
+
+
+def _to_float_en(s):
+    """Ingilizce sayi formati: 1,234,567.89 -> 1234567.89"""
+    return float(s.replace(',', ''))
+
 # Bolum basligi -> normalize edilmis kategori adi
 SECTION_HEADERS = {
     'HİSSE SENETLERİ': 'HISSE_SENEDI',
@@ -65,7 +116,7 @@ STOP_LINE_RE = re.compile(r'^(GRUP TOPLAMI|FON PORTFÖY DEĞERİ|IV-FON|V-AY|VI-
 class Lot:
     section: str
     ticker: str
-    isin: str
+    isin: str  # Format B'nin hisse senedi satirlarinda ISIN yok -> None
     nominal_deger: float
     tarih: str
     toplam_tutar_tl: float
@@ -89,6 +140,9 @@ class ParseResult:
     katilma_payi_giris_tl: float = None
     katilma_payi_cikis_tl: float = None
     katilma_payi_extract_method: str = ''  # 'same-line' | 'block-fallback' | 'UNRESOLVED'
+    dialect: str = 'A'  # 'A' | 'B' - hangi rapor sablonu tespit edildi
+    reconciliation_metric: str = 'agirlik_pct'  # 'agirlik_pct' | 'toplam_tl' - printed_group_totals
+                                                  # neyle kiyaslanmali (dialect'e gore degisir)
 
 
 def _to_float(s):
@@ -183,7 +237,19 @@ def _extract_ticker(prefix_tokens, unmatched_log, raw_line):
 
 
 def parse_pdf_text(all_text: str) -> ParseResult:
+    """Dispatcher: ilk satirdaki basliga gore Format A/B'yi secer (bkz. dosya
+    basindaki not). Ne A ne B'ye uyarsa Format A denenir - reconciliation
+    basarisiz olup GUVENLI sekilde reddedilecektir (yeni bir 3. dialect
+    eklemek gerekecek anlamina gelir)."""
+    first_line = next((l for l in all_text.split('\n') if l.strip()), '')
+    if FORMAT_B_TITLE_RE.search(first_line):
+        return _parse_pdf_text_format_b(all_text)
+    return _parse_pdf_text_format_a(all_text)
+
+
+def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
     result = ParseResult()
+    result.dialect = 'A'
     result.fon_kodu, result.fon_adi, result.donem_yil, result.donem_ay = _parse_header(all_text)
     (result.katilma_payi_giris_tl, result.katilma_payi_cikis_tl,
      result.katilma_payi_extract_method) = _extract_katilma_payi(all_text)
@@ -255,12 +321,93 @@ def parse_pdf_text(all_text: str) -> ParseResult:
     return result
 
 
+def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
+    """Ata Portföy'de gozlemlenen ikinci sablon - bkz. dosya basindaki not.
+    Hisse senedi satirlarinda ISIN YOK (sadece BIST ticker), Ingilizce sayi
+    formati, harfli bolum basliklari ("A) HİSSE SENETLERİ"), toplam satiri
+    yuzde degil TL bazli ("TOPLAM: <nominal> <rayic>") - bu yuzden
+    reconciliation_metric='toplam_tl' olarak isaretleniyor (Format A'nin
+    yuzde bazli reconciliation'inin aksine)."""
+    result = ParseResult(dialect='B', reconciliation_metric='toplam_tl')
+
+    lines = [l.strip() for l in all_text.split('\n')]
+    first_line = next((l for l in lines if l), '')
+    m = FORMAT_B_TITLE_RE.search(first_line)
+    if m:
+        result.fon_kodu = m.group(1)
+        result.donem_ay = TURKISH_MONTHS.get(m.group(2).lower(), 0)
+        result.donem_yil = int(m.group(3))
+    for line in lines:
+        m = FORMAT_B_FON_ADI_RE.match(line)
+        if m:
+            result.fon_adi = m.group(1).strip()
+            break
+
+    m = FORMAT_B_GIRIS_RE.search(all_text)
+    if m:
+        result.katilma_payi_giris_tl = _to_float_en(m.group(1))
+    m = FORMAT_B_CIKIS_RE.search(all_text)
+    if m:
+        result.katilma_payi_cikis_tl = _to_float_en(m.group(1))
+    if result.katilma_payi_giris_tl is not None and result.katilma_payi_cikis_tl is not None:
+        result.katilma_payi_extract_method = 'same-line'
+    else:
+        result.katilma_payi_extract_method = 'UNRESOLVED'
+
+    current_section = 'UNKNOWN'
+    for line in lines:
+        if not line:
+            continue
+
+        sm = FORMAT_B_SECTION_RE.match(line)
+        if sm:
+            current_section = FORMAT_B_SECTION_MAP.get(sm.group(2).strip().upper(), 'DIGER')
+            continue
+
+        tm = FORMAT_B_TOPLAM_RE.match(line)
+        if tm:
+            if current_section not in result.printed_group_totals:
+                # 2. sayi = rayic deger toplami - toplam_tutar_tl ile ayni
+                # birim, dogrudan kiyaslanabilir (bkz. asagida __main__).
+                result.printed_group_totals[current_section] = _to_float_en(tm.group(2))
+            continue
+
+        if current_section != 'HISSE_SENEDI':
+            continue
+
+        rm = FORMAT_B_ROW_RE.match(line)
+        if not rm:
+            # HISSE_SENEDI bolumunde ama satir kalibi tutmuyor - genelde
+            # bir sirket adinin devam satiri (orn. "A.Ş" tek basina) -
+            # sessizce atla, bu Format A'daki "ISIN yok -> atla" ile ayni
+            # mantik.
+            continue
+
+        ticker, nominal_s, rayic_s, pct_s = rm.groups()
+        result.lots.append(Lot(
+            section=current_section,
+            ticker=ticker,
+            isin=None,
+            nominal_deger=_to_float_en(nominal_s),
+            tarih='',
+            toplam_tutar_tl=_to_float_en(rayic_s),
+            agirlik_grup_pct=float(pct_s),
+            agirlik_fpd_pct=float(pct_s),
+            agirlik_ftd_pct=float(pct_s),
+            raw_line=line,
+        ))
+
+    return result
+
+
 def aggregate_by_isin(result: ParseResult, section='HISSE_SENEDI'):
+    """Isim aksine ragmen ISIN'i olmayan (Format B) satirlar icin ticker'a
+    gore de aggregate edebilir - anahtar ISIN varsa ISIN, yoksa ticker'dir."""
     agg = {}
     for lot in result.lots:
         if lot.section != section:
             continue
-        key = lot.isin
+        key = lot.isin or lot.ticker
         if key not in agg:
             agg[key] = {
                 'ticker': lot.ticker, 'isin': lot.isin,
@@ -274,6 +421,23 @@ def aggregate_by_isin(result: ParseResult, section='HISSE_SENEDI'):
     return list(agg.values())
 
 
+def check_reconciliation(result: ParseResult, holdings: list):
+    """result.reconciliation_metric'e gore (dialect'e bagli) dogru olcuyu
+    secip PDF'in kendi yazdigi toplamla kiyaslar. Donus:
+    (hesaplanan, yazili_toplam, ok, olcu_etiketi)."""
+    printed_total = result.printed_group_totals.get('HISSE_SENEDI')
+    if result.reconciliation_metric == 'toplam_tl':
+        calculated = sum(h['toplam_tutar_tl'] for h in holdings)
+        tol = max(1.0, abs(printed_total or 0) * 0.001)
+        label = 'TL'
+    else:
+        calculated = sum(h['agirlik_ftd_pct'] for h in holdings)
+        tol = 0.05
+        label = '%'
+    ok = printed_total is not None and abs(printed_total - calculated) < tol
+    return calculated, printed_total, ok, label
+
+
 if __name__ == '__main__':
     import pdfplumber
 
@@ -282,16 +446,14 @@ if __name__ == '__main__':
             text = '\n'.join((p.extract_text() or '') for p in pdf.pages)
         result = parse_pdf_text(text)
         holdings = aggregate_by_isin(result, 'HISSE_SENEDI')
-        total_weight = sum(h['agirlik_ftd_pct'] for h in holdings)
-
-        printed_total = result.printed_group_totals.get('HISSE_SENEDI')
-        ok = printed_total is not None and abs(printed_total - total_weight) < 0.05
+        calculated, printed_total, ok, unit = check_reconciliation(result, holdings)
 
         print(f"\n=== {path} ===")
-        print(f"Fon: {result.fon_kodu} - {result.fon_adi} | Donem: {result.donem_ay}/{result.donem_yil}")
+        print(f"Fon: {result.fon_kodu} - {result.fon_adi} | Donem: {result.donem_ay}/{result.donem_yil} "
+              f"| Dialect: {result.dialect}")
         print(f"Hisse senedi kalemi (aggregate sonrasi): {len(holdings)}")
-        print(f"Hesaplanan toplam agirlik (FTD bazli): {total_weight:.2f}%")
-        print(f"PDF'de yazan GRUP TOPLAMI (FTD bazli): {printed_total}")
+        print(f"Hesaplanan toplam ({unit}): {calculated:,.2f}")
+        print(f"PDF'de yazan toplam ({unit}): {printed_total}")
         print(f"Reconciliation: {'OK - eslesti' if ok else 'UYUSMUYOR - incele!'}")
         if result.katilma_payi_extract_method == 'UNRESOLVED':
             print("UYARI - katilma payi girisi/cikisi bulunamadi (nakit akisi verisi eksik kalacak)")
