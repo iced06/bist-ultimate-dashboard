@@ -168,7 +168,8 @@ def import_one(conn, path_or_url):
                     nominal_deger = EXCLUDED.nominal_deger,
                     toplam_tutar_tl = EXCLUDED.toplam_tutar_tl,
                     agirlik_pct = EXCLUDED.agirlik_pct,
-                    lot_sayisi = EXCLUDED.lot_sayisi
+                    lot_sayisi = EXCLUDED.lot_sayisi,
+                    kaynak = EXCLUDED.kaynak
             """, (fon_kodu, yil, ay, security_id, h['nominal_deger'], h['toplam_tutar_tl'],
                   h['agirlik_ftd_pct'], h['lot_sayisi']))
             n_written += 1
