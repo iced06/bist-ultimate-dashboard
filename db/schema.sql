@@ -30,10 +30,20 @@ CREATE TABLE securities (
     para_birimi     VARCHAR(3),                        -- 'TL' | 'USD' | 'EUR' | 'CHF' | ...
     varlik_sinifi   VARCHAR(20) NOT NULL DEFAULT 'HISSE_SENEDI',
                     -- 'HISSE_SENEDI' | 'BORCLANMA_SENEDI' | 'FON' | 'DIGER'
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (ticker, uyruk)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_securities_ticker ON securities(ticker);
+-- (ticker, uyruk) UNIQUE bir SUTUN KISITI DEGIL, sadece ISIN'i BOS olan
+-- (tarihsel Excel kaynakli) kayitlara uygulanan bir PARTIAL index - yabanci
+-- hisselerde ayni ticker'i FARKLI sirketlerin paylasmasi COK yaygin (orn.
+-- "SAN" hem Sanofi=FR0000120578 hem Santander=ES0113900J37 olabiliyor;
+-- "BBVA" hem Ispanya hem ABD ADR listesi icin ayri ISIN'lerle gorulebiliyor).
+-- KAP fon parser pilotunda (TMG fonu) gercek veriyle yakalandi - blanket
+-- UNIQUE(ticker, uyruk) bu durumda IKINCI sirketin/listelemenin INSERT'ini
+-- reddedip ilkiyle YANLISLIKLA birlestiriyordu. ISIN dolu oldugunda ISIN
+-- zaten tekil kimlik oldugu icin bu kisitin korumaya ihtiyaci kalmiyor.
+CREATE UNIQUE INDEX idx_securities_ticker_uyruk_legacy
+    ON securities(ticker, uyruk) WHERE isin IS NULL;
 
 -- 2) Fonlar (fon master data) — "Fonlar" / "Hisseler" sayfalarının kalıcı kısmı
 CREATE TABLE funds (
