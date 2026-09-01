@@ -13,6 +13,7 @@ import ta
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import json
 import requests
 import time
 try:
@@ -20,6 +21,16 @@ try:
 except ImportError:
     def load_dotenv():
         pass
+try:
+    import psycopg2
+    from psycopg2.extras import Json as _PgJson
+except ImportError:
+    # fon_analiz.py/sirket_raporlari.py'deki ayni savunmaci desen - psycopg2
+    # bazi ortamlarda kurulamayabiliyor, bu durumda finansal veri DB'ye
+    # kaydedilemez ama uygulama coketmez (yerel financial_store.json
+    # fallback'ine duser - bkz. _load_financial_store).
+    psycopg2 = None
+    _PgJson = None
 try:
     from fon_analiz import display_funds_analysis, get_latest_fund_flow_map
 except Exception as _fon_analiz_import_error:
@@ -307,15 +318,138 @@ if 'sma50_breadth' not in st.session_state:
 
 FINANCIAL_STORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "financial_store.json")
 
-def _save_financial_store():
-    """Persist financial store to JSON file for cross-session use.
 
-    Writes to a temp file and atomically renames it into place (os.replace)
-    so a crash or concurrent read mid-write can never leave a truncated/
-    corrupt financial_store.json behind.
+# ── Financial Data - DB persistence ──
+# Streamlit Cloud (ve benzeri) ortamlarda dosya sistemi KALICI DEĞİL - her
+# redeploy/restart'ta financial_store.json sıfırlanıyor, bu yüzden "2 gün
+# önce import ettim ama gitmiş" şikayeti burdan geliyordu. Diğer modüllerin
+# (fon_analiz.py, sirket_raporlari.py) zaten kullandığı Postgres (Neon) DB'yi
+# ASIL kalıcı depo yapıyoruz - yerel JSON dosyası artık sadece DB
+# yapılandırılmamış (DATABASE_URL yok) offline geliştirme için bir fallback.
+def _get_database_url():
+    try:
+        if "DATABASE_URL" in st.secrets:
+            return st.secrets["DATABASE_URL"]
+    except Exception:
+        pass
+    return os.getenv("DATABASE_URL")
+
+
+def _make_financial_db_connection():
+    if psycopg2 is None:
+        return None
+    dsn = _get_database_url()
+    if not dsn:
+        return None
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("SET search_path TO bist, public;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS financial_statements (
+                ticker            VARCHAR(24) NOT NULL,
+                yil               SMALLINT NOT NULL,
+                veri              JSONB NOT NULL,
+                guncelleme_zamani TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (ticker, yil)
+            );
+        """)
+    return conn
+
+
+@st.cache_resource(show_spinner=False)
+def _get_financial_db_connection():
+    return _make_financial_db_connection()
+
+
+def _get_live_financial_db_connection():
+    """Neon serverless boşta kalınca bağlantıyı askıya alabiliyor - diğer
+    modüllerdeki (fon_analiz.py, sirket_raporlari.py) aynı desenle canlılığı
+    kontrol edip gerekirse yeniden bağlanıyoruz."""
+    conn = _get_financial_db_connection()
+    if conn is None:
+        return None
+    try:
+        if conn.closed:
+            raise psycopg2.OperationalError("connection closed")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:
+        _get_financial_db_connection.clear()
+        conn = _get_financial_db_connection()
+    return conn
+
+
+def _upsert_financial_statement_to_db(symbol, raw_data):
+    """Bir hissenin TÜM yıllık verisini (raw_data = {yıl: [items]}) DB'ye
+    kalıcı olarak yazar - aynı (ticker, yıl) tekrar import edilirse veriyi
+    GÜNCELLER (kullanıcı isteği: "import dediğimde önceki financials update
+    olsun"). Başarısızsa sessizce False döner - session_state'teki veri
+    yine de kullanılabilir kalır, sadece kalıcılık garantisi olmaz."""
+    conn = _get_live_financial_db_connection()
+    if conn is None or _PgJson is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            for yil, items in raw_data.items():
+                cur.execute("""
+                    INSERT INTO financial_statements (ticker, yil, veri, guncelleme_zamani)
+                    VALUES (%s, %s, %s, now())
+                    ON CONFLICT (ticker, yil) DO UPDATE SET
+                        veri = EXCLUDED.veri, guncelleme_zamani = now()
+                """, (symbol, int(yil), _PgJson(items)))
+        return True
+    except Exception:
+        return False
+
+
+def _load_financial_store_from_db():
+    """DB'de kayıtlı TÜM hisselerin finansal verisini {ticker: {yıl: [items]}}
+    formatında döner - boş sözlük = DB yok/yapılandırılmamış/boş (caller
+    yerel JSON dosyasına fallback yapabilir)."""
+    conn = _get_live_financial_db_connection()
+    if conn is None:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticker, yil, veri FROM financial_statements")
+            rows = cur.fetchall()
+    except Exception:
+        return {}
+    store = {}
+    for ticker, yil, veri in rows:
+        store.setdefault(ticker, {})[int(yil)] = veri
+    return store
+
+
+def _delete_financial_store_from_db():
+    """'Clear Imported Data' butonu icin - DB'deki TÜM finansal veriyi siler.
+    DB artık asıl kalıcı depo olduğundan, bu çağrı yapılmazsa buton
+    session/dosyayı temizler ama bir sonraki yüklemede veri DB'den geri
+    gelir (buton anlamsız kalır)."""
+    conn = _get_live_financial_db_connection()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM financial_statements")
+        return True
+    except Exception:
+        return False
+
+
+def _save_financial_store():
+    """Financial store'u yerel JSON dosyasina yazar - DB yapilandirilmamis
+    ortamlarda (offline gelistirme) fallback olarak kullanilir. Asil kalici
+    yazim (DB) import_all_financials icinde HER hisse basarili oldukca
+    ayri ayri yapiliyor (bkz. _upsert_financial_statement_to_db) - boylece
+    kismi bir import (orn. 60/100 hissede basarili) bile kalici kalir.
+
+    Dosyaya yazarken temp dosyaya yazip atomik rename (os.replace) yapiyoruz
+    ki bir crash ya da eszamanli okuma yarim yazilmis/bozuk bir
+    financial_store.json birakmasin.
     """
     try:
-        import json
         payload = {
             "import_time": st.session_state.financial_import_time,
             "data": {}
@@ -331,11 +465,17 @@ def _save_financial_store():
         pass  # Non-critical — store still works in session
 
 def _load_financial_store():
-    """Load financial store from JSON file if available and session is empty."""
+    """Financial store'u ONCE DB'den (kalici - Streamlit Cloud gibi dosya
+    sistemi kalici olmayan ortamlarda bile hayatta kalir) yukler; DB
+    yapilandirilmamis/bossa yerel JSON dosyasina (offline gelistirme
+    fallback'i) duser."""
     if st.session_state.financial_store:
         return  # Already loaded
+    db_store = _load_financial_store_from_db()
+    if db_store:
+        st.session_state.financial_store = db_store
+        return
     try:
-        import json
         if os.path.exists(FINANCIAL_STORE_FILE):
             with open(FINANCIAL_STORE_FILE, 'r') as f:
                 payload = json.load(f)
@@ -1085,7 +1225,13 @@ def import_all_financials(stock_list, max_workers=5):
     """
     Bulk import financials for all stocks (parallelized — each stock is an
     independent İş Yatırım API call, so we fetch several concurrently instead
-    of one-by-one-with-sleep). Stores in session_state.
+    of one-by-one-with-sleep). Stores in session_state AND upserts each
+    successful ticker to the DB immediately (bkz. _upsert_financial_statement_
+    to_db) - hem kalıcı hem de yarım kalan bir import bile (örn. 60/100)
+    başarılı olan kısmıyla kalıcı kalır. DB yazımı burada (worker thread'ler
+    değil, as_completed'in çalıştığı ANA thread'de) yapılıyor - psycopg2
+    bağlantısı thread-safe değil, sadece ağ çağrıları (_fetch_single_stock_
+    financials) paralel, DB yazımı sıralı.
     Uses a progress bar. Returns (success_count, error_list).
     """
     errors = []
@@ -1107,6 +1253,9 @@ def import_all_financials(stock_list, max_workers=5):
                 raw_data = fut.result()
                 if raw_data:
                     st.session_state.financial_store[symbol] = raw_data
+                    # Import dediğimde önceki financials update olsun: aynı
+                    # (ticker, yıl) zaten DB'de varsa üzerine yazılır.
+                    _upsert_financial_statement_to_db(symbol, raw_data)
                     success += 1
                 else:
                     errors.append(symbol)
@@ -1115,13 +1264,19 @@ def import_all_financials(stock_list, max_workers=5):
 
     prog.empty()
     status.empty()
-    
+
     st.session_state.financial_import_time = datetime.now().strftime("%Y-%m-%d %H:%M")
     st.session_state.financial_import_errors = errors
-    
-    # Persist to file
+
+    # Yerel dosyaya da yaz (DB yapilandirilmamis ortamlarda fallback) - asil
+    # kalicilik yukarida hisse basina DB upsert'iyle saglaniyor.
     _save_financial_store()
-    
+
+    # financial_store degisti - onbelleklenmis marj/liste hesaplarini
+    # gecersiz kil (yoksa Company Reports/Show List eski veriyi gosterir).
+    get_financial_margin_snapshot.clear()
+    get_financial_store_summary.clear()
+
     return success, errors
 
 
@@ -1582,6 +1737,7 @@ def calculate_fundamentals(df_bs):
     return ratios
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_financial_margin_snapshot():
     """
     Import edilmis (st.session_state.financial_store'daki) her hisse icin
@@ -1593,13 +1749,35 @@ def get_financial_margin_snapshot():
     edilmis GERCEK finansal verilerden DETERMINISTIK olarak hesaplanir (daha
     dogru + Gemini kotasi harcamiyor).
 
-    Donen format: {ticker: {"period_latest", "period_prev",
-                             "gross_margin", "gross_margin_prev",
-                             "ebitda_margin", "ebitda_margin_prev",
-                             "net_margin", "net_margin_prev"}}
+    "prev" alanlari (Development skorunun girdisi) DOSYADA period_cols
+    sirasina gore bir ONCEKI DONEM - bu Turkiye'deki ceyreklik raporlamanin
+    KUMULATIF (yil ici, orn. "2026/6" = Ocak-Haziran) yapisi yuzunden
+    genelde "bu yilki daha kisa YTD'ye karsi bir onceki daha kisa/uzun
+    YTD" kiyaslamasi olur (orn. 2026/6 vs 2026/3), yil sinirinda ise (orn.
+    2026/3 vs 2025/12) 3 aylik veriyi 12 aylik veriyle kiyaslar - mevsimsellik
+    acisindan gurultulu olabilir.
+
+    Bu yuzden AYRICA "yoy" alanlari da hesaplaniyor: period_latest ile AYNI
+    ceyrek etiketinin (orn. "6") bir onceki YILDAKI karsiligi (orn. "2026/6"
+    -> "2025/6") - ayni uzunluktaki YTD donemlerini yil bazinda kiyaslayip
+    mevsimsellikten arindirilmis bir "gelisim" gorunumu saglar.
+
+    Donen format: {ticker: {"period_latest", "period_prev", "period_yoy",
+                             "gross_margin", "gross_margin_prev", "gross_margin_yoy",
+                             "ebitda_margin", "ebitda_margin_prev", "ebitda_margin_yoy",
+                             "net_margin", "net_margin_prev", "net_margin_yoy"}}
     Bir hisse icin financial_store'da veri yoksa veya UCUNDE de marj
     hesaplanamiyorsa (orn. gelir tablosu kalemleri eslesmedi) o hisse
-    sozlukte YER ALMAZ - caller "yok" durumunu ayirt edebilsin diye.
+    sozlukte YER ALMAZ - caller "yok" durumunu ayirt edebilsin diye. "yoy"
+    alanlari, tam bir yil once ayni ceyrek etiketi icin veri yoksa (orn.
+    sadece 1 yillik gecmis import edilmisse) None kalir.
+
+    @st.cache_data ile onbelleklendi: DB'ye tasinan financial_store artik
+    yuzlerce hisseyi tutabiliyor (once ~30'du) - her Company Reports
+    rerun'unda TUMUNU yeniden hesaplamak (parse_balance_sheet_to_df +
+    calculate_fundamentals x hisse sayisi) sayfa donusunu gozle gorulur
+    sekilde yavaslatiyordu. Onbellek, import_all_financials tamamlaninca ve
+    "Clear Imported Data" tiklaninca .clear() ile gecersiz kilinir.
     """
     all_key_items = {**KEY_ITEMS_BY_DESC, **KEY_INCOME_BY_DESC}
     snapshot = {}
@@ -1626,19 +1804,62 @@ def get_financial_margin_snapshot():
                 continue
             period_latest = period_cols[0]
             period_prev = period_cols[1] if len(period_cols) > 1 else None
+            # YoY-YTD karsilastirmasi: ayni ceyrek etiketinin (orn. "/6") tam
+            # bir yil onceki karsiligi - period_cols'ta VARSA kullan (bkz.
+            # yukaridaki docstring).
+            period_yoy = None
+            try:
+                y_str, q_str = period_latest.split("/")
+                candidate = f"{int(y_str) - 1}/{q_str}"
+                if candidate in period_cols:
+                    period_yoy = candidate
+            except (ValueError, AttributeError):
+                pass
             snapshot[symbol] = {
                 "period_latest": period_latest,
                 "period_prev": period_prev,
+                "period_yoy": period_yoy,
                 "gross_margin": gm_d.get(period_latest),
                 "gross_margin_prev": gm_d.get(period_prev) if period_prev else None,
+                "gross_margin_yoy": gm_d.get(period_yoy) if period_yoy else None,
                 "ebitda_margin": em_d.get(period_latest),
                 "ebitda_margin_prev": em_d.get(period_prev) if period_prev else None,
+                "ebitda_margin_yoy": em_d.get(period_yoy) if period_yoy else None,
                 "net_margin": nm_d.get(period_latest),
                 "net_margin_prev": nm_d.get(period_prev) if period_prev else None,
+                "net_margin_yoy": nm_d.get(period_yoy) if period_yoy else None,
             }
         except Exception:
             continue
     return snapshot
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_financial_store_summary():
+    """Sidebar'daki 'Listeyi Göster' butonunun veri kaynağı - şu an import
+    edilmiş her hissenin en son/en eski dönemini ve kaç dönem verisi
+    olduğunu döner (hangi hissede en son hangi çeyrek var, tek bakışta
+    görülsün diye)."""
+    rows = []
+    for symbol, raw_data in st.session_state.financial_store.items():
+        try:
+            df_bs = parse_balance_sheet_to_df(raw_data)
+            if df_bs is None or df_bs.empty:
+                continue
+            period_cols = [c for c in df_bs.columns if "/" in c]
+            if not period_cols:
+                continue
+            rows.append({
+                "Hisse": symbol,
+                "Son Dönem": period_cols[0],
+                "En Eski Dönem": period_cols[-1],
+                "Dönem Sayısı": len(period_cols),
+            })
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame(columns=["Hisse", "Son Dönem", "En Eski Dönem", "Dönem Sayısı"])
+    return pd.DataFrame(rows).sort_values("Hisse").reset_index(drop=True)
 
 
 def _make_quarterly_bar_chart(df_source, logical_key, title, color, fallback_key=None, forecasts=None):
@@ -4037,12 +4258,28 @@ def main():
                 st.rerun()
             
             if store_count > 0:
+                if st.button("📋 Show List", use_container_width=True):
+                    st.session_state["_show_financial_store_list"] = \
+                        not st.session_state.get("_show_financial_store_list", False)
+                if st.session_state.get("_show_financial_store_list"):
+                    store_summary = get_financial_store_summary()
+                    st.caption(f"{len(store_summary)} hisse için finansal veri mevcut — "
+                               "'Son Dönem' o hissede import edilmiş en güncel çeyrek.")
+                    st.dataframe(store_summary, use_container_width=True, hide_index=True)
+            
+            if store_count > 0:
                 if st.button("🗑️ Clear Imported Data", use_container_width=True):
                     st.session_state.financial_store = {}
                     st.session_state.financial_import_time = None
                     st.session_state.financial_import_errors = []
                     if os.path.exists(FINANCIAL_STORE_FILE):
                         os.remove(FINANCIAL_STORE_FILE)
+                    # DB artik asil kalici depo - burayi da silmezsek bir
+                    # sonraki yuklemede veri DB'den geri gelir, buton
+                    # anlamsiz kalirdi.
+                    _delete_financial_store_from_db()
+                    get_financial_margin_snapshot.clear()
+                    get_financial_store_summary.clear()
                     st.rerun()
         
         if mode == "📊 Single Stock":
