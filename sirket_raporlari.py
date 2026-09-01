@@ -77,87 +77,30 @@ _MARGIN_FIELDS = [
     ("net_margin", "net_margin_prev", "net kâr marjı"),
 ]
 
-
-def _composite_margin(fm):
-    """Brut kar marji, FAVOK marji ve net kar marjinin ORTALAMASI - kullanici
-    talebi: uc oranin ortalama durumuna gore hesapla. Mevcut olanlarin
-    ortalamasi alinir (biri/ikisi eksikse geri kalanlarla hesaplanir);
-    UCU DE yoksa None. Marj Current'in "tek sayi" girdisi."""
-    if not fm:
-        return None
-    vals = [fm.get(latest_key) for latest_key, _, _ in _MARGIN_FIELDS]
-    vals = [v for v in vals if v is not None]
-    return sum(vals) / len(vals) if vals else None
+# NOT: Marj Puanı/Marj Gelişim Puanı sadece FAVÖK+net kâr marjına dayanır
+# (bkz. compute_margin_scores_for_ticker). Brüt kâr marjı raporun METNİNDE
+# mutlaka anlatılır (bkz. SUMMARY_PROMPT_TEMPLATE) ama SAYISAL skora dahil
+# EDİLMEZ - üç farklı ölçekteki oranı (brüt kâr genelde %20-30, net kâr
+# genelde tek haneli) tek bir "kompozit" yüzdede eritip ortalamak (eski
+# _composite_margin/Marj Current) "toplam değerin bir anlamı yok" - FAVÖK
+# ve net kâr AYRI AYRI puanlanıp sadece o 1-5 SKORLARIN ortalaması alınıyor.
 
 
-def _compute_marj_change_score(fm, compare_suffix, period_latest_key, period_compare_key):
-    """Ortak mantik: latest_key/compare_key (orn. 'gross_margin'/'gross_margin_prev'
-    veya 'gross_margin'/'gross_margin_yoy') ciftlerinin UCUNUN ORTALAMA
-    degisimine dayali 0-5 skor + gerekceli yorum uretir. compute_marj_
-    development_from_financials (QoQ/dosya-sirasi) ve compute_marj_ytd_yoy_
-    from_financials (YoY-YTD) tarafindan paylasilir.
-    Donus: (puan, yorumu) - yeterli veri yoksa (None, None)."""
-    if not fm:
-        return None, None
-    deltas, parts = [], []
-    for latest_key, _prev_key, label in _MARGIN_FIELDS:
-        compare_key = f"{latest_key}{compare_suffix}"
-        if fm.get(latest_key) is not None and fm.get(compare_key) is not None:
-            d = fm[latest_key] - fm[compare_key]
-            deltas.append(d)
-            parts.append(f"{label} %{fm[compare_key]:.1f} → %{fm[latest_key]:.1f} "
-                          f"({'+' if d >= 0 else ''}{d:.1f} puan)")
-    if not deltas:
-        return None, None
-    avg_delta = sum(deltas) / len(deltas)
-    # +-5 puanlik ortalama degisim skoru tam uclara tasir (2.5 +- 2.5)
-    score = max(0.0, min(5.0, 2.5 + avg_delta * 0.5))
-    period_note = (f" ({fm[period_compare_key]} → {fm[period_latest_key]})"
-                    if fm.get(period_latest_key) and fm.get(period_compare_key) else "")
-    yorumu = (", ".join(parts) + period_note + ".")
-    return round(score, 1), yorumu[0].upper() + yorumu[1:]
-
-
-def compute_marj_development_from_financials(fm):
-    """Import edilmis GERCEK finansallardan (LLM tahmini DEGIL) bir onceki
-    DOSYA SIRASINDAKI donemE gore - brut kar marji, FAVOK marji ve net kar
-    marjinin UCUNUN ORTALAMA degisimine dayali 0-5 skor hesaplar. NOT:
-    Turkiye'deki kumulatif ceyreklik raporlama yuzunden bu genelde ayni yil
-    icinde bir onceki (daha kisa) YTD'ye karsi kiyaslamadir (orn. 2026/6 vs
-    2026/3); yil sinirinda ise 3 aylik veriyi 12 aylikla kiyaslar - mevsimsel
-    gurultu icerebilir (bkz. compute_marj_ytd_yoy_from_financials - AYNI
-    ceyregin bir onceki YILDAKI karsiligiyla kiyaslayan, gurultuden arindirilmis
-    EK bir skor).
-    fm: streamlit_app.get_financial_margin_snapshot()'un tek bir ticker
-    icin dondurdugu sozluk (None olabilir - financial_store'da yoksa).
-    Donus: (puan, yorumu) - yeterli veri yoksa (None, None)."""
-    return _compute_marj_change_score(fm, "_prev", "period_latest", "period_prev")
-
-
-def compute_marj_ytd_yoy_from_financials(fm):
-    """compute_marj_development_from_financials'in YoY-YTD versiyonu: AYNI
-    ceyrek etiketinin (orn. '/6') bir onceki YILDAKI karsiligiyla (orn.
-    2026/6 vs 2025/6) kiyaslar - ayni uzunluktaki kumulatif donemleri yil
-    bazinda kiyasladigi icin mevsimsellikten arindirilmis bir "yillik bazda
-    gelisim" gorunumu saglar. Tam bir yil once ayni ceyrek etiketi icin veri
-    yoksa (orn. sadece 1 yillik gecmis import edilmis) (None, None) doner."""
-    return _compute_marj_change_score(fm, "_yoy", "period_latest", "period_yoy")
-
-
-def compute_marj_current_for_sector(ticker, sektor_tickers, financial_margins):
-    """Import edilmis GERCEK finansallardan, bir sirketin kompozit (brut kar+
-    FAVOK+net kar marji ortalamasi) marjini AYNI SEKTORDEKI DIGER sirketlerle
-    (z-score ile) kiyaslayip 1-5 arasi bir skor uretir - LLM'in "tahmin"
-    etmesine gerek kalmaz.
-    En az 1 DIGER sirkette veri varsa hesaplar (kendisiyle birlikte toplam
-    2); tek basinaysa (None, None) doner."""
+def _margin_level_score(ticker, sektor_tickers, financial_margins, field_key, label):
+    """Tek bir marj oranının (örn. sadece FAVÖK) AYNI SEKTÖRDEKİ diğer
+    şirketlere göre z-score bazlı 1-5 seviye skoru + yorum üretir.
+    compute_margin_scores_for_ticker'ın FAVÖK Puanı/Net Kâr Puanı
+    hesaplarını paylaştığı ortak mantık.
+    En az 1 DİĞER şirkette bu oran için veri varsa hesaplar; tek başınaysa
+    (None, None) döner."""
     financial_margins = financial_margins or {}
-    my_val = _composite_margin(financial_margins.get(ticker))
+    fm = financial_margins.get(ticker)
+    my_val = fm.get(field_key) if fm else None
     if my_val is None:
         return None, None
     all_vals = {}
     for t in sektor_tickers:
-        v = _composite_margin(financial_margins.get(t))
+        v = (financial_margins.get(t) or {}).get(field_key)
         if v is not None:
             all_vals[t] = v
     all_vals[ticker] = my_val
@@ -175,10 +118,121 @@ def compute_marj_current_for_sector(ticker, sektor_tickers, financial_margins):
     score = max(1.0, min(5.0, score))
     ranked = sorted(all_vals.items(), key=lambda kv: -kv[1])
     rank = next((i + 1 for i, (t, _) in enumerate(ranked) if t == ticker), None)
-    yorumu = (f"Kompozit marj (brüt kâr+FAVÖK+net kâr ort.) %{my_val:.1f}, sektördeki "
-              f"diğer şirketlerin ortalaması %{mean:.1f}"
+    yorumu = (f"{label} %{my_val:.1f}, sektördeki diğer şirketlerin ortalaması %{mean:.1f}"
               + (f" — {rank}. sırada / {len(all_vals)} şirket arasında" if rank else "") + ".")
     return round(score, 1), yorumu
+
+
+def _margin_development_score(fm, field_key, label, compare_suffix="_prev",
+                                period_latest_key="period_latest", period_compare_key="period_prev"):
+    """Tek bir marj oranının (örn. sadece Net Kâr) belirtilen döneme göre
+    (varsayılan: bir önceki raporlanan dönem; compare_suffix='_yoy' ile
+    bir önceki YILDAKİ aynı çeyrek de kullanılabilir - bkz. Marj Gelişim
+    Puanı (Yıllık)) 0-5 gelişim skoru + yorum üretir."""
+    if not fm:
+        return None, None
+    compare_key = f"{field_key}{compare_suffix}"
+    if fm.get(field_key) is None or fm.get(compare_key) is None:
+        return None, None
+    d = fm[field_key] - fm[compare_key]
+    score = max(0.0, min(5.0, 2.5 + d * 0.5))
+    period_note = (f" ({fm[period_compare_key]} → {fm[period_latest_key]})"
+                    if fm.get(period_latest_key) and fm.get(period_compare_key) else "")
+    yorumu = (f"{label} %{fm[compare_key]:.1f} → %{fm[field_key]:.1f} "
+              f"({'+' if d >= 0 else ''}{d:.1f} puan){period_note}.")
+    return round(score, 1), yorumu
+
+
+def compute_margin_scores_for_ticker(ticker, sektor_tickers, financial_margins):
+    """Kullanıcı tanımlı TAM marj skorlama hiyerarşisini tek çağrıda hesaplar:
+
+      FAVÖK Puanı, Net Kâr Puanı        (sektör peer z-score, 1-5)
+        -> Marj Puanı = ikisinin ortalaması
+      FAVÖK Gelişim Puanı, Net Kâr Gelişim Puanı  (bir önceki döneme göre, 0-5)
+        -> Marj Gelişim Puanı = ikisinin ortalaması
+      Marj Toplam Puanı = (Marj Puanı + Marj Gelişim Puanı) / 2
+      (Overall Puan = (Marj Toplam Puanı + Görünüm Puanı) / 2 - gorunum_
+       puani'yi bilen ÇAĞIRAN tarafından hesaplanır, bkz. _finalize_scores)
+
+    Ayrıca BONUS bir "Marj Gelişim Puanı (Yıllık)" hesaplar: aynı iki oranın
+    (FAVÖK+Net) bir önceki YILDAKİ aynı çeyreğe göre (YoY-YTD, mevsimsellikten
+    arındırılmış) gelişimi - Marj Toplam Puanı'na dahil DEĞİL, ayrı bilgi
+    amaçlı bir skor.
+
+    NOT: Brüt kâr marjı bilerek SAYISAL skora dahil edilmez (kullanıcı
+    talebi - üç farklı ölçekli oranı tek "kompozit" yüzdede eritmenin
+    anlamı yoktu); rapor METNİNDE ayrıca mutlaka anlatılır.
+
+    sektor_tickers boş/None verilirse (henüz sektör atanmamışsa) seviye
+    skorları (FAVÖK/Net Kâr Puanı, dolayısıyla Marj Puanı) None kalır -
+    peer karşılaştırması için sektör grubu şart; gelişim skorları yine de
+    hesaplanır.
+
+    Donus: dict - herhangi bir alan hesaplanamazsa None kalır (anahtarlar:
+      favok_puani, favok_puani_yorumu, net_kar_puani, net_kar_puani_yorumu,
+      marj_puani, marj_yorumu,
+      favok_gelisim_puani, favok_gelisim_yorumu,
+      net_kar_gelisim_puani, net_kar_gelisim_yorumu,
+      marj_gelisim_puani, marj_gelisim_yorumu,
+      marj_gelisim_yillik_puani, marj_gelisim_yillik_yorumu,
+      marj_toplam_puani)."""
+    fm = (financial_margins or {}).get(ticker)
+    out = {k: None for k in (
+        "favok_puani", "favok_puani_yorumu", "net_kar_puani", "net_kar_puani_yorumu",
+        "marj_puani", "marj_yorumu",
+        "favok_gelisim_puani", "favok_gelisim_yorumu",
+        "net_kar_gelisim_puani", "net_kar_gelisim_yorumu",
+        "marj_gelisim_puani", "marj_gelisim_yorumu",
+        "marj_gelisim_yillik_puani", "marj_gelisim_yillik_yorumu",
+        "marj_toplam_puani",
+    )}
+
+    if sektor_tickers:
+        out["favok_puani"], out["favok_puani_yorumu"] = _margin_level_score(
+            ticker, sektor_tickers, financial_margins, "ebitda_margin", "FAVÖK marjı")
+        out["net_kar_puani"], out["net_kar_puani_yorumu"] = _margin_level_score(
+            ticker, sektor_tickers, financial_margins, "net_margin", "Net kâr marjı")
+        level_scores = [s for s in (out["favok_puani"], out["net_kar_puani"]) if s is not None]
+        if level_scores:
+            out["marj_puani"] = round(sum(level_scores) / len(level_scores), 1)
+            out["marj_yorumu"] = " ".join(
+                p for p in (out["favok_puani_yorumu"], out["net_kar_puani_yorumu"]) if p)
+
+    out["favok_gelisim_puani"], out["favok_gelisim_yorumu"] = _margin_development_score(
+        fm, "ebitda_margin", "FAVÖK marjı")
+    out["net_kar_gelisim_puani"], out["net_kar_gelisim_yorumu"] = _margin_development_score(
+        fm, "net_margin", "Net kâr marjı")
+    dev_scores = [s for s in (out["favok_gelisim_puani"], out["net_kar_gelisim_puani"]) if s is not None]
+    if dev_scores:
+        out["marj_gelisim_puani"] = round(sum(dev_scores) / len(dev_scores), 1)
+        out["marj_gelisim_yorumu"] = " ".join(
+            p for p in (out["favok_gelisim_yorumu"], out["net_kar_gelisim_yorumu"]) if p)
+
+    favok_yillik, favok_yillik_y = _margin_development_score(
+        fm, "ebitda_margin", "FAVÖK marjı", compare_suffix="_yoy", period_compare_key="period_yoy")
+    net_yillik, net_yillik_y = _margin_development_score(
+        fm, "net_margin", "Net kâr marjı", compare_suffix="_yoy", period_compare_key="period_yoy")
+    yillik_scores = [s for s in (favok_yillik, net_yillik) if s is not None]
+    if yillik_scores:
+        out["marj_gelisim_yillik_puani"] = round(sum(yillik_scores) / len(yillik_scores), 1)
+        out["marj_gelisim_yillik_yorumu"] = " ".join(p for p in (favok_yillik_y, net_yillik_y) if p)
+
+    toplam_parts = [s for s in (out["marj_puani"], out["marj_gelisim_puani"]) if s is not None]
+    if toplam_parts:
+        out["marj_toplam_puani"] = round(sum(toplam_parts) / len(toplam_parts), 1)
+
+    return out
+
+
+def compute_overall_puani(marj_toplam_puani, gorunum_puani):
+    """Overall Puan = Marj Toplam Puanı ile Görünüm Puanı'nın (faaliyet
+    raporu/yatırımcı sunumu metninden LLM'in çıkardığı gelecek beklentisi
+    tonu) ortalaması. İkisinden biri yoksa diğeri aynen döner; ikisi de
+    yoksa None."""
+    parts = [p for p in (marj_toplam_puani, gorunum_puani) if p is not None]
+    if not parts:
+        return None
+    return round(sum(parts) / len(parts), 1)
 
 
 SUMMARY_PROMPT_TEMPLATE = """Sen kıdemli bir yatırım fonu analistisin. Aşağıda bir şirketin PDF'ten
@@ -199,20 +253,23 @@ veya kod bloğu işareti (```) ekleme - yanıtın ilk karakteri {{ olmalı.
 {{
   "sektor": "<şirketin ait olduğu sektör - AŞAĞIDAKİ LİSTEDEN TAM OLARAK BİRİNİ seç, başka bir
 kelime kullanma: {sektor_listesi}>",
-  "marj_development_puani": <0-5 arası (yarım puan olabilir) - SADECE marjların (brüt/net kâr)
+  "marj_development_puani": <0-5 arası (yarım puan olabilir) - "Marj Gelişim Puanı": SADECE
+FAVÖK marjı ve net kâr marjının (brüt kâr marjı DAHİL DEĞİL - o sadece metinde anlatılır)
 YÖNÜNÜ/GELİŞİMİNİ ölçen bir skor - şirketin KENDİ geçmiş dönemine (BİR ÖNCEKİ RAPORLANAN DÖNEME,
-YTD YoY DEĞİL) göre karşılaştır, başka şirketle kıyaslama (bu ayrı bir adımda yapılacak). Raporda
-önceki döneme/yıla göre karşılaştırma varsa ona dayan. 0=marjlar belirgin şekilde DÜŞMÜŞ,
-2.5=yatay/karışık sinyal, 5=marjlar belirgin şekilde YÜKSELMİŞ. Sadece yön/değişim büyüklüğünü
-yansıtır, mevcut marj seviyesinin GÜCÜNÜ değil>,
-  "marj_development_yorumu": "<skoru gerekçelendiren 1-2 cümle, somut rakamlarla (örn. 'brüt
-marj %8,1'den %8,6'ya yükseldi')>",
+YTD YoY DEĞİL) göre karşılaştır, başka şirketle kıyaslama (bu ayrı/deterministik bir adımda
+yapılıyor, gerçek finansal veri varsa senin bu alana yazdığın TAHMİN zaten EZİLİP gerçek
+rakamla değiştirilecek). Raporda önceki döneme/yıla göre karşılaştırma varsa ona dayan.
+0=FAVÖK ve net kâr marjları belirgin şekilde DÜŞMÜŞ, 2.5=yatay/karışık sinyal, 5=belirgin
+şekilde YÜKSELMİŞ. Sadece yön/değişim büyüklüğünü yansıtır, mevcut marj seviyesinin GÜCÜNÜ değil>,
+  "marj_development_yorumu": "<skoru gerekçelendiren 1-2 cümle, somut rakamlarla (örn. 'FAVÖK
+marjı %8,1'den %8,6'ya yükseldi')>",
   "marj_ytd_puani": <0-5 arası (yarım puan olabilir) - marj_development_puani'nin YILLIK BAZDA
-(YTD YoY) versiyonu: AYNI çeyreğin bir önceki YILDAKİ karşılığına göre karşılaştır (örn. bu
-2. çeyrekse geçen yılın 2. çeyreğiyle), bir önceki RAPORLANAN dönemle değil. Aşağıda "YILLIK
-BAZDA (YTD YoY)" bloğu verilmişse SADECE onu kullan (hesaplama zaten yapılmış); verilmemişse
-VE rapor metninde geçen yılın aynı dönemine dair rakam varsa ondan çıkar, yoksa null bırak.
-0=yıllık bazda belirgin DÜŞÜŞ, 2.5=yatay, 5=yıllık bazda belirgin YÜKSELİŞ>,
+(YTD YoY) versiyonu (yine SADECE FAVÖK+net kâr marjı): AYNI çeyreğin bir önceki YILDAKİ
+karşılığına göre karşılaştır (örn. bu 2. çeyrekse geçen yılın 2. çeyreğiyle), bir önceki
+RAPORLANAN dönemle değil. Aşağıda "YILLIK BAZDA (YTD YoY)" bloğu verilmişse SADECE onu kullan
+(hesaplama zaten yapılmış); verilmemişse VE rapor metninde geçen yılın aynı dönemine dair rakam
+varsa ondan çıkar, yoksa null bırak. 0=yıllık bazda belirgin DÜŞÜŞ, 2.5=yatay, 5=yıllık bazda
+belirgin YÜKSELİŞ>,
   "marj_ytd_yorumu": "<skoru gerekçelendiren 1-2 cümle, somut rakamlarla; YILLIK BAZDA veri yoksa
 null>",
   "gorunum_puani": <1-5 arası TAM SAYI - raporda şirketin kendi ifade ettiği (veya senin
@@ -265,6 +322,10 @@ Kurallar:
   çekinme, senden istenen tam da bu.
 - Yüzeysel/jenerik ifadelerden kaçın ("şirket iyi performans gösterdi" gibi) - somut rakam ve
   nedensellik ver ("FAVÖK marjı %38,8 artışla X'e yükseldi, bunun nedeni Y" gibi).
+- ZORUNLU: metin_ozeti içinde brüt kâr marjı, FAVÖK marjı VE net kâr marjının ÜÇÜ DE en az iki
+  kez geçmeli (Finansal Performans + Değerlendirme ve Görünüm bölümlerinde) - yüzde değerleriyle
+  ve gelişim yönleriyle birlikte. Bu üç oranı atlarsan/tek tek saymadan genel geçer bir cümleyle
+  ("marjlar iyileşti" gibi) geçiştirirsen rapor eksik sayılır.
 
 --- RAPOR METNİ ---
 {report_text}
@@ -345,13 +406,40 @@ def _make_connection():
             -- sinirinda ise 3 aylik veriyi 12 aylikla kiyaslar - mevsimsel
             -- gurultu icerebilir). YTD, AYNI ceyrek etiketinin bir onceki
             -- YILDAKI karsiligiyla (orn. 2026/6 vs 2025/6) kiyaslayip bu
-            -- gurultuyu gideren AYRI/EK bir "gelisim" skorudur - bkz.
-            -- compute_marj_ytd_yoy_from_financials.
+            -- gurultuyu gideren AYRI/EK bir "gelisim" skorudur.
             ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_ytd_puani NUMERIC(3,1);
             ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_ytd_yorumu TEXT;
             UPDATE company_report_summaries
                 SET marj_development_puani = marj_puani, marj_development_yorumu = marj_yorumu
                 WHERE marj_development_puani IS NULL AND marj_puani IS NOT NULL;
+
+            -- Marj skorlama hiyerarsisi YENIDEN TASARLANDI (kullanici talebi -
+            -- brut+FAVOK+net'i tek "kompozit" yuzdede eritmenin anlami yoktu):
+            -- FAVOK Puani + Net Kar Puani (sektor peer, 1-5) -> ortalamalari
+            -- artik marj_current_puani/marj_current_yorumu kolonlarinda
+            -- "Marj Puani" olarak tutuluyor (isim degismedi, ANLAMI degisti).
+            -- FAVOK Gelisim Puani + Net Kar Gelisim Puani (0-5) -> ortalamalari
+            -- artik marj_development_puani/marj_development_yorumu kolonlarinda
+            -- "Marj Gelisim Puani" olarak tutuluyor (ayni sekilde ANLAMI
+            -- degisti, kolon adi degismedi). marj_ytd_puani/marj_ytd_yorumu
+            -- da ayni mantikla "Marj Gelisim Puani (Yillik)" oldu - ucu de
+            -- artik SADECE FAVOK+Net'in ortalamasi, brut kar dahil degil.
+            -- Alt-skorlar (FAVOK/Net Kar Puani ve Gelisim Puanlari) ile
+            -- Marj Toplam Puani/Overall Puan icin YENI kolonlar:
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS favok_puani NUMERIC(3,1);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS favok_puani_yorumu TEXT;
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS net_kar_puani NUMERIC(3,1);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS net_kar_puani_yorumu TEXT;
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS favok_gelisim_puani NUMERIC(3,1);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS favok_gelisim_yorumu TEXT;
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS net_kar_gelisim_puani NUMERIC(3,1);
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS net_kar_gelisim_yorumu TEXT;
+            -- Marj Puani (marj_current_puani) ile Marj Gelisim Puani
+            -- (marj_development_puani) ortalamasi:
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS marj_toplam_puani NUMERIC(3,1);
+            -- Marj Toplam Puani ile Gorunum Puani (faaliyet raporu metninden
+            -- LLM'in cikardigi genel ton) ortalamasi - nihai skor:
+            ALTER TABLE company_report_summaries ADD COLUMN IF NOT EXISTS overall_puani NUMERIC(3,1);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_company_report_period
                 ON company_report_summaries(ticker, yil, donem)
                 WHERE ticker IS NOT NULL AND yil IS NOT NULL AND donem IS NOT NULL;
@@ -520,8 +608,8 @@ def _format_financial_context(fm):
         lines.append(f"(Dönemler: {fm['period_prev']} → {fm['period_latest']})")
     # YoY-YTD: ayni ceyrek etiketinin bir onceki yildaki karsiligi - Turkiye'deki
     # kumulatif ceyreklik raporlamada mevsimsellikten arindirilmis, daha
-    # anlamli bir "yillik bazda gelisim" karsilastirmasi (bkz. sirket_
-    # raporlari.compute_marj_ytd_yoy_from_financials).
+    # anlamli bir "yillik bazda gelisim" karsilastirmasi (bkz.
+    # _margin_development_score'un compare_suffix="_yoy" kullanimi).
     if fm.get('period_yoy'):
         lines.append("")
         lines.append(f"YILLIK BAZDA (YTD YoY, {fm['period_yoy']} → {fm['period_latest']}) "
@@ -598,21 +686,34 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis, fi
             f"{MAX_SUMMARY_INPUT_CHARS:,} karakteri analiz edildi.*"
         )
 
-    # Marj Development icin import edilmis GERCEK finansal veri varsa (fm,
-    # yukarida prompt icin de hazirlandi), LLM'in metinden yaptigi TAHMINI
+    # Marj Gelisim Puani (FAVOK+net kar, brut kar DAHIL DEGIL) icin import
+    # edilmis GERCEK finansal veri varsa, LLM'in metinden yaptigi TAHMINI
     # onunla EZ - deterministik ve daha dogru, Gemini kotasi da harcamiyor.
-    # Yoksa LLM'in tahmini fallback olarak kalir.
-    dev_score, dev_yorumu = compute_marj_development_from_financials(fm)
-    if dev_score is not None:
-        parsed["marj_development_puani"] = dev_score
-        parsed["marj_development_yorumu"] = dev_yorumu + " (kaynak: import edilmiş finansallar)"
-
-    # Marj YTD (YoY) icin de ayni mantik: gercek finansal veri varsa LLM'in
-    # (varsa) yaptigi tahmini ez.
-    ytd_score, ytd_yorumu = compute_marj_ytd_yoy_from_financials(fm)
-    if ytd_score is not None:
-        parsed["marj_ytd_puani"] = ytd_score
-        parsed["marj_ytd_yorumu"] = ytd_yorumu + " (kaynak: import edilmiş finansallar, YTD YoY)"
+    # Yoksa LLM'in tahmini fallback olarak kalir. Sektor bu asamada HENUZ
+    # atanmadigi icin (parsed['sektor'] - ayni cagrinin cikisi) peer/seviye
+    # skorlari (FAVOK/Net Kar Puani, Marj Puani, Marj Toplam Puani, Overall)
+    # burada HESAPLANAMAZ - bkz. compute_sector_rollup/refresh_all_margin_
+    # scores (o sekilde TUM sektordeki sirketler bir arada gorulebiliyor).
+    margin_scores = compute_margin_scores_for_ticker(ticker, None, financial_margins) if ticker else {}
+    if margin_scores.get("marj_gelisim_puani") is not None:
+        parsed["marj_development_puani"] = margin_scores["marj_gelisim_puani"]
+        parsed["marj_development_yorumu"] = (
+            margin_scores["marj_gelisim_yorumu"] + " (kaynak: import edilmiş finansallar)")
+    if margin_scores.get("marj_gelisim_yillik_puani") is not None:
+        parsed["marj_ytd_puani"] = margin_scores["marj_gelisim_yillik_puani"]
+        parsed["marj_ytd_yorumu"] = (
+            margin_scores["marj_gelisim_yillik_yorumu"] + " (kaynak: import edilmiş finansallar, YTD YoY)")
+    # FAVOK/Net Kar Gelisim alt-skorlari her zaman parsed'e ekleniyor (varsa) -
+    # save_report_summary bunlari da kalici olarak DB'ye yazar.
+    for k in ("favok_gelisim_puani", "favok_gelisim_yorumu",
+              "net_kar_gelisim_puani", "net_kar_gelisim_yorumu"):
+        parsed[k] = margin_scores.get(k)
+    # Peer-bagimli alanlar bu asamada hep None - sektor rollup/refresh
+    # calistiginda doldurulacak. (marj_current_puani/yorumu = "Marj Puani",
+    # bkz. _apply_margin_scores'daki kolon esleme notu.)
+    for k in ("favok_puani", "favok_puani_yorumu", "net_kar_puani", "net_kar_puani_yorumu",
+              "marj_current_puani", "marj_current_yorumu", "marj_toplam_puani", "overall_puani"):
+        parsed.setdefault(k, None)
 
     return parsed
 
@@ -661,6 +762,8 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
         ticker, url, yil, donem,
         sektor, kpis.get('marj_development_puani'), kpis.get('marj_development_yorumu'),
         kpis.get('marj_ytd_puani'), kpis.get('marj_ytd_yorumu'),
+        kpis.get('favok_gelisim_puani'), kpis.get('favok_gelisim_yorumu'),
+        kpis.get('net_kar_gelisim_puani'), kpis.get('net_kar_gelisim_yorumu'),
         kpis.get('gorunum_puani'), kpis.get('gorunum_yorumu'),
         kpis.get('satis_hedefi'), kpis.get('satis_yonu'),
         kpis.get('favok_hedefi'), kpis.get('favok_yonu'),
@@ -673,10 +776,12 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
                 INSERT INTO company_report_summaries
                     (ticker, kaynak_url, yil, donem, sektor, marj_development_puani, marj_development_yorumu,
                      marj_ytd_puani, marj_ytd_yorumu,
+                     favok_gelisim_puani, favok_gelisim_yorumu,
+                     net_kar_gelisim_puani, net_kar_gelisim_yorumu,
                      gorunum_puani, gorunum_yorumu, satis_hedefi, satis_yonu,
                      favok_hedefi, favok_yonu, net_kar_hedefi, net_kar_yonu,
                      ozet, ham_metin_uzunluk)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (ticker, yil, donem) WHERE ticker IS NOT NULL
                     AND yil IS NOT NULL AND donem IS NOT NULL
                 DO UPDATE SET
@@ -686,6 +791,10 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
                     marj_development_yorumu = EXCLUDED.marj_development_yorumu,
                     marj_ytd_puani = EXCLUDED.marj_ytd_puani,
                     marj_ytd_yorumu = EXCLUDED.marj_ytd_yorumu,
+                    favok_gelisim_puani = EXCLUDED.favok_gelisim_puani,
+                    favok_gelisim_yorumu = EXCLUDED.favok_gelisim_yorumu,
+                    net_kar_gelisim_puani = EXCLUDED.net_kar_gelisim_puani,
+                    net_kar_gelisim_yorumu = EXCLUDED.net_kar_gelisim_yorumu,
                     gorunum_puani = EXCLUDED.gorunum_puani,
                     gorunum_yorumu = EXCLUDED.gorunum_yorumu,
                     satis_hedefi = EXCLUDED.satis_hedefi,
@@ -698,24 +807,32 @@ def save_report_summary(url, ticker, yil, donem, kpis, ham_metin_uzunluk):
                     ham_metin_uzunluk = EXCLUDED.ham_metin_uzunluk,
                     olusturma_zamani = now()
             """, vals)
-            # marj_current_puani/yorumu kasten bu UPDATE'e dahil edilmedi -
-            # sadece sektor rollup hesaplayabilir (peer karsilastirmasi gerekir),
-            # rutin metin ozeti yenilemesi onu SIFIRLAMAMALI.
+            # favok_puani/net_kar_puani/marj_puani/marj_toplam_puani/overall_puani
+            # (marj_current_puani vb.) kasten bu UPDATE'e dahil edilmedi - sadece
+            # sektor rollup/refresh_all_margin_scores hesaplayabilir (peer
+            # karsilastirmasi gerekir), rutin metin ozeti yenilemesi onlari
+            # SIFIRLAMAMALI.
         else:
             cur.execute("""
                 INSERT INTO company_report_summaries
                     (ticker, kaynak_url, yil, donem, sektor, marj_development_puani, marj_development_yorumu,
                      marj_ytd_puani, marj_ytd_yorumu,
+                     favok_gelisim_puani, favok_gelisim_yorumu,
+                     net_kar_gelisim_puani, net_kar_gelisim_yorumu,
                      gorunum_puani, gorunum_yorumu, satis_hedefi, satis_yonu,
                      favok_hedefi, favok_yonu, net_kar_hedefi, net_kar_yonu,
                      ozet, ham_metin_uzunluk)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (kaynak_url) DO UPDATE SET
                     ozet = EXCLUDED.ozet, ham_metin_uzunluk = EXCLUDED.ham_metin_uzunluk,
                     sektor = EXCLUDED.sektor, marj_development_puani = EXCLUDED.marj_development_puani,
                     marj_development_yorumu = EXCLUDED.marj_development_yorumu,
                     marj_ytd_puani = EXCLUDED.marj_ytd_puani,
                     marj_ytd_yorumu = EXCLUDED.marj_ytd_yorumu,
+                    favok_gelisim_puani = EXCLUDED.favok_gelisim_puani,
+                    favok_gelisim_yorumu = EXCLUDED.favok_gelisim_yorumu,
+                    net_kar_gelisim_puani = EXCLUDED.net_kar_gelisim_puani,
+                    net_kar_gelisim_yorumu = EXCLUDED.net_kar_gelisim_yorumu,
                     gorunum_puani = EXCLUDED.gorunum_puani,
                     gorunum_yorumu = EXCLUDED.gorunum_yorumu
             """, vals)
@@ -732,6 +849,10 @@ def get_existing_summary(url):
                marj_development_puani, marj_development_yorumu,
                marj_current_puani, marj_current_yorumu,
                marj_ytd_puani, marj_ytd_yorumu,
+               favok_puani, favok_puani_yorumu, net_kar_puani, net_kar_puani_yorumu,
+               favok_gelisim_puani, favok_gelisim_yorumu,
+               net_kar_gelisim_puani, net_kar_gelisim_yorumu,
+               marj_toplam_puani, overall_puani,
                gorunum_puani, gorunum_yorumu,
                satis_hedefi, satis_yonu, favok_hedefi, favok_yonu,
                net_kar_hedefi, net_kar_yonu, ozet, ham_metin_uzunluk, olusturma_zamani
@@ -752,6 +873,10 @@ def get_all_summaries():
                marj_development_puani, marj_development_yorumu,
                marj_current_puani, marj_current_yorumu,
                marj_ytd_puani, marj_ytd_yorumu,
+               favok_puani, favok_puani_yorumu, net_kar_puani, net_kar_puani_yorumu,
+               favok_gelisim_puani, favok_gelisim_yorumu,
+               net_kar_gelisim_puani, net_kar_gelisim_yorumu,
+               marj_toplam_puani, overall_puani,
                gorunum_puani, gorunum_yorumu,
                satis_yonu, favok_yonu, net_kar_yonu, ozet, olusturma_zamani
         FROM company_report_summaries
@@ -813,6 +938,10 @@ def get_reports_for_period(yil, donem):
                marj_development_puani, marj_development_yorumu,
                marj_current_puani, marj_current_yorumu,
                marj_ytd_puani, marj_ytd_yorumu,
+               favok_puani, favok_puani_yorumu, net_kar_puani, net_kar_puani_yorumu,
+               favok_gelisim_puani, favok_gelisim_yorumu,
+               net_kar_gelisim_puani, net_kar_gelisim_yorumu,
+               marj_toplam_puani, overall_puani,
                gorunum_puani, gorunum_yorumu, ozet
         FROM company_report_summaries
         WHERE yil = %(yil)s AND donem = %(donem)s
@@ -852,7 +981,7 @@ Görevlerin:
    görünümlü sektör, 1=en zayıf/olumsuz). Skorlar mutlaka birbirinden farklılaşsın - bütün
    sektörlere aynı skoru verme, gerçek bir sıralama/kıyaslama yap.
 
-Not: Şirketlerin sektör ortalamasına göre marj konumu (Marj Current) BURADA senin isin degil -
+Not: Şirketlerin sektör ortalamasına göre marj konumu (Marj Puanı) BURADA senin isin degil -
 gercek finansal verilerden ayrica ve deterministik olarak hesaplanacak.
 
 --- ŞİRKET ÖZETLERİ ---
@@ -877,6 +1006,56 @@ analiz - marjlar genel olarak iyiye mi kötüye mi gidiyor, hangi ortak temalar/
 """
 
 
+def _apply_margin_scores(cur, ticker, yil, donem, sektor_tickers, financial_margins, gorunum_puani_for_overall):
+    """Bir (ticker, yıl, dönem) satırının TÜM marj alt-skorlarını
+    (compute_margin_scores_for_ticker: FAVÖK/Net Kâr Puanı, Marj Puanı,
+    FAVÖK/Net Kâr Gelişim Puanı, Marj Gelişim Puanı (+Yıllık), Marj Toplam
+    Puanı) hesaplayıp DB'de günceller; Overall Puan için
+    gorunum_puani_for_overall kullanılır (çağıran taze bir değer biliyorsa
+    onu - örn. Gemini'nin az önce döndürdüğü -, bilmiyorsa satırın mevcut
+    DB değerini vermeli). Sadece GERÇEKTEN hesaplanabilen alanlar
+    güncellenir - eksik veri yüzünden hesaplanamayan bir alan, önceki bir
+    hesaplamadan kalma değeri SIFIRLAMAZ.
+    compute_sector_rollup ve refresh_all_margin_scores tarafından paylaşılır.
+    Donus: DB'ye yazılan set_values dict'i (boş dict = hiçbir alan
+    hesaplanamadı, hiçbir şey güncellenmedi)."""
+    scores = compute_margin_scores_for_ticker(ticker, sektor_tickers, financial_margins)
+    set_values = {}
+    for k in ("favok_puani", "favok_puani_yorumu", "net_kar_puani", "net_kar_puani_yorumu"):
+        if scores.get(k) is not None:
+            set_values[k] = scores[k]
+    if scores.get("marj_puani") is not None:
+        set_values["marj_current_puani"] = scores["marj_puani"]
+        set_values["marj_current_yorumu"] = scores["marj_yorumu"]
+    if scores.get("marj_gelisim_puani") is not None:
+        set_values["marj_development_puani"] = scores["marj_gelisim_puani"]
+        set_values["marj_development_yorumu"] = scores["marj_gelisim_yorumu"] + " (kaynak: import edilmiş finansallar)"
+    if scores.get("marj_gelisim_yillik_puani") is not None:
+        set_values["marj_ytd_puani"] = scores["marj_gelisim_yillik_puani"]
+        set_values["marj_ytd_yorumu"] = (
+            scores["marj_gelisim_yillik_yorumu"] + " (kaynak: import edilmiş finansallar, YTD YoY)")
+    if scores.get("favok_gelisim_puani") is not None:
+        set_values["favok_gelisim_puani"] = scores["favok_gelisim_puani"]
+        set_values["favok_gelisim_yorumu"] = scores["favok_gelisim_yorumu"]
+    if scores.get("net_kar_gelisim_puani") is not None:
+        set_values["net_kar_gelisim_puani"] = scores["net_kar_gelisim_puani"]
+        set_values["net_kar_gelisim_yorumu"] = scores["net_kar_gelisim_yorumu"]
+    if scores.get("marj_toplam_puani") is not None:
+        set_values["marj_toplam_puani"] = scores["marj_toplam_puani"]
+        overall = compute_overall_puani(scores["marj_toplam_puani"], gorunum_puani_for_overall)
+        if overall is not None:
+            set_values["overall_puani"] = overall
+    if not set_values:
+        return set_values
+    set_sql = ", ".join(f"{col} = %s" for col in set_values)
+    cur.execute(f"""
+        UPDATE company_report_summaries
+        SET {set_sql}
+        WHERE ticker = %s AND yil = %s AND donem = %s
+    """, list(set_values.values()) + [ticker, int(yil), donem])
+    return set_values
+
+
 def compute_sector_rollup(yil, donem, financial_margins=None):
     """Secilen (yil, donem) icin kayitli TUM rapor ozetlerini TEK bir Gemini
     cagrisinda sektorlere siniflandirir + sektor/gorunum analizini uretir
@@ -885,12 +1064,15 @@ def compute_sector_rollup(yil, donem, financial_margins=None):
     sart degil - bu fonksiyon o donemdeki TUM raporlari (sektoru bos olanlar
     dahil) tarar ve siniflandirir.
 
-    Marj Current, Gemini'nin DEGIL, bu fonksiyonun Python tarafinin isi:
-    Gemini'nin DONDURDUGU sektor gruplarina gore, her sirketin (varsa)
-    import edilmis GERCEK finansallardan hesaplanan kompozit marjini AYNI
-    SEKTORDEKI diger sirketlerle kiyaslar (bkz. compute_marj_current_for_sector).
-    Ayrica Marj Development de (varsa) finansallardan tazelenir - ilk analiz
-    sirasinda financial_store'da olmayip sonradan import edilmis olabilir.
+    Marj Puani (FAVOK+Net Kar seviye skorlarinin ortalamasi), Gemini'nin
+    DEGIL, bu fonksiyonun Python tarafinin isi: Gemini'nin DONDURDUGU sektor
+    gruplarina gore, her sirketin (varsa) import edilmis GERCEK
+    finansallardan hesaplanan FAVOK ve Net Kar marjlarini AYRI AYRI AYNI
+    SEKTORDEKI diger sirketlerle kiyaslar (bkz. _apply_margin_scores /
+    compute_margin_scores_for_ticker). Ayrica Marj Gelisim Puani, Marj
+    Gelisim Puani (Yillik), Marj Toplam Puani ve Overall Puan da (varsa)
+    finansallardan tazelenir - ilk analiz sirasinda financial_store'da
+    olmayip sonradan import edilmis olabilir.
 
     Sonuclari sector_rollup_analysis tablosuna (yil, donem, sektor) anahtariyla
     kaydeder (upsert); ayrica company_report_summaries uzerindeki sektor/marj/
@@ -951,37 +1133,16 @@ def compute_sector_rollup(yil, donem, financial_margins=None):
                   len(sirketler)))
             for c in sirketler:
                 ticker = c['ticker']
-                cur_score, cur_yorumu = compute_marj_current_for_sector(
-                    ticker, sektor_tickers, financial_margins)
-                dev_score, dev_yorumu = compute_marj_development_from_financials(
-                    financial_margins.get(ticker))
-                ytd_score, ytd_yorumu = compute_marj_ytd_yoy_from_financials(
-                    financial_margins.get(ticker))
-
-                set_values = {
-                    "sektor": sektor,
-                    "gorunum_puani": c.get('gorunum_puani'),
-                    "gorunum_yorumu": c.get('gorunum_yorumu'),
-                }
-                # marj_current/development/ytd SADECE finansal veriyle hesaplanabildiginde
-                # guncelleniyor - hesaplanamiyorsa (peer/finansal veri yok) mevcut
-                # deger (varsa onceki bir hesaplamadan kalan) SIFIRLANMIYOR.
-                if cur_score is not None:
-                    set_values["marj_current_puani"] = cur_score
-                    set_values["marj_current_yorumu"] = cur_yorumu
-                if dev_score is not None:
-                    set_values["marj_development_puani"] = dev_score
-                    set_values["marj_development_yorumu"] = dev_yorumu + " (kaynak: import edilmiş finansallar)"
-                if ytd_score is not None:
-                    set_values["marj_ytd_puani"] = ytd_score
-                    set_values["marj_ytd_yorumu"] = ytd_yorumu + " (kaynak: import edilmiş finansallar, YTD YoY)"
-
-                set_sql = ", ".join(f"{col} = %s" for col in set_values)
-                cur.execute(f"""
+                gorunum_puani = c.get('gorunum_puani')
+                cur.execute("""
                     UPDATE company_report_summaries
-                    SET {set_sql}
+                    SET sektor = %s, gorunum_puani = %s, gorunum_yorumu = %s
                     WHERE ticker = %s AND yil = %s AND donem = %s
-                """, list(set_values.values()) + [ticker, int(yil), donem])
+                """, (sektor, gorunum_puani, c.get('gorunum_yorumu'), ticker, int(yil), donem))
+                # FAVÖK/Net Kâr Puanı, Marj Puanı, gelişim skorları, Marj
+                # Toplam Puanı, Overall Puan - bkz. _apply_margin_scores.
+                _apply_margin_scores(cur, ticker, yil, donem, sektor_tickers,
+                                      financial_margins, gorunum_puani)
                 sirket_toplam += 1
     conn.commit()
     get_sector_rollup.clear()
@@ -992,30 +1153,33 @@ def compute_sector_rollup(yil, donem, financial_margins=None):
 
 def refresh_all_margin_scores(financial_margins):
     """Company Reports'ta ŞİMDİYE KADAR kayıtlı TÜM (ticker, yıl, dönem)
-    raporlarının Marj Current/Development/YTD (Yıllık) skorlarını, YENİ
-    import edilmiş financial_margins'e göre YENİDEN hesaplar ve DB'de
-    günceller - compute_sector_rollup'ın aksine Gemini'YE HİÇ SORMAZ
-    (sektör ataması ve Görünüm Puanı zaten var, sadece marj rakamları
-    gerçek finansal veriyle tazeleniyor). "Financial Data" toplu import
-    edildikten SONRA geçmiş raporları güncel finansallarla senkronlamak
-    için kullanılır (bkz. Company Reports > 🔄 Marjları Finansallardan
-    Tazele butonu).
+    raporlarının TÜM marj skorlarını (FAVÖK/Net Kâr Puanı, Marj Puanı,
+    FAVÖK/Net Kâr Gelişim Puanı, Marj Gelişim Puanı (+Yıllık), Marj Toplam
+    Puanı, Overall Puan) YENİ import edilmiş financial_margins'e göre
+    YENİDEN hesaplar ve DB'de günceller - compute_sector_rollup'ın aksine
+    Gemini'YE HİÇ SORMAZ (sektör ataması ve Görünüm Puanı zaten var, sadece
+    marj rakamları gerçek finansal veriyle tazeleniyor). "Financial Data"
+    toplu import edildikten SONRA geçmiş raporları güncel finansallarla
+    senkronlamak için kullanılır (bkz. Company Reports > 🔄 Marjları
+    Finansallardan Tazele butonu).
 
-    Marj Current için peer grubu, o (yıl, dönem) içinde HALİHAZIRDA aynı
-    sektöre atanmış diğer ticker'lardan kurulur (yeniden sınıflandırma
-    YAPILMAZ) - sektörü boş olan raporlar için Marj Current atlanır.
+    Seviye skorları (FAVÖK/Net Kâr Puanı, dolayısıyla Marj Puanı) için peer
+    grubu, o (yıl, dönem) içinde HALİHAZIRDA aynı sektöre atanmış diğer
+    ticker'lardan kurulur (yeniden sınıflandırma YAPILMAZ) - sektörü boş
+    olan raporlar için sadece gelişim skorları hesaplanır.
 
-    Donus: dict(rapor_sayisi, current_hesaplanan, development_hesaplanan,
-                 ytd_hesaplanan)."""
+    Donus: dict(rapor_sayisi, marj_puani_hesaplanan, marj_gelisim_hesaplanan,
+                 marj_gelisim_yillik_hesaplanan, marj_toplam_hesaplanan)."""
     conn = _get_live_connection()
-    stats = {"rapor_sayisi": 0, "current_hesaplanan": 0,
-             "development_hesaplanan": 0, "ytd_hesaplanan": 0}
+    stats = {"rapor_sayisi": 0, "marj_puani_hesaplanan": 0,
+              "marj_gelisim_hesaplanan": 0, "marj_gelisim_yillik_hesaplanan": 0,
+              "marj_toplam_hesaplanan": 0}
     if conn is None:
         return stats
     financial_margins = financial_margins or {}
 
     df = pd.read_sql("""
-        SELECT ticker, yil, donem, sektor
+        SELECT ticker, yil, donem, sektor, gorunum_puani
         FROM company_report_summaries
         WHERE ticker IS NOT NULL AND yil IS NOT NULL AND donem IS NOT NULL
     """, conn)
@@ -1026,38 +1190,20 @@ def refresh_all_margin_scores(financial_margins):
     with conn.cursor() as cur:
         for (yil, donem), grp in df.groupby(['yil', 'donem']):
             for sektor, sgrp in grp.groupby('sektor', dropna=False):
-                sektor_tickers = list(sgrp['ticker'])
-                for ticker in sektor_tickers:
-                    set_values = {}
-                    if pd.notna(sektor):
-                        cur_score, cur_yorumu = compute_marj_current_for_sector(
-                            ticker, sektor_tickers, financial_margins)
-                        if cur_score is not None:
-                            set_values["marj_current_puani"] = cur_score
-                            set_values["marj_current_yorumu"] = cur_yorumu
-                            stats["current_hesaplanan"] += 1
-                    dev_score, dev_yorumu = compute_marj_development_from_financials(
-                        financial_margins.get(ticker))
-                    if dev_score is not None:
-                        set_values["marj_development_puani"] = dev_score
-                        set_values["marj_development_yorumu"] = (
-                            dev_yorumu + " (kaynak: import edilmiş finansallar)")
-                        stats["development_hesaplanan"] += 1
-                    ytd_score, ytd_yorumu = compute_marj_ytd_yoy_from_financials(
-                        financial_margins.get(ticker))
-                    if ytd_score is not None:
-                        set_values["marj_ytd_puani"] = ytd_score
-                        set_values["marj_ytd_yorumu"] = (
-                            ytd_yorumu + " (kaynak: import edilmiş finansallar, YTD YoY)")
-                        stats["ytd_hesaplanan"] += 1
-                    if not set_values:
-                        continue
-                    set_sql = ", ".join(f"{col} = %s" for col in set_values)
-                    cur.execute(f"""
-                        UPDATE company_report_summaries
-                        SET {set_sql}
-                        WHERE ticker = %s AND yil = %s AND donem = %s
-                    """, list(set_values.values()) + [ticker, int(yil), donem])
+                sektor_tickers = list(sgrp['ticker']) if pd.notna(sektor) else None
+                for _, row in sgrp.iterrows():
+                    ticker = row['ticker']
+                    gorunum_puani = row['gorunum_puani'] if pd.notna(row['gorunum_puani']) else None
+                    set_values = _apply_margin_scores(
+                        cur, ticker, yil, donem, sektor_tickers, financial_margins, gorunum_puani)
+                    if "marj_current_puani" in set_values:
+                        stats["marj_puani_hesaplanan"] += 1
+                    if "marj_development_puani" in set_values:
+                        stats["marj_gelisim_hesaplanan"] += 1
+                    if "marj_ytd_puani" in set_values:
+                        stats["marj_gelisim_yillik_hesaplanan"] += 1
+                    if "marj_toplam_puani" in set_values:
+                        stats["marj_toplam_hesaplanan"] += 1
     conn.commit()
     get_sector_rollup.clear()
     get_reports_for_period.clear()
@@ -1074,10 +1220,81 @@ def _kpi_card(label, value, yon):
     st.caption(YON_BADGE.get(yon, "❓ Belirsiz"))
 
 
+def _render_margin_score_block(r):
+    """Marj skorlama hiyerarşisini gösterir - "Hedef Özeti" (yeni analiz)
+    kartı ve geçmiş rapor listesi kartı arasında paylaşılan ortak görsel
+    blok:
+      FAVÖK Puanı, Net Kâr Puanı -> Marj Puanı
+      FAVÖK Gelişim P., Net Kâr Gelişim P. -> Marj Gelişim Puanı
+      (+ bilgi amaçlı: Marj Gelişim Puanı (Yıllık))
+      Marj Toplam Puanı, Görünüm Puanı -> Overall Puan
+    r: dict veya dict-benzeri (pd.Series.to_dict() de olabilir) - eksik
+    anahtarlar .get() ile None kabul edilir.
+    Donus: hiç skor yoksa False (hiçbir şey çizilmedi), varsa True."""
+    has_any = any(pd.notna(r.get(k)) for k in (
+        'favok_puani', 'net_kar_puani', 'marj_current_puani',
+        'favok_gelisim_puani', 'net_kar_gelisim_puani', 'marj_development_puani',
+        'marj_toplam_puani', 'overall_puani', 'gorunum_puani'))
+    if not has_any:
+        return False
+
+    def _v(key):
+        v = r.get(key)
+        return f"{v}/5" if pd.notna(v) else "—"
+
+    st.caption("**Marj Puanı** — FAVÖK ve net kâr marjının sektör ortalamasına göre seviyesi "
+               "(brüt kâr marjı bu skora dahil değil, sadece metinde anlatılır)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("FAVÖK Puanı", _v('favok_puani'))
+        if r.get('favok_puani_yorumu'):
+            st.caption(r['favok_puani_yorumu'])
+    with c2:
+        st.metric("Net Kâr Puanı", _v('net_kar_puani'))
+        if r.get('net_kar_puani_yorumu'):
+            st.caption(r['net_kar_puani_yorumu'])
+    with c3:
+        st.metric("→ Marj Puanı", _v('marj_current_puani'))
+    if pd.isna(r.get('marj_current_puani')):
+        st.caption("ℹ️ Sadece \"Sektör Analizi\" bölümünde \"Hesapla/Yenile\" ya da "
+                   "\"🔄 Marjları Finansallardan Tazele\" çalıştırıldıktan sonra hesaplanır "
+                   "(sektördeki diğer şirketlerle kıyaslama gerekir).")
+
+    st.caption("**Marj Gelişim Puanı** — bir önceki döneme göre FAVÖK ve net kâr marjı gelişimi")
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        st.metric("FAVÖK Gelişim P.", _v('favok_gelisim_puani'))
+        if r.get('favok_gelisim_yorumu'):
+            st.caption(r['favok_gelisim_yorumu'])
+    with c5:
+        st.metric("Net Kâr Gelişim P.", _v('net_kar_gelisim_puani'))
+        if r.get('net_kar_gelisim_yorumu'):
+            st.caption(r['net_kar_gelisim_yorumu'])
+    with c6:
+        st.metric("→ Marj Gelişim Puanı", _v('marj_development_puani'))
+    if pd.notna(r.get('marj_ytd_puani')):
+        st.caption(f"📅 Yıllık bazda (YTD YoY) Marj Gelişim Puanı: **{r['marj_ytd_puani']}/5**"
+                   + (f" — {r['marj_ytd_yorumu']}" if r.get('marj_ytd_yorumu') else ""))
+
+    st.markdown("---")
+    c7, c8, c9 = st.columns(3)
+    with c7:
+        st.metric("Marj Toplam Puanı", _v('marj_toplam_puani'))
+        st.caption("(Marj Puanı + Marj Gelişim Puanı) / 2")
+    with c8:
+        st.metric("🔮 Görünüm Puanı", _v('gorunum_puani'))
+        if r.get('gorunum_yorumu'):
+            st.caption(r['gorunum_yorumu'])
+    with c9:
+        st.metric("⭐ Overall Puan", _v('overall_puani'))
+        st.caption("(Marj Toplam Puanı + Görünüm Puanı) / 2")
+    return True
+
+
 def display_company_reports(financial_margins=None):
     """financial_margins: streamlit_app.get_financial_margin_snapshot()'un
     ciktisi - {ticker: {net_margin, net_margin_prev, gross_margin, ...}}.
-    Verilmezse ({} / None) Marj Development LLM tahminine, Marj Current ise
+    Verilmezse ({} / None) Marj Gelişim Puanı LLM tahminine, Marj Puanı ise
     hesaplanamadigi icin bos ('—') kalir - modul streamlit_app olmadan da
     (izole testlerde) calismaya devam eder."""
     financial_margins = financial_margins or {}
@@ -1172,24 +1389,7 @@ def display_company_reports(financial_margins=None):
         st.markdown("---")
         sektor_str = f" | 🏭 {r['sektor']}" if r.get('sektor') else ""
         st.markdown(f"#### 🎯 Hedef Özeti — {r.get('ticker') or ''} {DONEM_LABELS.get(r.get('donem'), '')} {r.get('yil') or ''}{sektor_str}")
-        if (r.get('marj_development_puani') is not None or r.get('marj_ytd_puani') is not None
-                or r.get('gorunum_puani') is not None):
-            m1, m2, m3 = st.columns(3)
-            with m1:
-                st.metric("📊 Marj Gelişimi", f"{r.get('marj_development_puani') or '—'} / 5")
-                st.caption(r.get('marj_development_yorumu') or '')
-            with m2:
-                st.metric("📅 Marj Gelişimi (Yıllık)", f"{r.get('marj_ytd_puani') or '—'} / 5")
-                if r.get('marj_ytd_yorumu'):
-                    st.caption(r['marj_ytd_yorumu'])
-                else:
-                    st.caption("YTD YoY için yeterli import edilmiş finansal veri (bir yıl "
-                               "önceki aynı çeyrek) yok.")
-            with m3:
-                st.metric("🔮 Görünüm Puanı", f"{r.get('gorunum_puani') or '—'} / 5")
-                st.caption(r.get('gorunum_yorumu') or '')
-            st.caption("ℹ️ Marj Current (sektör ortalamasına göre konum) sadece \"Sektör Analizi\" "
-                       "bölümünde \"Hesapla/Yenile\" çalıştırıldıktan sonra hesaplanır.")
+        _render_margin_score_block(r)
         k1, k2, k3 = st.columns(3)
         with k1:
             _kpi_card("💰 Satış/Ciro Hedefi", r.get('satis_hedefi'), r.get('satis_yonu'))
@@ -1235,40 +1435,7 @@ def display_company_reports(financial_margins=None):
                     title = f"{row['ticker'] or row['kaynak_url'][:60]}{sektor_badge}"
                     with st.expander(f"{title} — {row['olusturma_zamani']:%d.%m.%Y %H:%M}"):
                         st.caption(row['kaynak_url'])
-                        has_scores = (pd.notna(row.get('marj_current_puani'))
-                                      or pd.notna(row.get('marj_development_puani'))
-                                      or pd.notna(row.get('marj_ytd_puani'))
-                                      or pd.notna(row.get('gorunum_puani')))
-                        if has_scores:
-                            m1, m2, m3, m4 = st.columns(4)
-                            with m1:
-                                st.markdown(f"**📈 Marj Current: {row.get('marj_current_puani', '—') if pd.notna(row.get('marj_current_puani')) else '—'}/5**")
-                                if pd.notna(row.get('marj_current_yorumu')):
-                                    st.caption(row['marj_current_yorumu'])
-                                else:
-                                    st.caption("Sektör analizi çalıştırılınca hesaplanır.")
-                            with m2:
-                                st.markdown(f"**📊 Marj Development: {row.get('marj_development_puani', '—') if pd.notna(row.get('marj_development_puani')) else '—'}/5**")
-                                if pd.notna(row.get('marj_development_yorumu')):
-                                    st.caption(row['marj_development_yorumu'])
-                            with m3:
-                                st.markdown(f"**📅 Marj Dev. (Yıllık): {row.get('marj_ytd_puani', '—') if pd.notna(row.get('marj_ytd_puani')) else '—'}/5**")
-                                if pd.notna(row.get('marj_ytd_yorumu')):
-                                    st.caption(row['marj_ytd_yorumu'])
-                                else:
-                                    st.caption("Bir yıl önceki aynı çeyrek verisi yok.")
-                            with m4:
-                                st.markdown(f"**🔮 Görünüm Puanı: {row.get('gorunum_puani', '—') if pd.notna(row.get('gorunum_puani')) else '—'}/5**")
-                                if pd.notna(row.get('gorunum_yorumu')):
-                                    st.caption(row['gorunum_yorumu'])
-                            marj_parts = [v for v in (row.get('marj_current_puani'), row.get('marj_development_puani'),
-                                                       row.get('marj_ytd_puani')) if pd.notna(v)]
-                            if marj_parts:
-                                marj_avg = sum(marj_parts) / len(marj_parts)
-                                total_parts = [v for v in (marj_avg, row.get('gorunum_puani')) if pd.notna(v)]
-                                total_score = sum(total_parts) / len(total_parts) if total_parts else None
-                                st.caption(f"**Marj Avg: {marj_avg:.1f}/5**" +
-                                           (f" · **Total Score: {total_score:.1f}/5**" if total_score is not None else ""))
+                        if _render_margin_score_block(row.to_dict()):
                             st.markdown("---")
                         st.markdown(row['ozet'])
 
@@ -1288,27 +1455,30 @@ def display_company_reports(financial_margins=None):
                "bir Gemini çağrısı yapar (yeni eklenen raporlar da dahil edilir); **Göster** "
                "ise hiçbir çağrı yapmadan en son hesaplanmış tabloyu getirir.")
     if not financial_margins:
-        st.caption("ℹ️ Marj Current/Development/Dev. (Yıllık), sidebar'dan **Import Financials** "
-                   "çalıştırılmış hisseler için gerçek finansal verilerden hesaplanır (daha "
-                   "doğru, Gemini kotası harcamaz). Henüz hiç finansal import edilmemiş — Marj "
-                   "Current (sadece gerçek veriyle hesaplanır, LLM tahmini yok) hiç "
-                   "hesaplanamıyor; Marj Development ve Marj Dev. (Yıllık) ise şimdilik "
-                   "faaliyet raporu metninden LLM tahminine dayanıyor (raporda geçen yılın "
-                   "aynı döneminden bahsedilmiyorsa Yıllık versiyonu genelde boş kalır).")
+        st.caption("ℹ️ Marj Puanı/Gelişim Puanı/Gelişim Puanı (Yıllık), sidebar'dan **Import "
+                   "Financials** çalıştırılmış hisseler için gerçek finansal verilerden "
+                   "hesaplanır (daha doğru, Gemini kotası harcamaz). Henüz hiç finansal import "
+                   "edilmemiş — Marj Puanı (sadece gerçek veriyle hesaplanır, LLM tahmini yok) "
+                   "hiç hesaplanamıyor; Marj Gelişim Puanı ve Gelişim Puanı (Yıllık) ise "
+                   "şimdilik faaliyet raporu metninden LLM tahminine dayanıyor (raporda geçen "
+                   "yılın aynı döneminden bahsedilmiyorsa Yıllık versiyonu genelde boş kalır).")
     else:
         if st.button("🔄 Marjları Finansallardan Tazele (TÜM dönemler, Gemini'siz)",
                       use_container_width=True,
-                      help="Şimdiye kadar kayıtlı TÜM raporların Marj Current/Development/"
-                           "Dev. (Yıllık) skorlarını, import edilmiş finansallardan yeniden "
-                           "hesaplar - sektör ataması ve metin özeti DEĞİŞMEZ, Gemini'ye "
-                           "sorulmaz. Yeni bir toplu 'Import Financials' sonrası çalıştır."):
+                      help="Şimdiye kadar kayıtlı TÜM raporların FAVÖK/Net Kâr Puanı, Marj "
+                           "Puanı, FAVÖK/Net Kâr Gelişim Puanı, Marj Gelişim Puanı (+Yıllık), "
+                           "Marj Toplam Puanı ve Overall Puan'ını import edilmiş finansallardan "
+                           "yeniden hesaplar - sektör ataması, Görünüm Puanı ve metin özeti "
+                           "DEĞİŞMEZ, Gemini'ye sorulmaz. Yeni bir toplu 'Import Financials' "
+                           "sonrası çalıştır."):
             with st.spinner("Tüm raporların marj skorları finansallardan tazeleniyor..."):
                 stats = refresh_all_margin_scores(financial_margins)
             st.success(
                 f"✅ {stats['rapor_sayisi']} rapor tarandı — "
-                f"Marj Current: {stats['current_hesaplanan']}, "
-                f"Marj Development: {stats['development_hesaplanan']}, "
-                f"Marj Dev. (Yıllık): {stats['ytd_hesaplanan']} rapor için gerçek "
+                f"Marj Puanı: {stats['marj_puani_hesaplanan']}, "
+                f"Marj Gelişim Puanı: {stats['marj_gelisim_hesaplanan']}, "
+                f"Marj Gelişim Puanı (Yıllık): {stats['marj_gelisim_yillik_hesaplanan']}, "
+                f"Marj Toplam Puanı: {stats['marj_toplam_hesaplanan']} rapor için gerçek "
                 f"finansal veriyle güncellendi."
             )
 
@@ -1373,25 +1543,21 @@ def display_company_reports(financial_margins=None):
                         st.markdown(srow['makro_analiz'] or '_Analiz yok._')
                         st.markdown("---")
                         companies = donem_raporlari[donem_raporlari['sektor'] == srow['sektor']].copy()
-                        # Marj Avg = (Marj Current + Marj Development + Marj Dev. Yıllık)
-                        # ortalaması; Total Score = (Marj Avg + Görünüm Puanı) ortalaması -
-                        # siralama bu nihai skora gore yapiliyor (sektorlerin kendisi de
-                        # skora gore siraliydi, ayni mantik sirketler icin de gecerli).
-                        companies['_marj_avg'] = companies[
-                            ['marj_current_puani', 'marj_development_puani', 'marj_ytd_puani']
-                        ].mean(axis=1, skipna=True)
-                        companies['_total_score'] = companies[['_marj_avg', 'gorunum_puani']].mean(axis=1, skipna=True)
-                        companies = companies.sort_values('_total_score', ascending=False, na_position='last')
+                        # Marj Toplam Puanı = (Marj Puanı + Marj Gelişim Puanı) / 2, Overall Puan
+                        # = (Marj Toplam Puanı + Görünüm Puanı) / 2 - ikisi de _apply_margin_scores
+                        # tarafından zaten hesaplanıp DB'ye yazılmış durumda (burada tekrar
+                        # hesaplanmıyor). Sıralama Overall Puan'a göre.
+                        companies = companies.sort_values('overall_puani', ascending=False, na_position='last')
                         show = companies.copy()
                         show['Dönem'] = show.apply(
                             lambda x: f"{DONEM_LABELS.get(x['donem'], x['donem'])} {int(x['yil'])}"
                             if pd.notna(x['yil']) else '—', axis=1)
-                        show['Marj Current'] = show['marj_current_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
-                        show['Marj Development'] = show['marj_development_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
-                        show['Marj Dev. (Yıllık)'] = show['marj_ytd_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
-                        show['Marj Avg'] = show['_marj_avg'].apply(lambda v: f"{v:.1f}/5" if pd.notna(v) else "—")
+                        show['Marj Puanı'] = show['marj_current_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
+                        show['Marj Gelişim Puanı'] = show['marj_development_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
+                        show['Marj Gel. P. (Yıllık)'] = show['marj_ytd_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
+                        show['Marj Toplam Puanı'] = show['marj_toplam_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
                         show['Görünüm Puanı'] = show['gorunum_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
-                        show['Total Score'] = show['_total_score'].apply(lambda v: f"{v:.1f}/5" if pd.notna(v) else "—")
+                        show['Overall Puan'] = show['overall_puani'].apply(lambda v: f"{v}/5" if pd.notna(v) else "—")
                         show['Özet Değerleme'] = (
                             show['marj_current_yorumu'].fillna('') + " " +
                             show['marj_development_yorumu'].fillna('') + " " +
@@ -1399,8 +1565,9 @@ def display_company_reports(financial_margins=None):
                             show['gorunum_yorumu'].fillna('')
                         ).str.strip()
                         st.dataframe(
-                            show[['ticker', 'Dönem', 'Marj Current', 'Marj Development', 'Marj Dev. (Yıllık)',
-                                  'Marj Avg', 'Görünüm Puanı', 'Total Score', 'Özet Değerleme']]
+                            show[['ticker', 'Dönem', 'Marj Puanı', 'Marj Gelişim Puanı',
+                                  'Marj Gel. P. (Yıllık)', 'Marj Toplam Puanı', 'Görünüm Puanı',
+                                  'Overall Puan', 'Özet Değerleme']]
                                 .rename(columns={'ticker': 'Hisse'}),
                             use_container_width=True, hide_index=True,
                         )
