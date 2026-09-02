@@ -119,24 +119,49 @@ CREATE INDEX idx_fund_holdings_fon_donem  ON fund_holdings(fon_kodu, yil, ay);
 --      miktar_etkisi_tl  : sadece adet değişiminden gelen TL değişimi
 --    fiyat_etkisi_tl + miktar_etkisi_tl ≈ degisim_tl (küçük bir çapraz terim
 --    farkı hariç, bu standart bir yaklaşıklıktır).
+-- ONEMLI: bir fon bir hisseyi ILK KEZ aliyorsa (bu fon+hisse icin fund_holdings'te
+-- daha ONCEKI HIC satir yoksa), "onceki deger" YOK degil, SIFIR sayilir - yoksa
+-- "%3 agirlikli yeni bir pozisyon aldik" gibi TAM OLARAK bir "degisim" olan bir
+-- durum, "karsilastirilacak onceki donem yok" ile ayni sekilde "-" gorunuyordu
+-- (kullanici raporu - bkz. asagidaki LAG(yil) OVER w IS NULL kontrolu, "hic
+-- ONCEKI SATIR YOK" anlamina gelir, PARTITION icinde ilk satir oldugumuzu soyler).
+-- BUNUNLA KARISTIRILMAMASI GEREKEN AYRI bir durum: ONCEKI SATIR VAR ama o
+-- satirin nominal_deger'i NULL (Excel'den gelen eski donemler adet tutmuyor) -
+-- bu durumda gercek onceki adet BILINMIYOR, SIFIR degil - bu yuzden nominal_
+-- deger'e dayanan degisim_nominal/fiyat_etkisi_tl/miktar_etkisi_tl icin SADECE
+-- "hic onceki satir yok" durumunda ozel islem yapiliyor, "onceki satir var ama
+-- nominal_deger'i NULL" durumunda normal SQL NULL-yayilimi ile "-" (bilinmiyor)
+-- olarak kalmaya devam ediyor - degisim_tl/degisim_agirlik_pct icin boyle bir
+-- ayrim GEREKMIYOR cunku toplam_tutar_tl/agirlik_pct HICBIR satirda NULL olmaz
+-- (kaynagi Excel de olsa KAP_PDF de olsa hep dolu) - LAG'in NULL donmesi ORADA
+-- SADECE "hic onceki satir yok" anlamina gelir.
 CREATE VIEW fund_holdings_change AS
 SELECT
     fon_kodu, security_id, yil, ay,
     toplam_tutar_tl,
     agirlik_pct,
     nominal_deger,
-    toplam_tutar_tl - LAG(toplam_tutar_tl) OVER w AS degisim_tl,
-    agirlik_pct     - LAG(agirlik_pct)     OVER w AS degisim_agirlik_pct,
-    nominal_deger   - LAG(nominal_deger)   OVER w AS degisim_nominal,
-    -- fiyat_etkisi: onceki ay elde tutulan adet x bu ayki-onceki ay birim fiyat farki
-    LAG(nominal_deger) OVER w
-        * ( (toplam_tutar_tl / NULLIF(nominal_deger, 0))
-          - (LAG(toplam_tutar_tl) OVER w / NULLIF(LAG(nominal_deger) OVER w, 0)) )
-        AS fiyat_etkisi_tl,
-    -- miktar_etkisi: adet degisimi x bu ayki birim fiyat
-    (nominal_deger - LAG(nominal_deger) OVER w)
-        * (toplam_tutar_tl / NULLIF(nominal_deger, 0))
-        AS miktar_etkisi_tl
+    toplam_tutar_tl - COALESCE(LAG(toplam_tutar_tl) OVER w, 0) AS degisim_tl,
+    agirlik_pct     - COALESCE(LAG(agirlik_pct)     OVER w, 0) AS degisim_agirlik_pct,
+    CASE WHEN LAG(yil) OVER w IS NULL THEN nominal_deger
+         ELSE nominal_deger - LAG(nominal_deger) OVER w
+    END AS degisim_nominal,
+    -- fiyat_etkisi: onceki ay elde tutulan adet x bu ayki-onceki ay birim fiyat farki.
+    -- Ilk kez alimda fiyat etkisi YOK (henuz elde tutulan bir pozisyon olmadigi icin
+    -- fiyat hareketinin etkileyecegi bir sey yoktu) - degisimin TAMAMI asagidaki
+    -- miktar_etkisi_tl'ye ("ilk alim") yaziliyor.
+    CASE WHEN LAG(yil) OVER w IS NULL THEN 0
+         ELSE LAG(nominal_deger) OVER w
+              * ( (toplam_tutar_tl / NULLIF(nominal_deger, 0))
+                - (LAG(toplam_tutar_tl) OVER w / NULLIF(LAG(nominal_deger) OVER w, 0)) )
+    END AS fiyat_etkisi_tl,
+    -- miktar_etkisi: adet degisimi x bu ayki birim fiyat. Ilk kez alimda TUM
+    -- toplam_tutar_tl buraya yazilir (yukaridaki fiyat_etkisi_tl=0 ile birlikte
+    -- fiyat_etkisi_tl + miktar_etkisi_tl = degisim_tl esitligi hala saglanir).
+    CASE WHEN LAG(yil) OVER w IS NULL THEN toplam_tutar_tl
+         ELSE (nominal_deger - LAG(nominal_deger) OVER w)
+              * (toplam_tutar_tl / NULLIF(nominal_deger, 0))
+    END AS miktar_etkisi_tl
 FROM fund_holdings
 WINDOW w AS (PARTITION BY fon_kodu, security_id ORDER BY yil, ay);
 
