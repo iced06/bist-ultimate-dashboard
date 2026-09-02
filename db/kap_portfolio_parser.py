@@ -115,6 +115,23 @@ SECTION_HEADERS = {
                         # readme_findings.md); HISSE_SENEDI'ye SIZMAMASI icin
                         # ayri bolum olarak isaretleniyor (import script'i
                         # sadece HISSE_SENEDI'yi DB'ye yaziyor).
+    # Katilim/murabaha yapili fonlarda gozlemlendi (KTJ - Kuveyt Turk Portfoy
+    # Teknoloji Katilim Fonu): bir "taahhut sozlesmesi" ile satilan/alinan
+    # hazine bonosu pozisyonu, HISSE SENETLERI bolumunun GRUP TOPLAMI'ndan
+    # HEMEN SONRA, kendi basligi ("Taahhut Sozlesmesi Satis/Alis") TANINMADIGI
+    # icin current_section HISSE_SENEDI'de TAKILI KALIYORDU - bu da hem bu
+    # bono satirlarinin (yanlislikla) hisse gibi sayilmasina hem de HEMEN
+    # SONRAKI DIGER bolumunun kendi GRUP TOPLAMI'nin HISSE_SENEDI'ye
+    # (bkz. asagidaki "son GRUP TOPLAMI kazanir" mantigi) sizip reconciliation'i
+    # bozmasina yol aciyordu. Ayri/ihmal edilen bir bolum olarak isaretleniyor.
+    'Taahhüt Sözleşmesi Satış': 'TAAHHUT',
+    'Taahhüt Sözleşmesi Alış': 'TAAHHUT',
+    # Ayni sinif hata (bkz. yukaridaki not) DOH fonunda "VIOP Nakit Teminatı"
+    # basligiyla da gercek veride yakalandi - HISSE SENETLERI'nin GRUP
+    # TOPLAMI'ndan hemen sonra gelip current_section'i degistirmedigi icin
+    # kendi GRUP TOPLAMI'si (%5,42) HISSE_SENEDI'nin dogru toplamina
+    # (%96,27) sizip reconciliation'i bozuyordu.
+    'VIOP Nakit Teminatı': 'TUREV',
 }
 # Bu satirlar bolum degistirmez, sadece alt-etiket (Hisse Turk / Hisse Yabanci vb.)
 SUB_LABEL_LINES = {
@@ -299,21 +316,47 @@ def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
 
     current_section = 'UNKNOWN'
     lines = [l.strip() for l in all_text.split('\n')]
+    prev_was_grup_toplami = False
 
     for i, line in enumerate(lines):
         if not line:
             continue
         if line in SUB_LABEL_LINES:
+            prev_was_grup_toplami = False
             continue
         if line in SECTION_HEADERS:
             current_section = SECTION_HEADERS[line]
+            prev_was_grup_toplami = False
             continue
         if STOP_LINE_RE.match(line):
-            if line.startswith('GRUP TOPLAMI') and current_section not in result.printed_group_totals:
-                nums = NUM_RE.findall(line)
-                if len(nums) >= 3:
-                    result.printed_group_totals[current_section] = _to_float(nums[-1])
+            is_grup_toplami = line.startswith('GRUP TOPLAMI')
+            if is_grup_toplami:
+                # Bir bolum "Hisse Turk"/"Hisse Yabanci" gibi ALT gruplara
+                # ayrilmissa (bkz. SUB_LABEL_LINES), her alt grup KENDI GRUP
+                # TOPLAMI satirini yazdirir (orn. sadece yerli %10,29) ve
+                # HEMEN ARDINDAN (araya baska veri girmeden) butun bolumun
+                # BIRLESIK toplamini yazdirir (orn. yerli+yabanci %87,66) -
+                # KTJ fonunda gercek veriyle yakalandi. current_section bu
+                # ALT gruplar arasinda DEGISMEDIGI icin (sub-label bolum
+                # degistirmez), SADECE bir GRUP TOPLAMI satiri HEMEN BASKA
+                # BIR GRUP TOPLAMI satirini (metin olarak, yazip yazmadigina
+                # bakilmaksizin) takip ediyorsa (araya veri/etiket girmemisse)
+                # SONRAKI deger uzerine yazilir - bu "birlesik final toplam"
+                # imzasidir. Aksi halde ILK deger korunur.
+                #
+                # NOT: Bu mantigin GUVENLI olmasi, TANINMAYAN alt-bolumlerin
+                # (orn. "VIOP Nakit Teminati", "Taahhut Sozlesmesi Satis")
+                # SECTION_HEADERS'a eklenip current_section'i GERCEKTEN
+                # degistirmesine bagli - yoksa o bolumun kendi GRUP TOPLAMI'si
+                # (data satirlari arada olmadan) HISSE_SENEDI'nin totaline
+                # sizabilir (DOH'ta "VIOP Nakit Teminati" ile yakalandi).
+                if prev_was_grup_toplami or current_section not in result.printed_group_totals:
+                    nums = NUM_RE.findall(line)
+                    if len(nums) >= 3:
+                        result.printed_group_totals[current_section] = _to_float(nums[-1])
+            prev_was_grup_toplami = is_grup_toplami
             continue
+        prev_was_grup_toplami = False
 
         if not _is_data_line(line):
             # ISIN tasimayan/sayisal alanlari eksik satir (baslik tekrari,

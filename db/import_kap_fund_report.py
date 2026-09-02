@@ -192,6 +192,20 @@ def import_one(conn, path_or_url):
                 kaynak = 'KAP_PDF'
         """, (fon_kodu, yil, ay, result.katilma_payi_giris_tl, result.katilma_payi_cikis_tl))
 
+        # Kullanici talebi: ayni (fon_kodu, yil, ay) icin (orn. duzeltilmis
+        # bir link/PDF ile) YENIDEN import yapilirsa, o donemin DB'deki
+        # TUM eski satirlari SILINIP yeni PDF'teki veriyle DEGISTIRILSIN.
+        # Asagidaki upsert (ON CONFLICT DO UPDATE) TEK BASINA yetersiz
+        # kalirdi: fon eski raporda tuttugu bir hisseyi YENI raporda
+        # TAMAMEN elden cikarmissa (artik hic gorunmuyorsa), upsert o
+        # ESKI/hayalet satiri hic SILMEZ - sadece ORTAK olan hisseleri
+        # gunceller, DB'de olmayan bir pozisyon kalici kalirdi. Bu noktada
+        # reconciliation ZATEN basarili oldugu (recon_ok=True, yukarida
+        # kontrol edildi) icin bu donem icin GUVENLE "temiz sayfa" yapilir.
+        cur.execute("""
+            DELETE FROM fund_holdings WHERE fon_kodu = %s AND yil = %s AND ay = %s
+        """, (fon_kodu, yil, ay))
+
         n_written = 0
         for h in holdings:
             isin = h['isin']
