@@ -687,11 +687,21 @@ def _render_kap_import_section():
                     st.caption(src)
                     st.write(detay)
 
-            # Yeni veri hemen gorunsun diye ilgili cache'leri temizle.
+            # Yeni veri hemen gorunsun diye ilgili cache'leri temizle. NOT:
+            # bu liste onceden _get_fund_list/_get_positions_for_fund/
+            # _get_fund_aum'u ICERMIYORDU - "Fon Bazli Pozisyonlar" sekmesi
+            # bu yuzden bir import'tan sonra 30 dakikaya kadar ESKI veri
+            # gosterebiliyordu (kullanici NNF icin gercek veriyle degil,
+            # onceki - belki hatali - import'un cache'lenmis sonucuyla
+            # karsilasti).
             _get_available_periods.clear()
             get_latest_fund_flow_map.clear()
             _get_flow_ranking.clear()
             _get_stock_list.clear()
+            _get_fund_list.clear()
+            _get_positions_for_fund.clear()
+            _get_fund_aum.clear()
+            _get_holders_for_stock.clear()
 
 
 def display_funds_analysis():
