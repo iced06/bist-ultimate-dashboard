@@ -6,11 +6,12 @@ Cikti: fon icindeki her menkul kiymet lotu icin normalize edilmis satirlar +
        ISIN (veya ISIN yoksa ticker) bazinda aggregate edilmis (fon, donem,
        hisse) tablosu.
 
-IKI FARKLI RAPOR SABLONU ("dialect") gozlemlendi - ilk 4 fonluk pilotta
+UC FARKLI RAPOR SABLONU ("dialect") gozlemlendi - ilk 4 fonluk pilotta
 (Tera/HSBC/İş Portföy/Neo) hepsi AYNI sablonu (Format A) kullaniyordu, bu
 yuzden "SPK'nin tek bir zorunlu formati var" varsayimi yapilmisti. 5. fonda
-(Ata Portföy) FARKLI bir sablon (Format B) cikti - bu yuzden iki ayri
-ayristirici var, ilk satirdaki basliga gore otomatik secilir:
+(Ata Portföy) FARKLI bir sablon (Format B), Yapı Kredi Portföy fonlarinda
+(orn. YAY) ise UCUNCU bir sablon (Format C) cikti - basliga gore otomatik
+secilir:
   - Format A ("{KOD}-{FON ADI}" basligi): satirlarda ISIN var, Turkce sayi
     formati (1.234.567,89), bolumler "HİSSE SENETLERİ" duz satir, toplam
     "GRUP TOPLAMI ... %" satirinda.
@@ -19,6 +20,12 @@ ayristirici var, ilk satirdaki basliga gore otomatik secilir:
     formati (1,234,567.89), bolumler "A) HİSSE SENETLERİ" harfli, toplam
     "TOPLAM: <nominal> <rayic>" satirinda (yuzde YOK - reconciliation TL
     toplamina gore yapiliyor, % degil).
+  - Format C ("Kurucu Şirket" / "(KOD) Fon Adı" / "{Ay} {Yıl} Aylık
+    Raporudur." UC SATIRLIK basligi): satirlarda ISIN var (Format A gibi)
+    AMA sayi formati Ingilizce (Format B gibi) - iki dialect'in hibriti;
+    bolumler "Ğ) YABANCI HİSSE :" gibi cok-harfli/kolon-sonlu, toplam
+    "TOPLAM <nominal> <rayic> <yuzde>" satirinda (bkz. FORMAT_C
+    sabitlerinin ustundeki detayli not).
 
 Bilinen sinirlamalar (readme_findings.md'de detayli):
 - "Tem.Ver." gibi az sayida bilinen on-ek disinda yeni bir on-ek turu
@@ -97,6 +104,32 @@ FORMAT_B_SECTION_MAP = {
     'YABANCI HİSSE SENETLERİ': 'HISSE_SENEDI',
 }
 
+# ── Format C (Yapı Kredi Portföy'de gozlemlendi - AK3/NNF/KPC gibi ilk
+# fonlardan TAMAMEN farkli bir KAP sablonu, YAY fonuyla gercek veride
+# yakalandi) ──
+# Baslik UC SATIRA yayiliyor: (1) kurucu sirket adi duz metin, (2)
+# "(KOD) FON ADI", (3) "{AY} {YIL} AYLIK RAPORUDUR." - Format A/B'nin ikisi
+# de TEK satirlik "{KOD}-{AD}" basligi bekliyordu, bu yuzden ayri dialect
+# gerekti. Hisse senedi satirlarinda ISIN VAR (Format A gibi) ama sayi
+# formati INGILIZCE (Format B gibi, virgul=binlik nokta=ondalik) - iki
+# onceki dialect'in bir "hibriti". Bolum basliklari harfli
+# ("Ğ) YABANCI HİSSE :" - Format B'ninkine benzer AMA bazen COK HARFLI,
+# orn. "AC) VİOP NAKİT TEMİNAT :", "AF) SERTIFIKALAR :") ve METIN ORTASINDA
+# pdfplumber'in sutun-birlestirmesi yuzunden SONRAKI SATIRA TASIYOR (orn.
+# "Ğ) YABANCI HİSSE :" + "SENETLERİ") - bu yuzden bolum adi tam eslesme
+# yerine "HİSSE" ile BASLIYOR MU diye kontrol ediliyor. TOPLAM satiri da
+# kendine ozgu: "TOPLAM <nominal> <rayic> <yuzde>" (Format B'nin
+# "TOPLAM: <2 sayi>"sindan ve Format A'nin "GRUP TOPLAMI ... %"sinden
+# farkli - ne ':' var ne net bir sayac, SADECE bosluk + N adet Ingilizce
+# sayi; sayi adedi bolume gore degisiyor - orn. VADELI bolumu "TOPLAM
+# <tutar> <yuzde>" gibi SADECE 2 sayi yazdirabiliyor - bu yuzden HER ZAMAN
+# SONUNCU sayi yuzde kabul ediliyor).
+NUM_EN_RE = re.compile(r'-?\d{1,3}(?:,\d{3})*\.\d+')
+FORMAT_C_TITLE_RE = re.compile(r'^\(([A-ZÇĞİÖŞÜ0-9]{2,10})\)\s+(.+)$')
+FORMAT_C_PERIOD_RE = re.compile(r'^([A-ZÇĞİÖŞÜ]+)\s+(\d{4})\s+AYLIK\s+RAPORUDUR', re.IGNORECASE)
+FORMAT_C_SECTION_RE = re.compile(r'^([A-ZÇĞİÖŞÜ]{1,3})\)\s*(.+?)\s*:?\s*$')
+FORMAT_C_TOPLAM_RE = re.compile(r'^TOPLAM\s+(.+)$')
+
 
 def _to_float_en(s):
     """Ingilizce sayi formati: 1,234,567.89 -> 1234567.89"""
@@ -171,7 +204,7 @@ class ParseResult:
     katilma_payi_giris_tl: float = None
     katilma_payi_cikis_tl: float = None
     katilma_payi_extract_method: str = ''  # 'same-line' | 'block-fallback' | 'UNRESOLVED'
-    dialect: str = 'A'  # 'A' | 'B' - hangi rapor sablonu tespit edildi
+    dialect: str = 'A'  # 'A' | 'B' | 'C' - hangi rapor sablonu tespit edildi
     reconciliation_metric: str = 'agirlik_pct'  # 'agirlik_pct' | 'toplam_tl' - printed_group_totals
                                                   # neyle kiyaslanmali (dialect'e gore degisir)
 
@@ -180,9 +213,14 @@ def _to_float(s):
     return float(s.replace('.', '').replace(',', '.'))
 
 
-def _extract_katilma_payi(all_text):
+def _extract_katilma_payi(all_text, num_re=NUM_RE, to_float=_to_float):
     """II. bolumdeki fon nakit giris/cikisini (katilma payi ihrac/iade) cikarir.
     4 gercek fonun 4'unde de dogrulandi (bkz. dosya basindaki not).
+    num_re/to_float cagiran tarafindan (bkz. _detect_number_format)
+    verilmezse Turkce format varsayilir - Ingilizce sayi formatli Format A
+    fonlarinda (orn. ITP) DOGRU formati vermek GEREKIR, yoksa "0.00" gibi
+    degerler Turkce regex'e (virgul-ondalik arar) hic UYMAZ ve UNRESOLVED
+    donuulur.
     Donus: (giris_tl, cikis_tl, yontem) - hicbiri bulunamazsa (None, None, 'UNRESOLVED')."""
     lines = all_text.split('\n')
     giris_idx = cikis_idx = None
@@ -196,12 +234,12 @@ def _extract_katilma_payi(all_text):
 
     # Once en yaygin durum: deger etiketle ayni satirda ("... (TL) : 123,45").
     giris_val = cikis_val = None
-    m = NUM_RE.search(lines[giris_idx])
+    m = num_re.search(lines[giris_idx])
     if m:
-        giris_val = _to_float(m.group(0))
-    m = NUM_RE.search(lines[cikis_idx])
+        giris_val = to_float(m.group(0))
+    m = num_re.search(lines[cikis_idx])
     if m:
-        cikis_val = _to_float(m.group(0))
+        cikis_val = to_float(m.group(0))
     if giris_val is not None and cikis_val is not None:
         return giris_val, cikis_val, 'same-line'
 
@@ -272,24 +310,67 @@ def _extract_ticker(prefix_tokens, unmatched_log, raw_line):
     return prefix_tokens[0], False
 
 
+FOOTER_TIMESTAMP_RE = re.compile(r'\b(\d{2})/(\d{2})/(\d{4})\s+\d{2}:\d{2}')
+
+
+def _infer_ay_from_footer(all_text, expected_yil):
+    """Bazi KAP PDF'lerinde (İş Portföy'de gercek veriyle yakalandi - ITP
+    fonu, Agustos 2026 raporu) basliktaki '{Ay}-{Yil}' satirinin AY KISMI
+    PDF'IN KENDI URETIMINDE bozuk/eksik cikiyor (orn. 'Ağustos-2026'
+    yerine tek basina 'A-2026' - bu pdfplumber'in degil KAYNAK PDF'in
+    kendi metin katmaninda eksik, tek harften de GUVENLE cozulemez: Ağustos
+    ile Aralık ikisi de 'A' ile basliyor). Fallback: her sayfanin altindaki
+    olusturma zaman damgasini ('DD/MM/YYYY SS:DD') kullanir - KAP aylik fon
+    raporlari HER ZAMAN bir sonraki ayin ilk gunlerinde yayinlanir, bu
+    yuzden damganin AYINDAN BIR ONCEKI AY donem sayilir. GUVENLIK ICIN
+    SADECE su ikisi de saglanirsa kullanilir: (1) damga GUNU kucuk (<=20 -
+    gec yayinlanmis bir raporda "bir onceki ay" varsayimi yanlis olabilir),
+    (2) damgadan turetilen YIL, basliktan zaten okunan yil ile TUTARLI
+    (uyusmuyorsa hicbir sey donmez - donem_ay yine 0 kalip rapor GUVENLI
+    sekilde reddedilir, YANLIS bir aya asla yazilmaz)."""
+    m = FOOTER_TIMESTAMP_RE.search(all_text)
+    if not m:
+        return 0
+    day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if day > 20:
+        return 0
+    inferred_yil, inferred_ay = (year - 1, 12) if month == 1 else (year, month - 1)
+    if expected_yil and inferred_yil != expected_yil:
+        return 0
+    return inferred_ay
+
+
 def parse_pdf_text(all_text: str) -> ParseResult:
-    """Dispatcher: ilk satirdaki basliga gore Format A/B'yi secer (bkz. dosya
-    basindaki not). Ne A ne B'ye uyarsa Format A denenir - reconciliation
-    basarisiz olup GUVENLI sekilde reddedilecektir (yeni bir 3. dialect
-    eklemek gerekecek anlamina gelir)."""
+    """Dispatcher: basliga gore Format A/B/C'yi secer (bkz. dosya basindaki
+    not). Hicbirine uymazsa Format A denenir - reconciliation basarisiz
+    olup GUVENLI sekilde reddedilecektir (yeni bir dialect eklemek
+    gerekecek anlamina gelir)."""
     first_line = next((l for l in all_text.split('\n') if l.strip()), '')
     if FORMAT_B_TITLE_RE.search(first_line):
-        return _parse_pdf_text_format_b(all_text)
-    return _parse_pdf_text_format_a(all_text)
+        result = _parse_pdf_text_format_b(all_text)
+    else:
+        # Format C: ilk ~6 dolu satirdan biri "(KOD) Fon Adi" seklinde mi -
+        # Format A/B basliklari ASLA acilis parantezle baslamiyor, bu
+        # yuzden tek basina yeterince ayirt edici (bkz. FORMAT_C_TITLE_RE
+        # tanimi).
+        early_lines = [l.strip() for l in all_text.split('\n')[:8] if l.strip()]
+        if any(FORMAT_C_TITLE_RE.match(l) for l in early_lines):
+            result = _parse_pdf_text_format_c(all_text)
+        else:
+            result = _parse_pdf_text_format_a(all_text)
+
+    if result.donem_ay == 0 and result.donem_yil:
+        result.donem_ay = _infer_ay_from_footer(all_text, result.donem_yil)
+    return result
 
 
-def _is_data_line(line):
+def _is_data_line(line, num_re=NUM_RE):
     """Ticker+nominal/toplam/yuzde iceren bir satir mi (ISIN bu satirda
     olmasi SART degil - bkz. _find_isin_in_window)."""
-    return len(NUM_RE.findall(line)) >= 4 and DATE_RE.search(line) is not None
+    return len(num_re.findall(line)) >= 4 and DATE_RE.search(line) is not None
 
 
-def _find_isin_in_window(lines, start_idx, max_lookahead=10):
+def _find_isin_in_window(lines, start_idx, num_re=NUM_RE, max_lookahead=10):
     """BV Portfoy sablonunda gozlemlendi: sirket adi uzun oldugunda ISIN,
     ticker+sayisal-veri satiriyla AYNI satirda degil, adin sardigi
     satirlardan BIRINDE cikabiliyor (orn. 'ASTOR TL 15.000,00 ...' veri
@@ -299,7 +380,7 @@ def _find_isin_in_window(lines, start_idx, max_lookahead=10):
         nxt = lines[j]
         if not nxt:
             continue
-        if nxt in SECTION_HEADERS or STOP_LINE_RE.match(nxt) or _is_data_line(nxt):
+        if nxt in SECTION_HEADERS or STOP_LINE_RE.match(nxt) or _is_data_line(nxt, num_re):
             break
         m = ISIN_RE.search(nxt)
         if m:
@@ -307,12 +388,31 @@ def _find_isin_in_window(lines, start_idx, max_lookahead=10):
     return None
 
 
+def _detect_number_format(all_text):
+    """Format A'nin ORIJINAL 4 pilot fonu (Tera/HSBC/İş Portföy/Neo) Turkce
+    sayi formati kullaniyordu (1.234.567,89) - ama ayni "Format A" YAPISINI
+    (harfsiz duz "HİSSE SENETLERİ" bolum basligi, ISIN'li satirlar, "GRUP
+    TOPLAMI ... %" toplam satiri) kullanan bazi fonlar (İş Portföy'un ITP
+    fonunda gercek veriyle yakalandi, Ağustos 2026 raporu) rapor sablonunu
+    SONRADAN Ingilizce sayi formatina (1,234,567.89) gecirmis - yapi ayni,
+    SADECE sayi formati degisik. Iki regex'in TUM dokumandaki eslesme
+    SAYISINA gore hangi formatin kullanildigini tespit eder (birbirleriyle
+    ORTUSMEZLER - biri virgul biri nokta ondalik ayraci ARADIGI icin ayni
+    sayiyi asla ikisi de eslestirmez). Donus: (num_re, to_float_fn)."""
+    if len(NUM_EN_RE.findall(all_text)) > len(NUM_RE.findall(all_text)):
+        return NUM_EN_RE, _to_float_en
+    return NUM_RE, _to_float
+
+
 def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
     result = ParseResult()
     result.dialect = 'A'
     result.fon_kodu, result.fon_adi, result.donem_yil, result.donem_ay = _parse_header(all_text)
+    num_re, to_float = _detect_number_format(all_text)
+    if num_re is NUM_EN_RE:
+        result.dialect = 'A-en'  # ayni yapi, Ingilizce sayi formati (bkz. _detect_number_format)
     (result.katilma_payi_giris_tl, result.katilma_payi_cikis_tl,
-     result.katilma_payi_extract_method) = _extract_katilma_payi(all_text)
+     result.katilma_payi_extract_method) = _extract_katilma_payi(all_text, num_re, to_float)
 
     current_section = 'UNKNOWN'
     lines = [l.strip() for l in all_text.split('\n')]
@@ -351,14 +451,14 @@ def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
                 # (data satirlari arada olmadan) HISSE_SENEDI'nin totaline
                 # sizabilir (DOH'ta "VIOP Nakit Teminati" ile yakalandi).
                 if prev_was_grup_toplami or current_section not in result.printed_group_totals:
-                    nums = NUM_RE.findall(line)
+                    nums = num_re.findall(line)
                     if len(nums) >= 3:
-                        result.printed_group_totals[current_section] = _to_float(nums[-1])
+                        result.printed_group_totals[current_section] = to_float(nums[-1])
             prev_was_grup_toplami = is_grup_toplami
             continue
         prev_was_grup_toplami = False
 
-        if not _is_data_line(line):
+        if not _is_data_line(line, num_re):
             # ISIN tasimayan/sayisal alanlari eksik satir (baslik tekrari,
             # sirket adi devam satiri, vb.) - atla.
             continue
@@ -369,8 +469,8 @@ def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
             prefix = line[:isin_match.start()].split()
         else:
             # ISIN bu satirda yok - komsu satirlarda ara (bkz. yukaridaki not).
-            isin = _find_isin_in_window(lines, i)
-            split_pos = min(m.start() for m in (NUM_RE.search(line), DATE_RE.search(line)) if m)
+            isin = _find_isin_in_window(lines, i, num_re)
+            split_pos = min(m.start() for m in (num_re.search(line), DATE_RE.search(line)) if m)
             prefix = line[:split_pos].split()
 
         ticker, flagged = _extract_ticker(prefix, result.unmatched_prefix_tokens, line)
@@ -383,13 +483,13 @@ def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
             result.pledge_disclosures.append(line)
             continue
 
-        nums = NUM_RE.findall(line)
+        nums = num_re.findall(line)
         dates = DATE_RE.findall(line)
 
-        nominal = _to_float(nums[0])
-        toplam_tutar = _to_float(nums[-4]) if len(nums) >= 4 else 0.0
+        nominal = to_float(nums[0])
+        toplam_tutar = to_float(nums[-4]) if len(nums) >= 4 else 0.0
         pct_grup, pct_fpd, pct_ftd = (
-            _to_float(nums[-3]), _to_float(nums[-2]), _to_float(nums[-1])
+            to_float(nums[-3]), to_float(nums[-2]), to_float(nums[-1])
         )
 
         if current_section == 'UNKNOWN':
@@ -491,6 +591,120 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
     return result
 
 
+def _parse_header_c(all_text):
+    """Format C basligi UC SATIRA yayilmis (bkz. FORMAT_C sabitlerinin
+    ustundeki not) - ilk ~8 dolu satirda "(KOD) Fon Adi" ve "{Ay} {Yil}
+    AYLIK RAPORUDUR" kaliplarini AYRI AYRI arar (ayni satirda olmalari
+    SART degil)."""
+    lines = [l.strip() for l in all_text.split('\n')[:8] if l.strip()]
+    fon_kodu, fon_adi, yil, ay = '', '', 0, 0
+    for line in lines:
+        m = FORMAT_C_TITLE_RE.match(line)
+        if m and not fon_kodu:
+            fon_kodu, fon_adi = m.group(1), m.group(2)
+        m2 = FORMAT_C_PERIOD_RE.match(line)
+        if m2 and not yil:
+            ay = TURKISH_MONTHS.get(_tr_lower(m2.group(1)), 0)
+            yil = int(m2.group(2))
+    return fon_kodu, fon_adi, yil, ay
+
+
+def _extract_katilma_payi_c(all_text):
+    """Format C'de 'KATILMA PAYI İHRAÇLARINDAN...GİRİŞLERİ'/'...İADELERİNDEN
+    ...ÇIKIŞLARI' etiketleri pdfplumber'da coke KELIMEYE BOLUNUYOR - sayi
+    SADECE ilk parcayla ("<Harf>. KATILMA PAYI : <sayi>") ayni satirda,
+    hangi etiket oldugu (giris/cikis) ise HEMEN SONRAKI satirdaki
+    "İHRAÇLARINDAN"/"İADELERİNDEN" kelimesinden anlasiliyor."""
+    lines = [l.strip() for l in all_text.split('\n')]
+    pat = re.compile(r'KATILMA PAYI\s*:\s*([\d,]+\.\d+)\s*$')
+    giris_val = cikis_val = None
+    for i, line in enumerate(lines):
+        m = pat.search(line)
+        if not m:
+            continue
+        nxt = next((lines[j] for j in range(i + 1, min(len(lines), i + 3)) if lines[j]), '')
+        if giris_val is None and nxt.upper().startswith(('İHRAÇ', 'IHRAC')):
+            giris_val = _to_float_en(m.group(1))
+        elif cikis_val is None and nxt.upper().startswith(('İADE', 'IADE')):
+            cikis_val = _to_float_en(m.group(1))
+    method = 'same-line' if (giris_val is not None and cikis_val is not None) else 'UNRESOLVED'
+    return giris_val, cikis_val, method
+
+
+def _classify_section_c(name):
+    """Bolum adinin (harf-onekli KOD kismindan ayiklanmis) HISSE_SENEDI mi
+    baska bir sey mi oldugunu belirler. TAM eslesme ARANMAZ - pdfplumber
+    basligi 'Ğ) YABANCI HİSSE :' + devam satiri 'SENETLERİ' seklinde ikiye
+    bolebiliyor, bu yuzden sadece 'HİSSE' ile BASLAMASI yeterli sayilir
+    (hem yerli 'HİSSE SENETLERİ' hem yabanci 'YABANCI HİSSE SENETLERİ'
+    Format A'daki gibi TEK bir HISSE_SENEDI kovasinda birlesir - TC/FOR
+    ayrimi zaten ISIN'e gore DB yazarken yapiliyor, bkz. _infer_uyruk)."""
+    n = name.strip().upper()
+    if n.startswith('HİSSE') or n.startswith('YABANCI HİSSE') or n.startswith('HISSE'):
+        return 'HISSE_SENEDI'
+    return 'DIGER'
+
+
+def _parse_pdf_text_format_c(all_text: str) -> ParseResult:
+    result = ParseResult(dialect='C', reconciliation_metric='agirlik_pct')
+    result.fon_kodu, result.fon_adi, result.donem_yil, result.donem_ay = _parse_header_c(all_text)
+    (result.katilma_payi_giris_tl, result.katilma_payi_cikis_tl,
+     result.katilma_payi_extract_method) = _extract_katilma_payi_c(all_text)
+
+    lines = [l.strip() for l in all_text.split('\n')]
+    current_section = 'UNKNOWN'
+
+    for line in lines:
+        if not line:
+            continue
+
+        sm = FORMAT_C_SECTION_RE.match(line)
+        if sm:
+            current_section = _classify_section_c(sm.group(2))
+            continue
+
+        tm = FORMAT_C_TOPLAM_RE.match(line)
+        if tm:
+            nums = NUM_EN_RE.findall(tm.group(1))
+            # Bolume gore sayi adedi degisiyor (nominal SAYISI olmayan
+            # bolumler - orn. VADELI mevduat - sadece tutar+yuzde yazdirir)
+            # - SONUNCU sayi HER ZAMAN yuzdedir (bkz. dosya basindaki not).
+            if nums:
+                result.printed_group_totals[current_section] = _to_float_en(nums[-1])
+            continue
+
+        if current_section != 'HISSE_SENEDI':
+            continue
+
+        isin_match = ISIN_RE.search(line)
+        if not isin_match:
+            # HISSE_SENEDI bolumunde ama ISIN yok - sirket adinin devam
+            # satiri (orn. 'Common Stock' tek basina) - sessizce atla.
+            continue
+        nums = NUM_EN_RE.findall(line)
+        if len(nums) < 3:
+            continue
+        prefix = line[:isin_match.start()].split()
+        ticker = prefix[0] if prefix else ''
+        if not ticker:
+            continue
+        nominal_s, tutar_s, pct_s = nums[-3], nums[-2], nums[-1]
+        result.lots.append(Lot(
+            section=current_section,
+            ticker=ticker,
+            isin=isin_match.group(0),
+            nominal_deger=_to_float_en(nominal_s),
+            tarih='',
+            toplam_tutar_tl=_to_float_en(tutar_s),
+            agirlik_grup_pct=_to_float_en(pct_s),
+            agirlik_fpd_pct=_to_float_en(pct_s),
+            agirlik_ftd_pct=_to_float_en(pct_s),
+            raw_line=line,
+        ))
+
+    return result
+
+
 def aggregate_by_isin(result: ParseResult, section='HISSE_SENEDI'):
     """Isim aksine ragmen ISIN'i olmayan (Format B) satirlar icin ticker'a
     gore de aggregate edebilir - anahtar ISIN varsa ISIN, yoksa ticker'dir."""
@@ -530,11 +744,13 @@ def check_reconciliation(result: ParseResult, holdings: list):
 
 
 if __name__ == '__main__':
-    import pdfplumber
+    # import_kap_fund_report._load_pdf_text kullanilir (dogrudan pdf.pages
+    # DEGIL) - buyuk/cok sayfali raporlarda bellek sismesine yol acan
+    # pdfplumber davranisi icin bkz. o dosyadaki _iter_pdf_pages_lowmem notu.
+    from import_kap_fund_report import _load_pdf_text
 
     for path in sys.argv[1:]:
-        with pdfplumber.open(path) as pdf:
-            text = '\n'.join((p.extract_text() or '') for p in pdf.pages)
+        text = _load_pdf_text(path)
         result = parse_pdf_text(text)
         holdings = aggregate_by_isin(result, 'HISSE_SENEDI')
         calculated, printed_total, ok, unit = check_reconciliation(result, holdings)
