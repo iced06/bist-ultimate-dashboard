@@ -38,8 +38,10 @@ except ImportError:
     requests = None
 try:
     import pdfplumber
+    from pdfminer.pdfpage import PDFPage as _PdfminerPage
 except ImportError:
     pdfplumber = None
+    _PdfminerPage = None
 try:
     import psycopg2
 except ImportError:
@@ -59,15 +61,37 @@ def _download_pdf_bytes(url):
     return data[idx:]
 
 
+def _iter_pdf_pages_lowmem(pdf):
+    """pdf.pages (pdfplumber'in kendi property'si) OLUSTURDUGU TUM Page
+    nesnelerini pdf._pages listesinde KALICI olarak saklar - sayfa bazinda
+    flush_cache() cagirsak bile Page nesnesinin KENDISI (ve page_obj'daki
+    pdfminer icerik/kaynak verisi) asla serbest birakilmiyor. Cok sayfali
+    (yuz+) fon raporlarinda bu LINEER bellek buyumesine yol aciyor - canli
+    olcumde 577 sayfalik bir KAP raporunda ~2.3 GB'a ulasip Streamlit
+    Cloud'da uygulamayi coktu (AK3 fonu, Temmuz 2026 raporu ile
+    dogrulandi). Bu fonksiyon AYNI sayfa olusturma mantigini pdf.pages'in
+    kendi kaynak kodundan alir ama pdf._pages'e HIC EKLEMEZ - her sayfa
+    yield edilip cagiran taraf metnini aldiktan sonra referansi birakinca
+    (donguden bir sonraki adima gecince) cop toplayiciya gidebiliyor. Ayni
+    PDF'te bellek 2.3 GB yerine sabit ~90 MB'ta kaliyor (olculdu), hiz
+    degismiyor."""
+    doctop = 0
+    for i, raw_page in enumerate(_PdfminerPage.create_pages(pdf.doc)):
+        page = pdfplumber.page.Page(pdf, raw_page, page_number=i + 1, initial_doctop=doctop)
+        doctop += page.height
+        yield page
+        page.flush_cache()
+
+
 def _load_pdf_text(path_or_url):
     if path_or_url.startswith('http://') or path_or_url.startswith('https://'):
         if requests is None:
             raise RuntimeError("requests paketi kurulu değil - URL indirilemez.")
         data = _download_pdf_bytes(path_or_url)
         with pdfplumber.open(io.BytesIO(data)) as pdf:
-            return '\n'.join((p.extract_text() or '') for p in pdf.pages)
+            return '\n'.join((p.extract_text() or '') for p in _iter_pdf_pages_lowmem(pdf))
     with pdfplumber.open(path_or_url) as pdf:
-        return '\n'.join((p.extract_text() or '') for p in pdf.pages)
+        return '\n'.join((p.extract_text() or '') for p in _iter_pdf_pages_lowmem(pdf))
 
 
 def _infer_uyruk(isin):

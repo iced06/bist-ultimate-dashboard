@@ -35,8 +35,10 @@ except ImportError:
 
 try:
     import pdfplumber
+    from pdfminer.pdfpage import PDFPage as _PdfminerPage
 except ImportError:
     pdfplumber = None
+    _PdfminerPage = None
 
 try:
     from google import genai
@@ -687,15 +689,37 @@ def _download_pdf_bytes(url):
     return data[idx:]
 
 
+def _iter_pdf_pages_lowmem(pdf):
+    """pdf.pages (pdfplumber'in kendi property'si) OLUSTURDUGU TUM Page
+    nesnelerini pdf._pages listesinde KALICI olarak saklar - sayfa bazinda
+    flush_cache() cagirsak bile Page nesnesinin KENDISI (ve page_obj'daki
+    pdfminer icerik/kaynak verisi) asla serbest birakilmiyor. Cok sayfali
+    (yuz+) yatirimci sunumlarinda/faaliyet raporlarinda bu LINEER bellek
+    buyumesine yol aciyor - canli olcumde 577 sayfalik bir KAP fon raporunda
+    ~2.3 GB'a ulasip Streamlit Cloud'da uygulamayi coktu (bkz.
+    db/import_kap_fund_report.py._iter_pdf_pages_lowmem - ayni sorun, ayni
+    cozum, AK3 fonu Temmuz 2026 raporuyla dogrulandi). Bu fonksiyon AYNI
+    sayfa olusturma mantigini pdf.pages'in kendi kaynak kodundan alir ama
+    pdf._pages'e HIC EKLEMEZ - her sayfa yield edilip cagiran taraf metnini
+    aldiktan sonra referansi birakinca cop toplayiciya gidebiliyor."""
+    doctop = 0
+    for i, raw_page in enumerate(_PdfminerPage.create_pages(pdf.doc)):
+        page = pdfplumber.page.Page(pdf, raw_page, page_number=i + 1, initial_doctop=doctop)
+        doctop += page.height
+        yield page
+        page.flush_cache()
+
+
 def _extract_pdf_text(pdf_bytes):
     if pdfplumber is None:
         raise RuntimeError("pdfplumber kurulu değil.")
     import io
     texts = []
+    n_pages = 0
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        n_pages = len(pdf.pages)
-        for p in pdf.pages:
+        for p in _iter_pdf_pages_lowmem(pdf):
             texts.append(p.extract_text() or "")
+            n_pages += 1
     full_text = "\n".join(texts)
     return full_text, n_pages
 
