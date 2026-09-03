@@ -422,6 +422,23 @@ def _load_financial_store_from_db():
     return store
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_financial_store_db_ticker_count():
+    """Sidebar'daki 'N stocks imported' rozeti icin HAFIF bir sayim - TUM
+    JSONB verisini cekmeden (bkz. _load_financial_store_from_db) sadece kac
+    FARKLI hisse oldugunu doner. Boylece bu rozeti gostermek icin session
+    henuz 566 hissenin tam verisini yuklemis olmak ZORUNDA kalmiyor."""
+    conn = _get_live_financial_db_connection()
+    if conn is None:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(DISTINCT ticker) FROM financial_statements")
+            return cur.fetchone()[0] or 0
+    except Exception:
+        return 0
+
+
 def _delete_financial_store_from_db():
     """'Clear Imported Data' butonu icin - DB'deki TÜM finansal veriyi siler.
     DB artık asıl kalıcı depo olduğundan, bu çağrı yapılmazsa buton
@@ -486,8 +503,24 @@ def _load_financial_store():
     except Exception:
         pass
 
-# Auto-load on startup
-_load_financial_store()
+# NOT: burada ARTIK otomatik "_load_financial_store()" cagirmiyoruz.
+# ONCEDEN her YENI session'da (Streamlit script'i her session icin bastan
+# calistirir) module seviyesinde KOSULSUZ cagriliyordu - yani siteye giren
+# HER ziyaretci, Company Reports'a hic girmese bile, 566 hissenin TUM
+# finansal JSON verisini (yillar boyu) DB'den cekip kendi session_state'ine
+# yukluyordu. Streamlit Cloud'un sinirli bellek/kaynagiyla bu, "Oh no -
+# Error running app. contact support" (platform seviyesinde cokme, kod
+# hatasi degil) ile sonuclaniyordu - gercek veriyle yakalandi (uygulama
+# HICBIR kullanici islemi olmadan, sadece URL'ye girince bile cokuyordu).
+# Bunun yerine artik SADECE gercekten TUM hisselerin verisine ihtiyac
+# duyan yerler (get_financial_margin_snapshot, get_financial_store_summary
+# - ikisi de sadece Company Reports'a girilince calisir) kendi basinda
+# _load_financial_store() cagiriyor - boylece bu agir yuk SADECE Company
+# Reports'u gercekten ziyaret eden kullanicilar icin, SADECE bir kere
+# (cache'lenene kadar) odeniyor. Single Stock'un kendi finansal verisi
+# (get_financial_data) zaten HER ZAMAN tek-hisse bazinda calisiyordu
+# (financial_store'da yoksa canli API'den cekiyor) - bulk yukleme hic
+# gerekmiyor.
 
 IMKB = [
     "ALBRK", "GARAN", "HALKB", "ISCTR", "SKBNK", "TSKB", "ICBCT", "KLNMA",
@@ -1276,6 +1309,7 @@ def import_all_financials(stock_list, max_workers=5):
     # gecersiz kil (yoksa Company Reports/Show List eski veriyi gosterir).
     get_financial_margin_snapshot.clear()
     get_financial_store_summary.clear()
+    _get_financial_store_db_ticker_count.clear()
 
     return success, errors
 
@@ -1779,6 +1813,7 @@ def get_financial_margin_snapshot():
     sekilde yavaslatiyordu. Onbellek, import_all_financials tamamlaninca ve
     "Clear Imported Data" tiklaninca .clear() ile gecersiz kilinir.
     """
+    _load_financial_store()  # sadece burada gercekten TUM hisseler lazim (bkz. yukaridaki not)
     all_key_items = {**KEY_ITEMS_BY_DESC, **KEY_INCOME_BY_DESC}
     snapshot = {}
     for symbol, raw_data in st.session_state.financial_store.items():
@@ -1840,6 +1875,7 @@ def get_financial_store_summary():
     edilmiş her hissenin en son/en eski dönemini ve kaç dönem verisi
     olduğunu döner (hangi hissede en son hangi çeyrek var, tek bakışta
     görülsün diye)."""
+    _load_financial_store()  # sadece burada gercekten TUM hisseler lazim
     rows = []
     for symbol, raw_data in st.session_state.financial_store.items():
         try:
@@ -4222,7 +4258,11 @@ def main():
             st.markdown("---")
             st.subheader("📥 Financial Data")
             
-            store_count = len(st.session_state.financial_store)
+            # Session'a TAM veri yuklenmemis olsa bile (bkz. _load_financial_store
+            # yanindaki not - artik SADECE Company Reports/Show List gercekten
+            # ihtiyac duydugunda yukleniyor) rozetin dogru sayi gostermesi icin
+            # once session'daki (varsa) sayiya, yoksa hafif bir DB COUNT'a bakiyoruz.
+            store_count = len(st.session_state.financial_store) or _get_financial_store_db_ticker_count()
             if store_count > 0:
                 import_time = st.session_state.financial_import_time or "Unknown"
                 err_count = len(st.session_state.financial_import_errors)
@@ -4280,6 +4320,7 @@ def main():
                     _delete_financial_store_from_db()
                     get_financial_margin_snapshot.clear()
                     get_financial_store_summary.clear()
+                    _get_financial_store_db_ticker_count.clear()
                     st.rerun()
         
         if mode == "📊 Single Stock":
