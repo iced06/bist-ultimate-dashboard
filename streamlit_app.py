@@ -1799,7 +1799,17 @@ def get_financial_margin_snapshot():
     Donen format: {ticker: {"period_latest", "period_prev", "period_yoy",
                              "gross_margin", "gross_margin_prev", "gross_margin_yoy",
                              "ebitda_margin", "ebitda_margin_prev", "ebitda_margin_yoy",
-                             "net_margin", "net_margin_prev", "net_margin_yoy"}}
+                             "net_margin", "net_margin_prev", "net_margin_yoy",
+                             "revenue", "revenue_prev", "revenue_yoy",
+                             "ebitda_tl", "ebitda_tl_prev", "ebitda_tl_yoy",
+                             "net_profit", "net_profit_prev", "net_profit_yoy"}}
+    Son uc satirdaki alanlar MUTLAK (nominal TL) buyuklukler - Marj Puani/
+    Marj Gelisim Puani SADECE oranlara (marjlara) bakiyor, kullanici notu:
+    "satislar ve FAVOK nominal olarak dusmus olabilir ama marjlar
+    yukselmis olabilir - iyi bir sey ama satislarini/FAVOK'unu AYNI ZAMANDA
+    marjlarini da artiran bir sirket kadar iyi degil". Bu yuzden ayrica
+    MUTLAK buyume de (Buyume Puani, bkz. sirket_raporlari.compute_growth_
+    scores_for_ticker) hesaplanabiliyor - marjlardan BAGIMSIZ bir boyut.
     Bir hisse icin financial_store'da veri yoksa veya UCUNDE de marj
     hesaplanamiyorsa (orn. gelir tablosu kalemleri eslesmedi) o hisse
     sozlukte YER ALMAZ - caller "yok" durumunu ayirt edebilsin diye. "yoy"
@@ -1829,6 +1839,24 @@ def get_financial_margin_snapshot():
             nm_d = dict(ratios.get("Net Margin %", []))
             if not gm_d and not em_d and not nm_d:
                 continue
+
+            def _abs_val(logical_key, period):
+                """calculate_fundamentals'in ic get_val'inin ayni mantigi -
+                Buyume Puani icin MUTLAK (marj DEGIL) tutarlari cekmek amacli."""
+                if "LogicalKey" not in df_bs.columns:
+                    return None
+                match = df_bs[df_bs["LogicalKey"] == logical_key]
+                if match.empty or period not in match.columns:
+                    return None
+                v = match[period].iloc[0]
+                return float(v) if v is not None and pd.notna(v) else None
+
+            def _ebitda_abs(period):
+                op = _abs_val("operating_profit", period)
+                if op is None:
+                    return None
+                dep = _abs_val("depreciation", period)
+                return op + (abs(dep) if dep is not None else 0)
             # Donem hizalamasi icin GERCEK donem kolonlarina (zaten kronolojik
             # sirali) ankorla - uc oranin listesi bagimsiz olustugu icin
             # (bir donemde orn. sadece net kar var, brut kar yoksa o donem o
@@ -1863,6 +1891,20 @@ def get_financial_margin_snapshot():
                 "net_margin": nm_d.get(period_latest),
                 "net_margin_prev": nm_d.get(period_prev) if period_prev else None,
                 "net_margin_yoy": nm_d.get(period_yoy) if period_yoy else None,
+                "revenue": _abs_val("revenue", period_latest),
+                "revenue_prev": _abs_val("revenue", period_prev) if period_prev else None,
+                "revenue_yoy": _abs_val("revenue", period_yoy) if period_yoy else None,
+                "ebitda_tl": _ebitda_abs(period_latest),
+                "ebitda_tl_prev": _ebitda_abs(period_prev) if period_prev else None,
+                "ebitda_tl_yoy": _ebitda_abs(period_yoy) if period_yoy else None,
+                "net_profit": (_abs_val("net_profit", period_latest)
+                               or _abs_val("net_profit_parent", period_latest)),
+                "net_profit_prev": ((_abs_val("net_profit", period_prev)
+                                     or _abs_val("net_profit_parent", period_prev))
+                                    if period_prev else None),
+                "net_profit_yoy": ((_abs_val("net_profit", period_yoy)
+                                    or _abs_val("net_profit_parent", period_yoy))
+                                   if period_yoy else None),
             }
         except Exception:
             continue
