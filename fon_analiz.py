@@ -819,6 +819,24 @@ def _render_kap_import_section():
             placeholder="https://www.kap.org.tr/tr/api/file/download/...\nYDI|https://www.kap.org.tr/tr/api/file/download/... (fon kodu PDF'te yoksa)",
         )
 
+        def _clear_fund_caches():
+            # Yeni veri hemen gorunsun diye ilgili cache'leri temizle. NOT:
+            # bu liste onceden _get_fund_list/_get_positions_for_fund/
+            # _get_fund_aum'u ICERMIYORDU - "Fon Bazli Pozisyonlar" sekmesi
+            # bu yuzden bir import'tan sonra 30 dakikaya kadar ESKI veri
+            # gosterebiliyordu (kullanici NNF icin gercek veriyle degil,
+            # onceki - belki hatali - import'un cache'lenmis sonucuyla
+            # karsilasti).
+            _get_available_periods.clear()
+            get_latest_fund_flow_map.clear()
+            _get_flow_ranking.clear()
+            _get_stock_list.clear()
+            _get_fund_list.clear()
+            _get_fund_periods.clear()
+            _get_positions_for_fund.clear()
+            _get_fund_aum.clear()
+            _get_holders_for_stock.clear()
+
         if st.button("📥 İçe Aktar", use_container_width=True):
             raw_lines = [s.strip() for s in sources_text.splitlines() if s.strip()]
             if not raw_lines:
@@ -848,16 +866,26 @@ def _render_kap_import_section():
                     ok, detay, meta = _kap_import_one(conn, src, override_kod)
                 except Exception as e:
                     ok, detay, meta = False, str(e), {}
-                results.append((src, ok, detay, meta))
+                results.append({"src": src, "ok": ok, "detay": detay, "meta": meta})
                 prog.progress((i + 1) / len(sources))
             prog.empty()
+            # session_state'e yaziliyor ki asagidaki "kodu duzelt, tekrar
+            # dene" butonlarindan biri tetikledigi rerun'da sonuclar
+            # KAYBOLMASIN (bu buton, disaridaki "Ice Aktar" butonunun
+            # if'i TEKRAR calismayacagi icin, sadece session_state'ten
+            # okunarak render edilebilir).
+            st.session_state['kap_import_results'] = results
+            _clear_fund_caches()
 
-            n_ok = sum(1 for _, ok, _, _ in results if ok)
+        results = st.session_state.get('kap_import_results')
+        if results:
+            n_ok = sum(1 for r in results if r['ok'])
             (st.success if n_ok == len(results) else st.warning)(
                 f"{n_ok}/{len(results)} rapor başarıyla içe aktarıldı."
             )
 
-            for src, ok, detay, meta in results:
+            for i, r in enumerate(results):
+                src, ok, detay, meta = r['src'], r['ok'], r['detay'], r['meta']
                 fon_kodu = meta.get('fon_kodu') or '?'
                 donem_str = (f"{TR_MONTHS_SHORT.get(meta.get('ay'), meta.get('ay'))} {meta.get('yil')}"
                              if meta.get('yil') and meta.get('ay') else 'dönem okunamadı')
@@ -867,26 +895,48 @@ def _render_kap_import_section():
                 title = f"{icon} {fon_kodu} — {donem_str}"
                 if mismatch:
                     title += f" (BEKLENEN {TR_MONTHS_SHORT.get(exp_ay, exp_ay)} {exp_yil} İLE UYUŞMUYOR!)"
-                with st.expander(title):
+                with st.expander(title, expanded=not ok):
                     st.caption(src)
                     st.write(detay)
-
-            # Yeni veri hemen gorunsun diye ilgili cache'leri temizle. NOT:
-            # bu liste onceden _get_fund_list/_get_positions_for_fund/
-            # _get_fund_aum'u ICERMIYORDU - "Fon Bazli Pozisyonlar" sekmesi
-            # bu yuzden bir import'tan sonra 30 dakikaya kadar ESKI veri
-            # gosterebiliyordu (kullanici NNF icin gercek veriyle degil,
-            # onceki - belki hatali - import'un cache'lenmis sonucuyla
-            # karsilasti).
-            _get_available_periods.clear()
-            get_latest_fund_flow_map.clear()
-            _get_flow_ranking.clear()
-            _get_stock_list.clear()
-            _get_fund_list.clear()
-            _get_fund_periods.clear()
-            _get_positions_for_fund.clear()
-            _get_fund_aum.clear()
-            _get_holders_for_stock.clear()
+                    # Fon kodu PDF'te hic gecmiyorsa (meta['fon_kodu'] bos)
+                    # bunu METINDEN anlamaya calismak yerine dogrudan
+                    # kullaniciya sor - textarea'ya "KOD|link" yazmayi
+                    # unutan/bilmeyen kullanici icin ayni islevi burada,
+                    # hatanin TAM YANINDA, gorunur bir alanla saglar.
+                    if not ok and not meta.get('fon_kodu'):
+                        st.caption("⚠️ Bu PDF'te fon kodu hiçbir yerde geçmiyor — kodu kendin gir:")
+                        rc1, rc2 = st.columns([3, 1])
+                        with rc1:
+                            manual_kod = st.text_input(
+                                "Fon kodu", key=f"kap_retry_kod_{i}", label_visibility="collapsed",
+                                placeholder="örn. YDI")
+                        with rc2:
+                            retry_clicked = st.button("🔁 Tekrar dene", key=f"kap_retry_btn_{i}",
+                                                       use_container_width=True)
+                        if retry_clicked:
+                            if not manual_kod.strip():
+                                st.warning("Önce fon kodunu gir.")
+                            else:
+                                conn = _get_live_connection()
+                                if conn is None:
+                                    st.error("Veritabanı bağlantısı yok.")
+                                else:
+                                    try:
+                                        ok2, detay2, meta2 = _kap_import_one(conn, src, manual_kod.strip())
+                                    except Exception as e:
+                                        ok2, detay2, meta2 = False, str(e), meta
+                                    st.session_state['kap_import_results'][i] = {
+                                        "src": src, "ok": ok2, "detay": detay2, "meta": meta2}
+                                    _clear_fund_caches()
+                                    # st.rerun() BURADA GEREKLI: bu script calismasinda ZATEN
+                                    # cizilmis olan ESKI (basarisiz) expander/retry alani
+                                    # session_state'i guncellemekle KENDILIGINDEN degismez -
+                                    # Streamlit ayni tikanma icin IKINCI bir otomatik rerun
+                                    # YAPMIYOR, bu yuzden acikca tetiklenmezse ekran GUNCEL
+                                    # sonucu YENI PASS olmadan hic gostermiyor (canli test:
+                                    # backend YDI'yi basariyla yazdi ama st.rerun() olmadan
+                                    # ekran hala "basarisiz" gosterip kaldi).
+                                    st.rerun()
 
 
 def display_funds_analysis():
