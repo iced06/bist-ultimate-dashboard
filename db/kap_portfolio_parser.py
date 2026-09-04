@@ -349,12 +349,18 @@ def parse_pdf_text(all_text: str) -> ParseResult:
     if FORMAT_B_TITLE_RE.search(first_line):
         result = _parse_pdf_text_format_b(all_text)
     else:
-        # Format C: ilk ~6 dolu satirdan biri "(KOD) Fon Adi" seklinde mi -
-        # Format A/B basliklari ASLA acilis parantezle baslamiyor, bu
-        # yuzden tek basina yeterince ayirt edici (bkz. FORMAT_C_TITLE_RE
-        # tanimi).
+        # Format C: ilk ~8 dolu satirdan biri "(KOD) Fon Adi" YA DA
+        # "{Ay} {Yil} AYLIK RAPORUDUR" seklinde mi. Ikinci kosul GEREKLI -
+        # bazi fonlarda (Yapı Kredi Portföy'un "Model Portföy" urunlerinde
+        # gercek veriyle yakalandi) baslikta HIC "(KOD)" YOK ama govde
+        # (bolum basliklari, ISIN'li Ingilizce-sayi-formatli satirlar) yine
+        # de Format C - Format A/B basliklari ise ne acilis parantezi ne bu
+        # "AYLIK RAPORUDUR" ifadesini kullaniyor, bu yuzden tek basina
+        # yeterince ayirt edici. Boyle bir PDF'te fon_kodu bos kalir -
+        # caller (bkz. import_one'in override_fon_kodu'su) kullanicidan
+        # almasi gerekir.
         early_lines = [l.strip() for l in all_text.split('\n')[:8] if l.strip()]
-        if any(FORMAT_C_TITLE_RE.match(l) for l in early_lines):
+        if any(FORMAT_C_TITLE_RE.match(l) or FORMAT_C_PERIOD_RE.match(l) for l in early_lines):
             result = _parse_pdf_text_format_c(all_text)
         else:
             result = _parse_pdf_text_format_a(all_text)
@@ -595,10 +601,15 @@ def _parse_header_c(all_text):
     """Format C basligi UC SATIRA yayilmis (bkz. FORMAT_C sabitlerinin
     ustundeki not) - ilk ~8 dolu satirda "(KOD) Fon Adi" ve "{Ay} {Yil}
     AYLIK RAPORUDUR" kaliplarini AYRI AYRI arar (ayni satirda olmalari
-    SART degil)."""
-    lines = [l.strip() for l in all_text.split('\n')[:8] if l.strip()]
+    SART degil). Bazi fonlarda (Yapı Kredi Portföy'un "Model Portföy"
+    urunlerinde gercek veriyle yakalandi) baslikta "(KOD)" HIC YOK - boyle
+    durumda fon_kodu bos doner (caller'in override_fon_kodu'su gerekir,
+    bkz. import_one) ama fon_adi'ni YINE DE Format B ile PAYLASILAN "A.
+    FONUN ADI :" etiketinden (ilk ~15 satirda) cikarmayi dener."""
+    all_lines = [l.strip() for l in all_text.split('\n') if l.strip()]
+    early_lines = all_lines[:8]
     fon_kodu, fon_adi, yil, ay = '', '', 0, 0
-    for line in lines:
+    for line in early_lines:
         m = FORMAT_C_TITLE_RE.match(line)
         if m and not fon_kodu:
             fon_kodu, fon_adi = m.group(1), m.group(2)
@@ -606,6 +617,12 @@ def _parse_header_c(all_text):
         if m2 and not yil:
             ay = TURKISH_MONTHS.get(_tr_lower(m2.group(1)), 0)
             yil = int(m2.group(2))
+    if not fon_adi:
+        for line in all_lines[:15]:
+            m = FORMAT_B_FON_ADI_RE.match(line)
+            if m:
+                fon_adi = m.group(1).strip()
+                break
     return fon_kodu, fon_adi, yil, ay
 
 

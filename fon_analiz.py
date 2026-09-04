@@ -623,7 +623,10 @@ def _render_kap_import_section():
                    "PDF linklerini ya da yerel dosya yollarını yapıştır — her satıra bir tane. "
                    "Sistem her PDF'in kendi başlığından fon kodunu ve dönemi otomatik okur; "
                    "reconciliation (PDF'in kendi yazdığı toplamla karşılaştırma) başarısız "
-                   "olursa o rapor GÜVENLİK İÇİN hiç yazılmaz.")
+                   "olursa o rapor GÜVENLİK İÇİN hiç yazılmaz. Bazı PDF'lerde (bazı 'Model "
+                   "Portföy' fonlarında gözlemlendi) fon kodu metnin hiçbir yerinde geçmiyor — "
+                   "böyle bir satır için `KOD|link` yazarak (örn. `YDI|https://...`) kodu "
+                   "kendin verebilirsin.")
 
         if _kap_import_one is None:
             st.error(f"İçe aktarma modülü yüklenemedi: {_KAP_IMPORT_ERROR}")
@@ -643,14 +646,25 @@ def _render_kap_import_section():
         sources_text = st.text_area(
             "PDF URL'leri veya dosya yolları (satır satır)", height=110,
             key="kap_import_sources",
-            placeholder="https://www.kap.org.tr/tr/api/file/download/...\nhttps://www.kap.org.tr/tr/api/file/download/...",
+            placeholder="https://www.kap.org.tr/tr/api/file/download/...\nYDI|https://www.kap.org.tr/tr/api/file/download/... (fon kodu PDF'te yoksa)",
         )
 
         if st.button("📥 İçe Aktar", use_container_width=True):
-            sources = [s.strip() for s in sources_text.splitlines() if s.strip()]
-            if not sources:
+            raw_lines = [s.strip() for s in sources_text.splitlines() if s.strip()]
+            if not raw_lines:
                 st.warning("En az bir URL veya dosya yolu girin.")
                 return
+            # "KOD|link" sozdizimi: fon kodu PDF metninde HIC gecmeyen bazi
+            # raporlarda (bkz. yukaridaki uyari) kullanici kodu kendisi
+            # verebilsin diye - "|" yoksa normal otomatik-tespit davranisi
+            # degismez (override_fon_kodu=None).
+            sources = []
+            for line in raw_lines:
+                if '|' in line:
+                    kod, src = line.split('|', 1)
+                    sources.append((src.strip(), kod.strip() or None))
+                else:
+                    sources.append((line, None))
 
             conn = _get_live_connection()
             if conn is None:
@@ -659,9 +673,9 @@ def _render_kap_import_section():
 
             results = []
             prog = st.progress(0)
-            for i, src in enumerate(sources):
+            for i, (src, override_kod) in enumerate(sources):
                 try:
-                    ok, detay, meta = _kap_import_one(conn, src)
+                    ok, detay, meta = _kap_import_one(conn, src, override_kod)
                 except Exception as e:
                     ok, detay, meta = False, str(e), {}
                 results.append((src, ok, detay, meta))

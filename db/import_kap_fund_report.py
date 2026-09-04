@@ -164,8 +164,18 @@ def _log_etl(conn, fon_kodu, yil, ay, durum, detay):
         """, (fon_kodu or None, yil or None, ay or None, durum, detay))
 
 
-def import_one(conn, path_or_url):
+def import_one(conn, path_or_url, override_fon_kodu=None):
     """Tek bir KAP fon portfoy raporu PDF'ini parse edip DB'ye yazar.
+    override_fon_kodu: bazi PDF'lerde (Yapı Kredi Portföy'un "Model
+    Portföy" isimli urunlerinde gercek veriyle yakalandi) rapor METNININ
+    HICBIR YERINDE fon kodu gecmiyor - ne "(KOD)" parantezi ne baska bir
+    "Fon Kodu" alani. Boyle durumlarda otomatik tespit fon_kodu'nu ya bos
+    ya da baslik metninden yanlislikla turetilmis bir kelime olarak
+    doldurur (guvenlik icin reddedilir, DB'ye YAZILMAZ) - kullanici KAP
+    bildirim sayfasindan/TEFAS'tan gercek kodu kendisi verip BURADAN
+    ZORLAYABILIR. Verilirse otomatik tespit edilen fon_kodu'nun (dogru
+    olsa bile) YERINE GECER - donem (yil/ay) etkilenmez, o hala PDF
+    metninden okunur.
     Donus: (basarili_mi: bool, detay_mesaji: str, meta: dict).
     meta her zaman (basarisiz olsa bile, PDF parse edilebildiyse) fon_kodu/
     yil/ay/sirket_sayisi/agirlik/katilma_payi alanlarini icerir - caller'in
@@ -176,7 +186,8 @@ def import_one(conn, path_or_url):
     holdings = aggregate_by_isin(result, 'HISSE_SENEDI')
     calculated, printed_total, recon_ok, recon_unit = check_reconciliation(result, holdings)
 
-    fon_kodu, yil, ay = result.fon_kodu, result.donem_yil, result.donem_ay
+    fon_kodu = override_fon_kodu.strip().upper() if override_fon_kodu else result.fon_kodu
+    yil, ay = result.donem_yil, result.donem_ay
     meta = {
         'fon_kodu': fon_kodu, 'fon_adi': result.fon_adi, 'yil': yil, 'ay': ay,
         'sirket_sayisi': len(holdings), 'dialect': result.dialect,
