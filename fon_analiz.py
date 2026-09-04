@@ -179,15 +179,43 @@ def _get_stock_list():
 @st.cache_data(ttl=1800, show_spinner=False)
 def _get_fund_list():
     """Fon bazlı drill-down için: sadece gerçekten hisse verisi olan fonlar
-    (funds tablosunda fon_holdings'i olmayan bir kayıt varsa listelenmez)."""
+    (funds tablosunda fon_holdings'i olmayan bir kayıt varsa listelenmez).
+    kurucu_kurum'u ("Fon Ana Kurumu" filtresi icin) normalize eder:
+    - Bos/NULL olanlar 'Diğer / Bilinmiyor' kovasina duser (KAP PDF'ten
+      dogrudan import edilen bazi fonlarda henuz doldurulmamis - kaynak
+      veride buyuk/kucuk harf ayrimi disinda tutarli, orn. "Teb" ile "TEB"
+      AYNI kuruma ait ama farkli metin olarak kayitli).
+    - Buyuk/kucuk harf farkli iki yazim (orn. "Teb"/"TEB", "Inveo"/"INVEO")
+      AYNI kurum sayilip filtrede TEK secenek olarak gorunur - kanonik
+      goruntu adi o kurum_key icin EN SIK kullanilan yazimdir."""
+    conn = _get_live_connection()
+    if conn is None:
+        return pd.DataFrame()
+    df = pd.read_sql("""
+        SELECT DISTINCT f.fon_kodu, f.fon_adi, f.kurucu_kurum
+        FROM funds f
+        JOIN fund_holdings fh ON fh.fon_kodu = f.fon_kodu
+        ORDER BY f.fon_kodu
+    """, conn)
+    if df.empty:
+        return df
+    df['kurum_raw'] = df['kurucu_kurum'].fillna('').str.strip()
+    df.loc[df['kurum_raw'] == '', 'kurum_raw'] = 'Diğer / Bilinmiyor'
+    df['kurum_key'] = df['kurum_raw'].str.upper()
+    canon = df.groupby('kurum_key')['kurum_raw'].agg(lambda s: s.value_counts().idxmax())
+    df['kurum_display'] = df['kurum_key'].map(canon)
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_fund_periods():
+    """Hangi fonun hangi (yıl, ay) için verisi var - fon secicisini "Beklenen
+    Dönem'e göre önce filtrele" akışı için (bkz. _render_fund_drilldown)."""
     conn = _get_live_connection()
     if conn is None:
         return pd.DataFrame()
     return pd.read_sql("""
-        SELECT DISTINCT f.fon_kodu, f.fon_adi
-        FROM funds f
-        JOIN fund_holdings fh ON fh.fon_kodu = f.fon_kodu
-        ORDER BY f.fon_kodu
+        SELECT DISTINCT fon_kodu, yil, ay FROM fund_holdings
     """, conn)
 
 
@@ -514,18 +542,159 @@ def _render_stock_drilldown(uyruk_filter=None):
 
 def _render_fund_drilldown():
     """Hisse bazlı drill-down'un (_render_stock_drilldown) fon eksenindeki
-    simetriği: bir FON seçip, secilen ayda o fonun TÜM pozisyonlarını ve
-    bir önceki aya göre (fiyat/miktar ayrıştırılmış) değişimini gösterir."""
+    simetriği. Akış (kullanıcı talebiyle) FON SEÇİMİNDEN ÖNCE iki daraltma
+    adımı içerir:
+      1) Dönem (yıl/ay) - sadece o dönemde içe aktarılmış fonlar altta görünür.
+      2) Fon Ana Kurumu (kurucu_kurum, bkz. _get_fund_list) - "Tümü" ya da
+         tek bir kurum (örn. "Yapı Kredi") seçilebilir; fon listesi buna göre
+         daralır.
+    Fon seçicisinin İLK seçeneği her zaman "📊 Toplam (...)" - o an geçerli
+    kurum daraltmasındaki TÜM fonların toplu (aggregate) görünümü; belirli
+    bir fon seçilince tek-fon detayına geçilir (bkz. _render_single_fund_detail)."""
     funds = _get_fund_list()
-    if funds.empty:
+    fund_periods = _get_fund_periods()
+    if funds.empty or fund_periods.empty:
         st.info("Fon verisi bulunamadı.")
         return
 
-    funds = funds.copy()
-    funds['label'] = funds['fon_kodu'] + ' - ' + funds['fon_adi'].fillna('').str.slice(0, 55)
-    sel_label = st.selectbox("Fon seç", options=funds['label'].tolist(), key="fund_drilldown_fon")
-    fon_kodu = funds.loc[funds['label'] == sel_label, 'fon_kodu'].iloc[0]
+    all_periods = sorted(fund_periods[['yil', 'ay']].drop_duplicates().itertuples(index=False, name=None))
+    yil, ay = _period_selector(all_periods, key="fund_drilldown_period")
 
+    funds_with_period = set(fund_periods.loc[
+        (fund_periods['yil'] == yil) & (fund_periods['ay'] == ay), 'fon_kodu'])
+    funds_period = funds[funds['fon_kodu'].isin(funds_with_period)].copy()
+    if funds_period.empty:
+        st.info(f"{TR_MONTHS_SHORT.get(ay, ay)} {yil} için içe aktarılmış fon yok.")
+        return
+
+    kurum_options = ["Tümü"] + sorted(funds_period['kurum_display'].unique())
+    sel_kurum = st.selectbox("Fon Ana Kurumu", options=kurum_options, key="fund_drilldown_kurum")
+    funds_scope = (funds_period if sel_kurum == "Tümü"
+                   else funds_period[funds_period['kurum_display'] == sel_kurum]).copy()
+
+    funds_scope['label'] = funds_scope['fon_kodu'] + ' - ' + funds_scope['fon_adi'].fillna('').str.slice(0, 50)
+    toplam_label = (f"📊 Toplam — Tüm Fonlar ({len(funds_scope)} fon)" if sel_kurum == "Tümü"
+                    else f"📊 Toplam — {sel_kurum} ({len(funds_scope)} fon)")
+    fund_options = [toplam_label] + sorted(funds_scope['label'].tolist())
+    sel_label = st.selectbox("Fon", options=fund_options, key="fund_drilldown_fon")
+
+    if sel_label == toplam_label:
+        _render_fund_group_aggregate(funds_scope, yil, ay, sel_kurum)
+    else:
+        fon_kodu = funds_scope.loc[funds_scope['label'] == sel_label, 'fon_kodu'].iloc[0]
+        _render_single_fund_detail(fon_kodu, sel_label, yil, ay)
+
+
+def _render_fund_group_aggregate(funds_scope, yil, ay, sel_kurum):
+    """Bir kurumun (ya da 'Tümü' secildiyse tum fonlarin) SECILEN DONEMDEKI
+    pozisyonlarini hisse bazinda TOPLAYIP gosterir - tek fonun detay
+    tablosunun (_render_single_fund_detail) aksine, agirlik_pct FARKLI
+    buyuklukteki fonlar arasinda anlamli sekilde TOPLANAMADIGI icin burada
+    gosterilmez; bunun yerine TL bazli toplamlar (ve kac fonda tutuldugu)
+    kullanilir - _render_top_buys_sells'in (market genelindeki) ayni
+    mantiginin bir fon alt-kumesine daraltilmis hali."""
+    fon_kodlari = funds_scope['fon_kodu'].tolist()
+    dfs = []
+    for fk in fon_kodlari:
+        d = _get_positions_for_fund(fk)
+        if not d.empty:
+            d = d.copy()
+            d['fon_kodu'] = fk
+            dfs.append(d)
+    if not dfs:
+        st.info("Seçili fonlar için pozisyon verisi yok.")
+        return
+    df = pd.concat(dfs, ignore_index=True)
+    for col in ['toplam_tutar_tl', 'agirlik_pct', 'miktar_etkisi_tl', 'fiyat_etkisi_tl',
+                'degisim_tl', 'degisim_agirlik_pct', 'degisim_nominal']:
+        df[col] = df[col].astype(float)
+
+    period_df = df[(df['yil'] == yil) & (df['ay'] == ay)].copy()
+    if period_df.empty:
+        st.info(f"{TR_MONTHS_SHORT.get(ay, ay)} {yil} için pozisyon verisi yok.")
+        return
+    period_df['degisim_gosterilecek'] = period_df['miktar_etkisi_tl'].fillna(period_df['degisim_tl'])
+
+    agg = period_df.groupby(['ticker', 'uyruk'], as_index=False).agg(
+        toplam_tutar_tl=('toplam_tutar_tl', 'sum'),
+        fon_sayisi=('fon_kodu', 'nunique'),
+        degisim_gosterilecek=('degisim_gosterilecek', lambda s: s.sum(min_count=1)),
+        miktar_etkisi_tl=('miktar_etkisi_tl', lambda s: s.sum(min_count=1)),
+        fiyat_etkisi_tl=('fiyat_etkisi_tl', lambda s: s.sum(min_count=1)),
+        degisim_nominal=('degisim_nominal', lambda s: s.sum(min_count=1)),
+    )
+    agg = agg.sort_values('toplam_tutar_tl', ascending=False)
+    agg['Hisse'] = agg['ticker'] + agg['uyruk'].apply(lambda u: '' if u == 'TC' else f" ({u})")
+
+    aum_rows = [a for a in (_get_fund_aum(fk, yil, ay) for fk in fon_kodlari) if a is not None]
+    toplam_giris = sum(a['katilma_payi_giris_tl'] for a in aum_rows if pd.notna(a['katilma_payi_giris_tl']))
+    toplam_cikis = sum(a['katilma_payi_cikis_tl'] for a in aum_rows if pd.notna(a['katilma_payi_cikis_tl']))
+
+    baslik = (f"📊 Tüm Fonlar — Toplam {len(fon_kodlari)} Fon" if sel_kurum == "Tümü"
+              else f"📊 {sel_kurum} — Toplam {len(fon_kodlari)} Fon")
+    st.markdown(f"#### {baslik} — {TR_MONTHS_SHORT.get(ay, ay)} {yil} pozisyonları")
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Fon Sayısı", len(fon_kodlari))
+    with m2:
+        st.metric("Toplam Hisse Portföyü (TL)", _fmt_tl(period_df['toplam_tutar_tl'].sum()))
+    with m3:
+        st.metric("Katılma Payı Girişi (Toplam)", _fmt_tl(toplam_giris) if aum_rows else "—")
+    with m4:
+        st.metric("Katılma Payı Çıkışı (Toplam)", _fmt_tl(toplam_cikis) if aum_rows else "—")
+    st.caption("ℹ️ Ağırlık (%) burada gösterilmiyor — farklı büyüklükteki fonlar arasında "
+               "doğrudan toplanamaz. TL tutarlar ve fon sayısı doğrudan karşılaştırılabilir.")
+
+    if period_df['miktar_etkisi_tl'].isna().all():
+        st.caption("ℹ️ Bu ay için adet verisi yok — 'Toplam Değişim' sütunu ham TL değişimidir "
+                   "(fiyat hareketini de içerir).")
+
+    show = agg.copy()
+    show['Toplam TL Tutar'] = show['toplam_tutar_tl'].apply(_fmt_tl)
+    show['Kaç Fonda'] = show['fon_sayisi']
+    show['Toplam Değişim (TL)'] = show['degisim_gosterilecek'].apply(_fmt_tl_signed)
+    show['Miktar Etkisi (TL)'] = show['miktar_etkisi_tl'].apply(_fmt_tl_signed)
+    show['Fiyat Etkisi (TL)'] = show['fiyat_etkisi_tl'].apply(_fmt_tl_signed)
+    show['Adet Değişimi (Toplam)'] = show['degisim_nominal'].apply(_fmt_adet_signed)
+    st.dataframe(show[['Hisse', 'Toplam TL Tutar', 'Kaç Fonda', 'Toplam Değişim (TL)',
+                        'Miktar Etkisi (TL)', 'Fiyat Etkisi (TL)', 'Adet Değişimi (Toplam)']],
+                 use_container_width=True, hide_index=True,
+                 height=min(500, 38 * len(show) + 38))
+
+    st.markdown("##### 📊 Değişim Grafiği")
+    metric_options = {
+        "Miktar Etkisi — Gerçek Alım/Satım (TL)": ('miktar_etkisi_tl', _fmt_tl_signed),
+        "Fiyat Etkisi (TL)": ('fiyat_etkisi_tl', _fmt_tl_signed),
+        "Adet Değişimi (Nominal, Toplam)": ('degisim_nominal', _fmt_adet_signed),
+        "Toplam Değişim (TL)": ('degisim_gosterilecek', _fmt_tl_signed),
+    }
+    metric_label = st.selectbox("Grafikte gösterilecek metrik", options=list(metric_options.keys()),
+                                 key="fund_group_metric")
+    value_col, fmt_func = metric_options[metric_label]
+    fig_metric = _signed_bar_chart(
+        agg, value_col, 'Hisse',
+        f"{baslik} — {metric_label} ({TR_MONTHS_SHORT.get(ay, ay)} {yil})", fmt_func)
+    if fig_metric is None:
+        st.info("Bu dönem için bu metrik hesaplanamadı.")
+    else:
+        st.plotly_chart(fig_metric, use_container_width=True, config=PLOTLY_CONFIG)
+
+    trend = df.groupby(['yil', 'ay'], as_index=False)['toplam_tutar_tl'].sum()
+    trend = trend.sort_values(['yil', 'ay'])
+    trend['label'] = trend.apply(lambda r: f"{TR_MONTHS_SHORT.get(int(r['ay']), r['ay'])} {int(r['yil'])}", axis=1)
+    fig = go.Figure(go.Scatter(x=trend['label'], y=trend['toplam_tutar_tl'], mode='lines+markers',
+                                line=dict(color='#3b82f6', width=2)))
+    fig.update_layout(title=f"{baslik} — Toplam Hisse Portföyü (Zaman İçinde)", height=300,
+                       margin=dict(l=10, r=10, t=40, b=10), yaxis_title="TL")
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+
+
+def _render_single_fund_detail(fon_kodu, sel_label, yil, ay):
+    """Tek bir fonun secilen aydaki pozisyonlarini ve bir onceki aya gore
+    (fiyat/miktar ayristirilmis) degisimini gosterir - yil/ay artik ust
+    seviyede (_render_fund_drilldown) secildigi icin parametre olarak
+    alinir; bu fonksiyon kendi donem secicisini CIZMEZ."""
     df = _get_positions_for_fund(fon_kodu)
     if df.empty:
         st.info("Bu fon için pozisyon verisi bulunamadı.")
@@ -534,9 +703,10 @@ def _render_fund_drilldown():
                 'degisim_tl', 'degisim_agirlik_pct', 'degisim_nominal']:
         df[col] = df[col].astype(float)
 
-    periods = sorted(df[['yil', 'ay']].drop_duplicates().itertuples(index=False, name=None))
-    yil, ay = _period_selector(periods, key="fund_drilldown_period")
     period_df = df[(df['yil'] == yil) & (df['ay'] == ay)].copy()
+    if period_df.empty:
+        st.info(f"{sel_label} için {TR_MONTHS_SHORT.get(ay, ay)} {yil} döneminde veri yok.")
+        return
     # nominal_deger olmayan (tarihsel Excel) aylarda miktar_etkisi_tl NULL olur;
     # bu durumda ham degisime (fiyat+miktar karisik) fallback yapiyoruz - bkz.
     # _render_stock_drilldown'daki ayni mantik/not.
@@ -713,6 +883,7 @@ def _render_kap_import_section():
             _get_flow_ranking.clear()
             _get_stock_list.clear()
             _get_fund_list.clear()
+            _get_fund_periods.clear()
             _get_positions_for_fund.clear()
             _get_fund_aum.clear()
             _get_holders_for_stock.clear()
