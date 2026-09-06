@@ -372,8 +372,21 @@ def parse_pdf_text(all_text: str) -> ParseResult:
     if FORMAT_B_TITLE_RE.search(first_line):
         result = _parse_pdf_text_format_b(all_text)
     else:
-        # Format C: ilk ~8 dolu satirdan biri "(KOD) Fon Adi" YA DA
-        # "{Ay} {Yil} AYLIK RAPORUDUR" seklinde mi. Ikinci kosul GEREKLI -
+        # Format C: ilk ~8 dolu satirdan biri "{Ay} {Yil} AYLIK RAPORUDUR"
+        # (cok kendine ozgu bir ifade, genis pencerede aransa da guvenli)
+        # YA DA ilk SADECE 3 satirdan biri "(KOD) Fon Adi" seklinde mi.
+        # "(KOD)" kontrolu KASITLI OLARAK DAR (ilk 3 satir) tutuluyor -
+        # BV Portföy'un BHI fonunda gercek veriyle yakalandi: fon ADININ
+        # ICINDE "SERBEST (TL) FON" gibi bir ibare pdfplumber'da KENDI
+        # SATIRINA sarilinca "(TL) FON ..." satiri (TL 2 harfli buyuk kod
+        # gibi gorunerek) 8 satirlik pencerede FORMAT_C_TITLE_RE ile YANLIS
+        # eslesip Format A'nin gercek bir fonunu (donemi "Ağustos-2026"
+        # gibi standart Format A kaliplı) yanlislikla Format C'ye
+        # yonlendirip fon_kodu='TL' gibi SAHTE bir kod uretiyordu. Gercek
+        # Format C basliklarinda "(KOD)" HER ZAMAN ilk birkac satirda (kurucu
+        # sirket adi + kod satiri) cikiyor, govde metninin ICINDE degil - bu
+        # yuzden ilk 3 satirla sinirlamak YAY/YDI gibi gercek Format C
+        # fonlarini etkilemeden bu yanlis-pozitifi engelliyor.
         # bazi fonlarda (Yapı Kredi Portföy'un "Model Portföy" urunlerinde
         # gercek veriyle yakalandi) baslikta HIC "(KOD)" YOK ama govde
         # (bolum basliklari, ISIN'li Ingilizce-sayi-formatli satirlar) yine
@@ -383,7 +396,9 @@ def parse_pdf_text(all_text: str) -> ParseResult:
         # caller (bkz. import_one'in override_fon_kodu'su) kullanicidan
         # almasi gerekir.
         early_lines = [l.strip() for l in all_text.split('\n')[:8] if l.strip()]
-        if any(FORMAT_C_TITLE_RE.match(l) or FORMAT_C_PERIOD_RE.match(l) for l in early_lines):
+        title_lines = early_lines[:3]
+        if (any(FORMAT_C_TITLE_RE.match(l) for l in title_lines)
+                or any(FORMAT_C_PERIOD_RE.match(l) for l in early_lines)):
             result = _parse_pdf_text_format_c(all_text)
         else:
             result = _parse_pdf_text_format_a(all_text)
@@ -648,10 +663,15 @@ def _parse_header_c(all_text):
     all_lines = [l.strip() for l in all_text.split('\n') if l.strip()]
     early_lines = all_lines[:8]
     fon_kodu, fon_adi, yil, ay = '', '', 0, 0
-    for line in early_lines:
+    # "(KOD)" araması ilk 3 satırla SINIRLI - bkz. dispatcher'daki (parse_pdf_text)
+    # ayni sinirin BHI fonundaki "(TL) FON ..." yanlis-pozitifini nasil
+    # engelledigine dair not; govde metninde ("A-)Fonun Adı :" devam
+    # satirlari gibi) benzer bir parantez fragmani varsa buraya da sizmasin.
+    for line in early_lines[:3]:
         m = FORMAT_C_TITLE_RE.match(line)
         if m and not fon_kodu:
             fon_kodu, fon_adi = m.group(1), m.group(2)
+    for line in early_lines:
         m2 = FORMAT_C_PERIOD_RE.match(line)
         if m2 and not yil:
             ay = TURKISH_MONTHS.get(_tr_lower(m2.group(1)), 0)
