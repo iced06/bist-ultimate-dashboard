@@ -104,6 +104,26 @@ FORMAT_B_SECTION_MAP = {
     'YABANCI HİSSE SENETLERİ': 'HISSE_SENEDI',
 }
 
+# Format B'nin ORIJINAL ornegi (Ata Portföy) Ingilizce sayi formati
+# kullaniyordu - ama ayni YAPIYI (baslik "{KOD} FON {AY} {YIL} PORTFÖY
+# DAĞILIM RAPORU", ISIN'siz satirlar, harfli "A) HİSSE SENETLERİ" bolum
+# basligi, "TOPLAM: <nominal> <rayic>" toplam satiri) kullanan Osmanlı
+# Portföy'un OPH fonu SAYILARI TURKCE FORMATTA yaziyor (gercek veriyle
+# yakalandi) - Format A'da INgilizce/Turkce icin zaten yapilan ayni
+# tespit+degistirme (bkz. _detect_number_format) burada da gerekiyor.
+FORMAT_B_ROW_RE_TR = re.compile(
+    r'^([A-ZÇĞİÖŞÜ0-9]{2,8})\s+.+?\s+([\d.]+,\d+)\s+([\d.]+,\d+)\s+([\d,]+)%\s*$'
+)
+FORMAT_B_TOPLAM_RE_TR = re.compile(r'^TOPLAM:\s*([\d.]+,\d+)\s+([\d.]+,\d+)\s*$')
+FORMAT_B_GIRIS_RE_TR = re.compile(
+    r'KATILMA PAYI İHRA[ÇC]LARINDAN KAYNAKLANAN NAK[İI]T G[İI]R[İI][ŞS]LER[İI]\s*:\s*([\d.]+,\d+)',
+    re.IGNORECASE,
+)
+FORMAT_B_CIKIS_RE_TR = re.compile(
+    r'KATILMA PAYI İADELER[İI]NDEN KAYNAKLANAN NAK[İI]T [ÇC]IK[İI][ŞS]LAR[İI]\s*:\s*([\d.]+,\d+)',
+    re.IGNORECASE,
+)
+
 # ── Format C (Yapı Kredi Portföy'de gozlemlendi - AK3/NNF/KPC gibi ilk
 # fonlardan TAMAMEN farkli bir KAP sablonu, YAY fonuyla gercek veride
 # yakalandi) ──
@@ -204,7 +224,10 @@ class ParseResult:
     katilma_payi_giris_tl: float = None
     katilma_payi_cikis_tl: float = None
     katilma_payi_extract_method: str = ''  # 'same-line' | 'block-fallback' | 'UNRESOLVED'
-    dialect: str = 'A'  # 'A' | 'B' | 'C' - hangi rapor sablonu tespit edildi
+    dialect: str = 'A'  # 'A' | 'A-en' | 'B' | 'B-tr' | 'C' - hangi rapor sablonu/sayi
+                          # formati tespit edildi ('-en'/'-tr' eki, o dialect'in
+                          # PILOT fonlarda gozlemlenen VARSAYILAN sayi formatindan
+                          # FARKLI oldugu anlamina gelir, bkz. _detect_number_format)
     reconciliation_metric: str = 'agirlik_pct'  # 'agirlik_pct' | 'toplam_tl' - printed_group_totals
                                                   # neyle kiyaslanmali (dialect'e gore degisir)
 
@@ -520,12 +543,24 @@ def _parse_pdf_text_format_a(all_text: str) -> ParseResult:
 
 def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
     """Ata Portföy'de gozlemlenen ikinci sablon - bkz. dosya basindaki not.
-    Hisse senedi satirlarinda ISIN YOK (sadece BIST ticker), Ingilizce sayi
-    formati, harfli bolum basliklari ("A) HİSSE SENETLERİ"), toplam satiri
-    yuzde degil TL bazli ("TOPLAM: <nominal> <rayic>") - bu yuzden
-    reconciliation_metric='toplam_tl' olarak isaretleniyor (Format A'nin
-    yuzde bazli reconciliation'inin aksine)."""
+    Hisse senedi satirlarinda ISIN YOK (sadece BIST ticker), harfli bolum
+    basliklari ("A) HİSSE SENETLERİ"), toplam satiri yuzde degil TL bazli
+    ("TOPLAM: <nominal> <rayic>") - bu yuzden reconciliation_metric=
+    'toplam_tl' olarak isaretleniyor (Format A'nin yuzde bazli
+    reconciliation'inin aksine). Sayi formati FONA GORE DEGISIYOR - Ata
+    Portföy Ingilizce (1,234,567.89), Osmanlı Portföy'un OPH fonu Turkce
+    (1.234.567,89) kullaniyor (gercek veriyle yakalandi) - bu yuzden
+    Format A'daki gibi (bkz. _detect_number_format) belge iceriginden
+    tespit edilip dogru regex/donusturucu seti secilir."""
     result = ParseResult(dialect='B', reconciliation_metric='toplam_tl')
+    num_re, to_float = _detect_number_format(all_text)
+    is_tr = num_re is NUM_RE
+    row_re = FORMAT_B_ROW_RE_TR if is_tr else FORMAT_B_ROW_RE
+    toplam_re = FORMAT_B_TOPLAM_RE_TR if is_tr else FORMAT_B_TOPLAM_RE
+    giris_re = FORMAT_B_GIRIS_RE_TR if is_tr else FORMAT_B_GIRIS_RE
+    cikis_re = FORMAT_B_CIKIS_RE_TR if is_tr else FORMAT_B_CIKIS_RE
+    if is_tr:
+        result.dialect = 'B-tr'
 
     lines = [l.strip() for l in all_text.split('\n')]
     first_line = next((l for l in lines if l), '')
@@ -540,12 +575,12 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
             result.fon_adi = m.group(1).strip()
             break
 
-    m = FORMAT_B_GIRIS_RE.search(all_text)
+    m = giris_re.search(all_text)
     if m:
-        result.katilma_payi_giris_tl = _to_float_en(m.group(1))
-    m = FORMAT_B_CIKIS_RE.search(all_text)
+        result.katilma_payi_giris_tl = to_float(m.group(1))
+    m = cikis_re.search(all_text)
     if m:
-        result.katilma_payi_cikis_tl = _to_float_en(m.group(1))
+        result.katilma_payi_cikis_tl = to_float(m.group(1))
     if result.katilma_payi_giris_tl is not None and result.katilma_payi_cikis_tl is not None:
         result.katilma_payi_extract_method = 'same-line'
     else:
@@ -561,18 +596,18 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
             current_section = FORMAT_B_SECTION_MAP.get(sm.group(2).strip().upper(), 'DIGER')
             continue
 
-        tm = FORMAT_B_TOPLAM_RE.match(line)
+        tm = toplam_re.match(line)
         if tm:
             if current_section not in result.printed_group_totals:
                 # 2. sayi = rayic deger toplami - toplam_tutar_tl ile ayni
                 # birim, dogrudan kiyaslanabilir (bkz. asagida __main__).
-                result.printed_group_totals[current_section] = _to_float_en(tm.group(2))
+                result.printed_group_totals[current_section] = to_float(tm.group(2))
             continue
 
         if current_section != 'HISSE_SENEDI':
             continue
 
-        rm = FORMAT_B_ROW_RE.match(line)
+        rm = row_re.match(line)
         if not rm:
             # HISSE_SENEDI bolumunde ama satir kalibi tutmuyor - genelde
             # bir sirket adinin devam satiri (orn. "A.Ş" tek basina) -
@@ -581,16 +616,20 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
             continue
 
         ticker, nominal_s, rayic_s, pct_s = rm.groups()
+        # Yuzde grubu TR'de virgul-ondalik ("3,31"), EN'de nokta-ondalik
+        # ("3.31") - digerlerinin aksine THOUSANDS grubu icermez (yuzdeler
+        # hep <100), bu yuzden to_float yerine dogrudan cevrilebilir.
+        pct_val = float(pct_s.replace(',', '.')) if is_tr else float(pct_s)
         result.lots.append(Lot(
             section=current_section,
             ticker=ticker,
             isin=None,
-            nominal_deger=_to_float_en(nominal_s),
+            nominal_deger=to_float(nominal_s),
             tarih='',
-            toplam_tutar_tl=_to_float_en(rayic_s),
-            agirlik_grup_pct=float(pct_s),
-            agirlik_fpd_pct=float(pct_s),
-            agirlik_ftd_pct=float(pct_s),
+            toplam_tutar_tl=to_float(rayic_s),
+            agirlik_grup_pct=pct_val,
+            agirlik_fpd_pct=pct_val,
+            agirlik_ftd_pct=pct_val,
             raw_line=line,
         ))
 
