@@ -104,6 +104,22 @@ FORMAT_B_SECTION_MAP = {
     'YABANCI HİSSE SENETLERİ': 'HISSE_SENEDI',
 }
 
+
+def _classify_section_b(name):
+    """FORMAT_B_SECTION_MAP TAM eslesme arar ama bolum basligi pdfplumber'da
+    devam satirina BOLUNEBILIYOR (AAV fonunda gercek veriyle yakalandi:
+    "A) HİSSE SENETLERİ" yerine sadece "A) HİSSE" gelip "SENETLERİ" ayri
+    bir satira dusuyor) - TAM eslesme bu durumda 'DIGER'e dusup
+    HISSE_SENEDI satirlarinin TAMAMEN atlanmasina yol aciyordu. Format
+    C'deki _classify_section_c ile AYNI mantik: TAM esleme yerine BASLAMA
+    kontrolu (bkz. o fonksiyonun notu)."""
+    n = name.strip().upper()
+    if n in FORMAT_B_SECTION_MAP:
+        return FORMAT_B_SECTION_MAP[n]
+    if n.startswith('HİSSE') or n.startswith('YABANCI HİSSE') or n.startswith('HISSE'):
+        return 'HISSE_SENEDI'
+    return 'DIGER'
+
 # Format B'nin ORIJINAL ornegi (Ata Portföy) Ingilizce sayi formati
 # kullaniyordu - ama ayni YAPIYI (baslik "{KOD} FON {AY} {YIL} PORTFÖY
 # DAĞILIM RAPORU", ISIN'siz satirlar, harfli "A) HİSSE SENETLERİ" bolum
@@ -608,7 +624,7 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
 
         sm = FORMAT_B_SECTION_RE.match(line)
         if sm:
-            current_section = FORMAT_B_SECTION_MAP.get(sm.group(2).strip().upper(), 'DIGER')
+            current_section = _classify_section_b(sm.group(2))
             continue
 
         tm = toplam_re.match(line)
