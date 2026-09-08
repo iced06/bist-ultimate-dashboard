@@ -299,6 +299,16 @@ if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 if 'chosen_stocks' not in st.session_state:
     st.session_state.chosen_stocks = {}
+if 'screener_scan' not in st.session_state:
+    # {timeframe: [Faz-1 satirlari - TUM taranan hisseler, her indikatorun
+    # kendi skoruyla birlikte]} - "hangi indikatore gore sirala" combobox'i
+    # degistirildiginde yeniden 611 hisse taramamak icin (bkz.
+    # _rank_and_enrich docstring'i).
+    st.session_state.screener_scan = {}
+if 'screener_val_cache' not in st.session_state:
+    # {timeframe: {symbol: {P/E, PD/DD, ... }}} - Faz-2 degerleme cache'i,
+    # indikator combobox'i degisince tekrar cekilmesin diye.
+    st.session_state.screener_val_cache = {}
 if 'filter_chosen_only' not in st.session_state:
     st.session_state.filter_chosen_only = False
 if 'current_timeframe' not in st.session_state:
@@ -725,6 +735,78 @@ def fetch_stock_data(symbol, start_date="2023-01-01", end_date=None, interval="1
             return None
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _decay_value_score(series, threshold, ceiling):
+    """SINIRLI osilatorler (RSI/Stochastic/CCI/CMF) icin: deger BUY esigini
+    (threshold) YUKARI kestigi anda 1 puanla baslar, 'asiri alim' tavanina
+    (ceiling) dogru yukseldikce DOGRUSAL olarak 0'a iner - boylece "az once
+    kesti" ile "hala pozitif ama tukenme bolgesine yaklasiyor" arasinda
+    kademeli bir gecis olur (eskiden ikisi de ayni 0/1 puani aliyordu).
+    Esigin ALTINDA ya da tavanin USTUNDE (tam tukenmis) 0 puan."""
+    score = (ceiling - series) / (ceiling - threshold)
+    score = score.clip(lower=0, upper=1)
+    score = score.where(series >= threshold, 0)
+    score = score.where(series <= ceiling, 0)
+    return score.fillna(0)
+
+
+def _bars_since_true(flag_series):
+    """flag_series (0/1): en son 1 olunan bardan bu yana KAC BAR gectigini
+    dondurur (0 = tam o gun taze kesisim). Pencerede hic 1 yoksa buyuk bir
+    sayi (asla 'taze' sayilmasin diye) doner."""
+    idx = np.arange(len(flag_series))
+    last_true_idx = pd.Series(np.where(flag_series.values == 1, idx, np.nan),
+                               index=flag_series.index).ffill()
+    bars_since = idx - last_true_idx.values
+    return np.where(np.isnan(last_true_idx.values), 10**6, bars_since)
+
+
+def _decay_time_score(state_series, cross_flag_series, decay_days=10):
+    """SABIT bir 'tavani' olmayan trend/kesisim tipi indikatorler (MACD,
+    EMA10xEMA30, Fiyat×SMA5/SMA22/KAMA, AO) icin: DEGERE gore degil ZAMANA
+    gore azalma - kesisen gun 1 puan, hala 'bullish' durumdaysa (state=1)
+    decay_days boyunca dogrusal olarak 0'a iner, durum bozulursa (state=0)
+    ya da tekrar kesisirse (bars_since=0) sifirlanir/yenilenir. Deger
+    bazli azalma burada YANLIS olurdu - orn. MACD farkinin buyumesi
+    'asiri alim' degil GUCLU TREND demektir, cezalandirilmamali."""
+    bars_since = _bars_since_true(cross_flag_series)
+    raw = np.clip(1 - bars_since / decay_days, 0, 1)
+    return np.where(state_series == 1, raw, 0.0)
+
+
+def _decay_slope_score(diff_series, state_series, cross_flag_series,
+                        decay_days=10, slope_bars=3, vol_window=20):
+    """HIBRIT skor = zaman-bazli decay x EGIM carpani (kullanici talebi:
+    "MACD gibi indikatorler icin zamanla azaltma yerine egime bakarak
+    puanlasak - eğim artarken güçlü, eğim azalırken az, eğim eksiye
+    düşünce iyice az puanlasak").
+
+    diff_series: kesisimin 'mesafe' egrisi (MACD-Signal, EMA10-EMA30,
+    Close-SMA5/SMA22/KAMA, ya da AO'nun kendisi - zaten bir fark osilatoru).
+
+    Egim = diff_series'in son slope_bars barlik degisimi, o egrinin kendi
+    son vol_window barlik volatilitesine gore normalize edilir (z-score)
+    ve sigmoid'den gecirilir - olcek hisseden hisseye/indikatorden
+    indikatore FARKLI oldugu icin (TL cinsi fark vs. EMA farki vs. AO)
+    ham egim degil GORECELI egim kullanilir:
+      z >> 0 (momentum HIZLANIYOR)      -> carpan ~1  (zaman-decay aynen uygulanir)
+      z  = 0 (momentum DUZ)             -> carpan ~0.5 (yariya iner)
+      z << 0 (momentum TERSINE DONUYOR) -> carpan ~0  (asil kesisim/state
+                                            bozulmasi HENUZ gerceklesmese
+                                            bile erken uyari, skoru siler)
+
+    Zaman-decay carpani (mevcut _decay_time_score) GUVENLIK AGI olarak
+    kalir: decay_days'i asmis ESKI bir kesisim, egim gurultuyle gecici
+    pozitife ziplasa bile sonsuza dek yuksek puan alamaz - carpim zaten 0
+    olur (kullanicinin onayladigi "hibrit" tasarim, saf egime gecmek
+    yerine)."""
+    time_decay = _decay_time_score(state_series, cross_flag_series, decay_days)
+    slope = diff_series.diff(slope_bars)
+    vol = diff_series.rolling(vol_window).std().replace(0, np.nan)
+    z = (slope / vol).fillna(0).clip(-4, 4)
+    slope_multiplier = 1 / (1 + np.exp(-z))
+    return (time_decay * slope_multiplier).fillna(0)
+
+
 def calculate_all_indicators(df):
     if df is None or df.empty:
         return None
@@ -743,8 +825,8 @@ def calculate_all_indicators(df):
         df["Diff"] = df["MACD"] - df["MACDS"]
         df["Buy_MACD"] = np.where((df["MACD"] > df["MACDS"]), 1, 0)
         df["Buy_MACDS"] = np.where((df["Buy_MACD"] > df["Buy_MACD"].shift(1)), 1, 0)
-        df["Buy_MACDS2"] = np.where((df["Diff"] > 0) & (df["Buy_MACDS"] == 1), 2, df["Buy_MACDS"])
         df['VSMA15'] = ta.trend.sma_indicator(df['Volume'], window=15)
+        df['VSMA50'] = ta.trend.sma_indicator(df['Volume'], window=50)
         df['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
         df["RSI"] = ta.momentum.rsi(df["Close"], window=14, fillna=False)
         df["Buy_RSI"] = np.where((df["RSI"] > 30), 1, 0)
@@ -761,12 +843,14 @@ def calculate_all_indicators(df):
         df["Buy_EMA10S"] = np.where((df["Buy_EMA10"] > df["Buy_EMA10"].shift(1)), 1, 0)
         df["Buy_EMA10_EMA30"] = np.where((df["EMA10"] > df["EMA30"]), 1, 0)
         df["Buy_EMA10_EMA30S"] = np.where((df["Buy_EMA10_EMA30"] > df["Buy_EMA10_EMA30"].shift(1)), 1, 0)
+        df["EMA_Diff"] = df["EMA10"] - df["EMA30"]
         df["Stochastic"] = ta.momentum.stoch_signal(df["High"], df["Low"], df["Close"], window=3, fillna=False)
         df["Stochastic_Buy"] = np.where((df["Stochastic"] > 20), 1, 0)
         df["Stochastic_BuyS"] = np.where((df["Stochastic_Buy"] > df["Stochastic_Buy"].shift(1)), 1, 0)
         df["KAMA"] = ta.momentum.kama(df["Close"], window=10, pow1=2, pow2=30, fillna=False)
         df["Buy_KAMA"] = np.where((df["Close"] > df["KAMA"]), 1, 0)
         df["Buy_KAMAS"] = np.where((df["Buy_KAMA"] > df["Buy_KAMA"].shift(1)), 1, 0)
+        df["KAMA_Diff"] = df["Close"] - df["KAMA"]
         df['SMA5'] = ta.trend.sma_indicator(df['Close'], window=5)
         df['SMA22'] = ta.trend.sma_indicator(df['Close'], window=22)
         df['SMA50'] = ta.trend.sma_indicator(df['Close'], window=50)
@@ -776,9 +860,28 @@ def calculate_all_indicators(df):
         df["Buy_SMA5S"] = np.where((df["Buy_SMA5"] > df["Buy_SMA5"].shift(1)), 1, 0)
         df["Buy_SMA22S"] = np.where((df["Buy_SMA22"] > df["Buy_SMA22"].shift(1)), 1, 0)
         df["Buy_SMA50S"] = np.where((df["Buy_SMA50"] > df["Buy_SMA50"].shift(1)), 1, 0)
+        df["SMA5_Diff"] = df["Close"] - df["SMA5"]
+        df["SMA22_Diff"] = df["Close"] - df["SMA22"]
         df["CMF"] = ta.volume.chaikin_money_flow(df["High"], df["Low"], df["Close"], df["Volume"], window=20, fillna=False)
         df["Buy_CMF"] = np.where((df["CMF"] > 0), 1, 0)
         df["Buy_CMFS"] = np.where((df["Buy_CMF"] > df["Buy_CMF"].shift(1)), 1, 0)
+
+        # --- Indicator Score'un surekli (0-1) katkilari - bkz. _decay_value_score
+        # / _decay_time_score docstring'leri. Ham 0/1 "Buy_XS" bayraklari
+        # HALA saklaniyor (UI'da "taze kesisim mi" isaretlemek icin gerekli). ---
+        df["Score_RSI"] = _decay_value_score(df["RSI"], 30, 70)
+        df["Score_Stochastic"] = _decay_value_score(df["Stochastic"], 20, 80)
+        df["Score_CCI"] = _decay_value_score(df["CCI"], 0, 100)
+        df["Score_CMF"] = _decay_value_score(df["CMF"], 0, 0.20)
+        # Zaman-decay yerine HIBRIT (zaman-decay x egim carpani) - bkz.
+        # _decay_slope_score docstring'i (kullanici talebi: "MACD gibi
+        # indikatorler icin zamanla azaltma yerine egime bakarak puanlasak").
+        df["Score_MACD"] = _decay_slope_score(df["Diff"], df["Buy_MACD"], df["Buy_MACDS"])
+        df["Score_EMA10_EMA30"] = _decay_slope_score(df["EMA_Diff"], df["Buy_EMA10_EMA30"], df["Buy_EMA10_EMA30S"])
+        df["Score_SMA5"] = _decay_slope_score(df["SMA5_Diff"], df["Buy_SMA5"], df["Buy_SMA5S"])
+        df["Score_SMA22"] = _decay_slope_score(df["SMA22_Diff"], df["Buy_SMA22"], df["Buy_SMA22S"])
+        df["Score_KAMA"] = _decay_slope_score(df["KAMA_Diff"], df["Buy_KAMA"], df["Buy_KAMAS"])
+        df["Score_AO"] = _decay_slope_score(df["AO"], df["Buy_AO"], df["Buy_AOS"])
         return df
     except:
         return df
@@ -786,24 +889,17 @@ def calculate_all_indicators(df):
 BIST_OPEN_HOUR = 10
 BIST_CLOSE_HOUR = 18
 
-def _projected_volume_ratio(latest):
-    """
-    Volume / VSMA15 oranini hesaplar - ama en son bar BUGUNUN HENUZ
-    KAPANMAMIS bari ise (piyasa hala acikken taraniyorsa), o barin hacmi
-    GUN SONUNA KADAR BEKLENEN toplamin sadece bir parcasidir. VSMA15
-    (15 GECMIS TAM gunun ortalamasi) ile DOGRUDAN kiyaslamak erken saatte
-    neredeyse HER hisseyi 'dusuk hacimli' gosterir (canli testte dogrulandi:
-    ayni hisse ogle saatinde 0.31 iken, gun kapandiktan sonra 0.94 cikti -
-    ayni gunun ayni verisi, sadece saat farkli).
-
-    Gecen sure oranina gore hacmi projekte ederek bu carpitmayi azaltir.
-    Kaba bir yaklasim - gun ici hacim dagilimi duz degildir (acilis/kapanista
-    yogunlasir) - ama hic duzeltmemekten ve tum gun boyunca sistematik
-    olarak "hicbir hisse bulunamiyor" sonucundan iyidir.
-    """
+def _volume_ratio(latest):
+    """Bugunku islem hacmi / 50 gunluk ortalama islem hacmi (VSMA50). Son
+    bar BUGUNUN HENUZ KAPANMAMIS bari ise (piyasa hala acikken taraniyorsa),
+    o barin hacmini GECEN SURE oranina gore projekte eder - aksi halde
+    ogleden once VSMA50 (50 TAM gunun ortalamasi) ile kiyaslamak neredeyse
+    HER hisseyi 'dusuk hacimli' gosterir (kismi gun < tam gun ortalamasi,
+    matematiksel olarak kacinilmaz). Kaba bir yaklasim (gun ici hacim
+    dagilimi duz degildir) ama hic duzeltmemekten iyidir."""
     volume = latest.get("Volume")
-    vsma15 = latest.get("VSMA15")
-    if not volume or not vsma15:
+    vsma50 = latest.get("VSMA50")
+    if not volume or not vsma50:
         return 0.0
     bar_ts = latest.name
     try:
@@ -817,88 +913,88 @@ def _projected_volume_ratio(latest):
         total_hours = BIST_CLOSE_HOUR - BIST_OPEN_HOUR
         frac = min(1.0, elapsed_hours / total_hours)
         volume = volume / frac
-    return volume / vsma15
+    return volume / vsma50
 
 
-def calculate_original_scores(df):
+def calculate_scores(df):
+    """IKI skor: Indicator Score (0-10) ve Volume Score.
+
+    Indicator Score: 10 teknik sinyalden HER BIRININ SUREKLI (0-1) katkisi
+    toplanir - "taze kesisim = tam puan, zamanla/degerle/egimle tukenme
+    bolgesine yaklastikca 0'a inme" mantigiyla (bkz. _decay_value_score/
+    _decay_time_score/_decay_slope_score docstring'leri, kullanici
+    talebiyle eklendi/genisletildi):
+      1. MACD, MACD Signal'i yukari keser (ZAMAN x EGIM hibrit - histogram
+         ivmelenirken guclu, ivme kesilince/tersine donunce hizla azalir)
+      2. RSI 30'u yukari keser (DEGERE gore azalir, 70'te 0)
+      3. CCI 0'i yukari keser (DEGERE gore azalir, 100'de 0)
+      4. AO (Awesome Oscillator) 0'i yukari keser (ZAMAN x EGIM hibrit)
+      5. Fiyat KAMA'yi yukari keser (ZAMAN x EGIM hibrit)
+      6. CMF 0'i yukari keser (DEGERE gore azalir, 0.20'de 0)
+      7. EMA10, EMA30'u yukari keser (ZAMAN x EGIM hibrit)
+      8. Fiyat SMA5'i yukari keser (ZAMAN x EGIM hibrit)
+      9. Fiyat SMA22'yi yukari keser (ZAMAN x EGIM hibrit)
+      10. Stochastic 20'yi yukari keser (DEGERE gore azalir, 80'de 0)
+
+    Volume Score: bkz. _volume_ratio (bugunku hacim / 50 gunluk ortalama,
+    gun-ici projeksiyonlu)."""
     if df is None or df.empty:
         return 0, 0
     try:
         latest = df.iloc[-1]
-        indicator_score_2 = (
-            latest["Buy_MACDS2"] + latest["Buy_AOS"] + latest["Buy_EMA10_EMA30S"] +
-            latest["Buy_SMA5S"] + latest["Buy_SMA22S"] + latest["Buy_RSIS"] +
-            latest["Stochastic_BuyS"] + latest["Buy_CCIS"] + latest["Buy_KAMAS"] + latest["Buy_CMFS"]
+        indicator_score = (
+            latest["Score_MACD"] + latest["Score_AO"] + latest["Score_EMA10_EMA30"] +
+            latest["Score_SMA5"] + latest["Score_SMA22"] + latest["Score_RSI"] +
+            latest["Score_Stochastic"] + latest["Score_CCI"] + latest["Score_KAMA"] + latest["Score_CMF"]
         )
-        volume_score_2 = _projected_volume_ratio(latest)
-        return float(indicator_score_2), float(volume_score_2)
+        volume_score = _volume_ratio(latest)
+        return float(indicator_score), float(volume_score)
     except:
         return 0, 0
 
-def calculate_simplified_scores(df):
-    """
-    Basit Trend/Momentum skoru (Indicator 1) — Indicator 2 (orijinal,
-    resmi screener skoru) ile ayni "taze sinyal" felsefesini paylasacak
-    sekilde yeniden yazildi. Onceki versiyondan farklar:
+# Screener'daki "hangi indikatore gore sirala/filtrele" combobox'inin
+# secenekleri - etiket -> calculate_all_indicators'un urettigi Score_*
+# kolonu. "Tumu" (indicator_score = 10 skorun toplami) ayrica ele alinir
+# (bkz. _rank_and_enrich). Kullanici talebi: "screener de 10 indikatorun
+# oldugu bir combobox eklesek ve buradan tek bir indikatoru sectigimizde
+# o indikatore gore screen etse".
+SCREENER_INDICATOR_OPTIONS = {
+    "Tümü (10 indikatör toplamı)": "indicator_score",
+    "MACD": "Score_MACD",
+    "RSI": "Score_RSI",
+    "CCI": "Score_CCI",
+    "AO (Awesome Oscillator)": "Score_AO",
+    "KAMA": "Score_KAMA",
+    "CMF": "Score_CMF",
+    "EMA10×EMA30": "Score_EMA10_EMA30",
+    "SMA5": "Score_SMA5",
+    "SMA22": "Score_SMA22",
+    "Stochastic": "Score_Stochastic",
+}
+# Faz-2'de _enrich_stock_row'un ekledigi, valuation_cache'te sakla(n)an alanlar.
+_VALUATION_FIELDS = ['Fon Net Alımı', 'P/E', 'PD/DD', 'EV/EBITDA', 'Fwd P/E',
+                      'Fwd PD/DD', 'Fwd EV/EBITDA', 'P/E Δ', 'EV/EBITDA Δ']
 
-    - RSI: statik "RSI < 30" esigi yerine Indicator 2'nin de kullandigi
-      Buy_RSIS bayragini (asiri satimdan 30'un ustune YENI donus) kullanir.
-      Boylece RSI de "az once oldu mu" sorusuna cevap verir - eskiden
-      RSI mean-reversion (statik durum), MACD/SMA trend-takip (yine statik
-      durum) mantigiyla calisip birbirini iptal edebiliyordu; artik ucu de
-      "yeni sinyal" felsefesinde.
-    - MACD: statik "MACD > MACDS" durumu yerine Buy_MACDS crossover
-      bayragini + fiyata oranli buyuklugu kullanir - hem "az once cross
-      oldu mu" hem "ne kadar guclu" bilgisi skora yansir.
-    - SMA: SMA5/22 ikilisine ek olarak SMA50 (orta vade) eklendi -
-      Indicator 2'nin SMA50S bayragiyla tutarli.
 
-    Not: bu hala backtest edilmemis bir sezgisel (heuristic) skor -
-    esikler/agirliklar TA folkloruna dayanir, BIST icin ampirik olarak
-    dogrulanmamistir (bkz. Faz 4 ML plani).
-    """
-    if df is None or df.empty:
-        return 0, 0
-    try:
-        latest = df.iloc[-1]
+def _screen_one_stock(s, start_date, interval):
+    """Faz 1 (ucuz): tek hisse icin fetch+indikator+skor hesabi -
+    screen_chosen_stocks'un ThreadPoolExecutor ile paralel calistirdigi is
+    birimi. Degerleme (compute_stock_valuations) ve fon-akisi verisi BURADA
+    CEKILMEZ - o pahali islem sadece en yuksek puanli top_n hisse icin
+    Faz 2'de (_enrich_stock_row) yapilir, boylece 600+ hissenin TAMAMI icin
+    gereksiz API cagrisi/rate-limit riski olusmaz.
 
-        # RSI: -1..+1 - taze "asiri satimdan donus" +1, asiri alim -1, notr 0
-        rsi_component = 1 if latest.get('Buy_RSIS', 0) == 1 else (-1 if latest['RSI'] > 70 else 0)
-
-        # MACD: yon (isaret) + fiyata oranli buyukluk, [-1, 1] araligina sikistirilmis
-        # (~%0.5'lik bir MACD-sinyal farki tam +-1'e ulasir; hisse fiyatindan
-        # bagimsiz karsilastirilabilir olsun diye Close'a oranlaniyor)
-        macd_diff_pct = (latest['MACD'] - latest['MACDS']) / latest['Close'] if latest['Close'] else 0
-        macd_component = max(-1, min(1, macd_diff_pct * 200))
-        if latest.get('Buy_MACDS', 0) == 1:
-            macd_component = max(macd_component, 0.5)  # taze cross en az orta-guclu sayilir
-
-        # SMA: 5/22/50 uc katmanli hizalama, esit agirlikli +-1/3
-        sma_component = sum(
-            (1 if latest['Close'] > latest[sma] else -1) / 3
-            for sma in ['SMA5', 'SMA22', 'SMA50']
-        )
-
-        raw = rsi_component + macd_component + sma_component  # -3..+3 araliginda (oncekiyle ayni olcek)
-        score = max(0, min(5, raw + 2.5))
-
-        vr = _projected_volume_ratio(latest)
-        vs = max(0, min(5, round(vr * 2.5, 1)))  # Volume 2'nin ham oranina paralel, surekli olcek
-        return round(score, 1), round(vs, 1)
-    except Exception:
-        return 0, 0
-
-def _screen_one_stock(s, start_date, interval, fund_flow_map):
-    """Tek hisse icin fetch+indikator+skor hesabi - screen_chosen_stocks'un
-    ThreadPoolExecutor ile paralel calistirdigi is birimi."""
+    Toplam indicator_score'un yaninda SCREENER_INDICATOR_OPTIONS'taki HER
+    BIR indikatorun kendi (0-1) skorunu da dondurur - screener'da tek bir
+    indikatore gore siralama/filtre secilebilmesi icin (bkz.
+    _rank_and_enrich). Bu ekstra veri calculate_all_indicators zaten
+    hesapliyor, ek maliyeti yok."""
     try:
         df = fetch_stock_data(s, start_date=start_date, interval=interval)
         if df is None or df.empty:
             return None
         df = calculate_all_indicators(df)
-        ind, vol = calculate_original_scores(df)
-        if not (ind >= 3 and vol > 0.7):
-            return None
+        ind, vol = calculate_scores(df)
         latest = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else latest
         price = latest['Close']
@@ -910,27 +1006,95 @@ def _screen_one_stock(s, start_date, interval, fund_flow_map):
             'price': round(price, 2),
             'chg%': round(price_chg, 2),
             'RSI': round(rsi, 1) if rsi and pd.notna(rsi) else None,
-            'indicator_score_2': round(ind, 2),
-            'volume_score_2': round(vol, 2),
-            'Fon Net Alımı': fund_flow_map.get(s),
+            'indicator_score': round(ind, 2),
+            'volume_score': round(vol, 2),
         }
-
-        vals = compute_stock_valuations(s, price)
-        row['P/E'] = vals.get('pe')
-        row['PD/DD'] = vals.get('pb')
-        row['EV/EBITDA'] = vals.get('ev_ebitda')
-        row['Fwd P/E'] = vals.get('fwd_pe')
-        row['Fwd PD/DD'] = vals.get('fwd_pb')
-        row['Fwd EV/EBITDA'] = vals.get('fwd_ev_ebitda')
-        row['P/E Δ'] = vals.get('pe_delta')
-        row['EV/EBITDA Δ'] = vals.get('ev_ebitda_delta')
+        for score_col in set(SCREENER_INDICATOR_OPTIONS.values()):
+            if score_col == 'indicator_score':
+                continue
+            v = latest.get(score_col)
+            row[score_col] = round(float(v), 3) if v is not None and pd.notna(v) else 0.0
         return row
     except Exception:
         return None
 
 
+def _enrich_stock_row(row, fund_flow_map, financial_store):
+    """Faz 2 (pahali): sadece top_n'e giren hisseler icin degerleme
+    (compute_stock_valuations - API cagirir) ve fon-akisi verisini ekler.
+
+    financial_store ACIKCA gecirilir (bkz. compute_stock_valuations
+    docstring'i) - worker thread'den st.session_state.financial_store'a
+    guvenilmez erisim yuzunden."""
+    s = row['symbol']
+    row['Fon Net Alımı'] = fund_flow_map.get(s)
+    try:
+        vals = compute_stock_valuations(s, row['price'], financial_store=financial_store)
+    except Exception:
+        vals = {}
+    row['P/E'] = vals.get('pe')
+    row['PD/DD'] = vals.get('pb')
+    row['EV/EBITDA'] = vals.get('ev_ebitda')
+    row['Fwd P/E'] = vals.get('fwd_pe')
+    row['Fwd PD/DD'] = vals.get('fwd_pb')
+    row['Fwd EV/EBITDA'] = vals.get('fwd_ev_ebitda')
+    row['P/E Δ'] = vals.get('pe_delta')
+    row['EV/EBITDA Δ'] = vals.get('ev_ebitda_delta')
+    return row
+
+
+def _rank_and_enrich(scored, rank_col, valuation_cache, top_n=20, max_workers=5):
+    """scored (screen_chosen_stocks'un TUM hisseler icin dondurdugu Faz-1
+    listesi - session_state'te cache'lenir) rank_col'a gore siralanir, en
+    yuksek top_n alinir, ve SADECE valuation_cache'te henuz olmayan
+    semboller icin Faz-2 (pahali degerleme) calistirilir.
+
+    Bu sayede screener'daki indikator combobox'i degistirildiginde YENI bir
+    611-hisse ag taramasi GEREKMEZ - sadece (yeni siralamada ust siraya
+    cikan ama daha once degerlemesi cekilmemis) birkac sembol icin ek istek
+    atilir, geri kalani cache'ten aninda gelir (kullanici talebi: "10
+    indikatorun oldugu bir combobox... o indikatore gore screen etse").
+
+    rank_col == 'indicator_score' ise esik ind>2.5 VE vol>1 (0-10 olcek);
+    tek bir indikator secilmisse esik score>0.5 VE vol>1 (0-1 olcek, 0.5
+    'notr eksen' - kullanicinin onayladigi tasarim)."""
+    if not scored:
+        return []
+    ranked = sorted(scored, key=lambda r: r.get(rank_col, 0) or 0, reverse=True)
+    top = [dict(r) for r in ranked[:top_n]]
+
+    missing = [r for r in top if r['symbol'] not in valuation_cache]
+    if missing:
+        fund_flow_map = get_latest_fund_flow_map()
+        # ANA THREAD'de (burada, ScriptRunContext mevcut) financial_store'un
+        # bir snapshot'i alinir - worker thread'lere ACIKCA gecirilir (bkz.
+        # compute_stock_valuations docstring'i).
+        financial_store_snapshot = dict(st.session_state.get('financial_store', {}))
+        stat2 = st.empty()
+        stat2.text(f"En yüksek puanlı {len(missing)} yeni hisse için değerleme verisi çekiliyor...")
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            enriched_missing = list(ex.map(
+                lambda r: _enrich_stock_row(dict(r), fund_flow_map, financial_store_snapshot), missing))
+        stat2.empty()
+        for r in enriched_missing:
+            valuation_cache[r['symbol']] = {k: r.get(k) for k in _VALUATION_FIELDS}
+
+    threshold = 2.5 if rank_col == 'indicator_score' else 0.5
+    for r in top:
+        r.update(valuation_cache.get(r['symbol'], {}))
+        r['qualifies'] = bool((r.get(rank_col, 0) or 0) > threshold and (r.get('volume_score', 0) or 0) > 1)
+    return top
+
+
 def screen_chosen_stocks(stock_list, interval="1d", max_workers=5):
     """
+    FAZ 1 SADECE: TUM hisseler icin ucuz (fetch+indikator+skor) tarama -
+    her hissenin toplam indicator_score'unun yaninda 10 indikatorun HER
+    BIRININ kendi skorunu da dondurur. Degerleme (Faz 2) burada YAPILMAZ -
+    caller sonucu session_state'e tam liste olarak kaydedip _rank_and_enrich
+    ile ayri cagirir; boylece screener'daki "hangi indikatore gore sirala"
+    combobox'i degistirildiginde YENIDEN 611 hisse taramasi gerekmez.
+
     Onceki versiyon 600+ hisseyi tek tek, sirayla taryordu (~1 istek/hisse,
     her biri agdan fiyat verisi cekiyor). ThreadPoolExecutor ile paralel
     hale getirildi - fetch_stock_data zaten @st.cache_data ile cache'li
@@ -947,15 +1111,12 @@ def screen_chosen_stocks(stock_list, interval="1d", max_workers=5):
     stat = st.empty()
     days = TIMEFRAMES[interval]["days"]
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    # Tek seferde cekilir (hisse basina ayri DB sorgusu atmamak icin) -
-    # fon verisi olmayan hisseler icin bos sozluk donebilir, sorun degil.
-    fund_flow_map = get_latest_fund_flow_map()
 
-    chosen = []
+    scored = []
     total = len(stock_list)
     done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_screen_one_stock, s, start_date, interval, fund_flow_map): s
+        futures = {ex.submit(_screen_one_stock, s, start_date, interval): s
                    for s in stock_list}
         for fut in as_completed(futures):
             s = futures[fut]
@@ -964,11 +1125,11 @@ def screen_chosen_stocks(stock_list, interval="1d", max_workers=5):
             prog.progress(done / total)
             row = fut.result()
             if row:
-                chosen.append(row)
+                scored.append(row)
 
     prog.empty()
     stat.empty()
-    return chosen
+    return scored
 
 def _scan_one_stock_summary(s, start_date, interval):
     """Tek hisse icin sentiment + SMA50 durumu - scan_market_summary'nin
@@ -979,13 +1140,13 @@ def _scan_one_stock_summary(s, start_date, interval):
         if df is None or df.empty:
             return (s, "ERROR", None)
         df = calculate_all_indicators(df)
-        ind2, vol2 = calculate_original_scores(df)
+        ind, vol = calculate_scores(df)
         latest = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else latest
         price_change_pct = ((latest['Close'] - prev['Close']) / prev['Close']) * 100 if len(df) > 1 else 0
 
         sentiment_text, _, _, confidence = calculate_sentiment(
-            ind2, vol2, latest['RSI'], latest['Diff'], price_change_pct
+            ind, vol, latest['RSI'], latest['Diff'], price_change_pct
         )
 
         sma50_status = None
@@ -2219,14 +2380,30 @@ def _cumulate_forecasts(standalone_forecasts):
     return sum(vals) if vals else None
 
 
-def compute_stock_valuations(symbol, current_price):
+def compute_stock_valuations(symbol, current_price, financial_store=None):
     """
     Compute current and forward valuations for a single stock.
     Returns dict with pe, pb, ev_ebitda, forward_pe, forward_ev_ebitda, etc.
     Returns empty dict on failure.
-    """
+
+    financial_store: opsiyonel {ticker: ...} sozlugu - verilirse
+    get_financial_data (dolayisiyla icindeki st.session_state.financial_store
+    okumasi) ATLANIR. ThreadPoolExecutor worker thread'lerinden cagirildiginda
+    (bkz. screen_chosen_stocks/_enrich_stock_row) st.session_state'e o
+    thread'lerin ScriptRunContext'i olmadigi icin erisim GUVENILIR DEGIL -
+    ana thread'de st.session_state.financial_store'un bir SNAPSHOT'i alinip
+    buraya acikca gecirilmesi gerekir, aksi halde tum degerleme sessizce bos
+    doner (kullanici sikayeti: "With Financials" hep 0 gorunuyordu)."""
     result = {}
-    raw_data = get_financial_data(symbol)
+    if financial_store is not None:
+        raw_data = financial_store.get(symbol)
+        if raw_data is None:
+            try:
+                raw_data = fetch_balance_sheet(symbol)
+            except Exception:
+                raw_data = None
+    else:
+        raw_data = get_financial_data(symbol)
     if not raw_data or not current_price or current_price <= 0:
         return result
     
@@ -4209,14 +4386,12 @@ def main():
             else:
                 if st.button("🚀 Run Screener", use_container_width=True):
                     with st.spinner("Screening..."):
-                        results = screen_chosen_stocks(IMKB, interval=selected_tf)
-                        st.session_state.chosen_stocks[selected_tf] = results
-                    if results:
-                        st.success(f"✅ Found {len(results)} stocks!")
-                    else:
-                        st.warning("⚠️ Tarama tamamlandı ama kriterlere uyan hisse bulunamadı "
-                                   "(ind ≥ 3 VE hacim > ortalamanın %70'i şartı bugün için çok "
-                                   "az/hiç hisseyi karşılamıyor olabilir - piyasa sakin olabilir).")
+                        scanned = screen_chosen_stocks(IMKB, interval=selected_tf)
+                        st.session_state.screener_scan[selected_tf] = scanned
+                        st.session_state.screener_val_cache.setdefault(selected_tf, {})
+                    if not scanned:
+                        st.warning("⚠️ Tarama tamamlandı ama hiç hisse için veri çekilemedi "
+                                   "(ağ/veri kaynağı sorunu olabilir - tekrar deneyin).")
             
             if mode == "📋 Market Summary":
                 if st.button("🔎 Scan All Stocks", use_container_width=True):
@@ -4252,13 +4427,18 @@ def main():
                     st.warning("⚠️ Import financials first for best results!")
                 
                 if st.button("💎 Scan for Value", use_container_width=True, type="primary"):
+                    # ANA THREAD'de snapshot alinir - asagidaki ThreadPoolExecutor
+                    # worker'larindan st.session_state.financial_store'a guvenilmez
+                    # erisim yuzunden (bkz. compute_stock_valuations docstring'i).
+                    vf_financial_store_snapshot = dict(st.session_state.get('financial_store', {}))
+
                     def _scan_one_value_stock(s, start_date, interval):
                         try:
                             df = fetch_stock_data(s, start_date=start_date, interval=interval)
                             if df is None or df.empty:
                                 return None
                             price = df['Close'].iloc[-1]
-                            vals = compute_stock_valuations(s, price)
+                            vals = compute_stock_valuations(s, price, financial_store=vf_financial_store_snapshot)
                             if vals:
                                 vals['symbol'] = s
                                 vals['price'] = round(price, 2)
@@ -4373,13 +4553,12 @@ def main():
                 df = fetch_stock_data(stock, start_date=start, end_date=end, interval=selected_tf)
             if df is not None and not df.empty:
                 df = calculate_all_indicators(df)
-                ind1, vol1 = calculate_simplified_scores(df)
-                ind2, vol2 = calculate_original_scores(df)
+                ind, vol = calculate_scores(df)
                 latest = df.iloc[-1]
                 prev = df.iloc[-2] if len(df) > 1 else latest
                 price_change_pct = ((latest['Close'] - prev['Close']) / prev['Close']) * 100 if len(df) > 1 else 0
                 sentiment_text, sentiment_emoji, sentiment_class, confidence = calculate_sentiment(
-                    ind2, vol2, latest['RSI'], latest['Diff'], price_change_pct
+                    ind, vol, latest['RSI'], latest['Diff'], price_change_pct
                 )
                 st.subheader(f"📈 {stock} - {TIMEFRAMES[selected_tf]['label']}")
                 st.markdown(f"""
@@ -4403,31 +4582,19 @@ def main():
                     st.metric("MACD", f"{latest['MACD']:.4f}")
                 
                 # -- Scores: compact HTML cards (mobile-friendly, no tiny gauges) --
-                ind2_color = "#28a745" if ind2 >= 3 else "#ffc107" if ind2 >= 1 else "#dc3545"
-                ind1_color = "#28a745" if ind1 >= 3.5 else "#ffc107" if ind1 >= 2 else "#dc3545"
-                vol2_color = "#28a745" if vol2 > 0.7 else "#dc3545"
-                vol1_color = "#28a745" if vol1 >= 3 else "#ffc107" if vol1 >= 2 else "#dc3545"
+                ind_color = "#28a745" if ind > 2.5 else "#ffc107" if ind >= 1 else "#dc3545"
+                vol_color = "#28a745" if vol > 1 else "#dc3545"
                 st.markdown(f"""
                 <div class="mobile-score-row">
                     <div class="mobile-score-card">
-                        <p class="score-label">Indicator 2 ⭐</p>
-                        <p class="score-value" style="color:{ind2_color}">{ind2:.1f}</p>
+                        <p class="score-label">Indicator Score</p>
+                        <p class="score-value" style="color:{ind_color}">{ind:.1f}</p>
                         <p class="score-max">/ 10</p>
                     </div>
                     <div class="mobile-score-card">
-                        <p class="score-label">Volume 2</p>
-                        <p class="score-value" style="color:{vol2_color}">{vol2:.2f}</p>
-                        <p class="score-max">{"✅ Above 0.7" if vol2 > 0.7 else "⚠️ Below 0.7"}</p>
-                    </div>
-                    <div class="mobile-score-card">
-                        <p class="score-label">Indicator 1</p>
-                        <p class="score-value" style="color:{ind1_color}">{ind1:.1f}</p>
-                        <p class="score-max">/ 5</p>
-                    </div>
-                    <div class="mobile-score-card">
-                        <p class="score-label">Volume 1</p>
-                        <p class="score-value" style="color:{vol1_color}">{vol1:.1f}</p>
-                        <p class="score-max">/ 5</p>
+                        <p class="score-label">Volume Score</p>
+                        <p class="score-value" style="color:{vol_color}">{vol:.2f}</p>
+                        <p class="score-max">{"✅ Above 1" if vol > 1 else "⚠️ Below 1"}</p>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -4437,33 +4604,33 @@ def main():
                 # ══════════════════════════════════════════════════
                 with st.expander("📝 Score Commentary & KPI Analysis", expanded=True):
                     
-                    # --- Indicator Score 2 (Original) Commentary ---
-                    st.markdown("#### 📊 Indicator Score 2 (Original) — {:.1f} / 10".format(ind2))
-                    st.caption("Counts how many of 10 technical signals just fired a fresh **buy crossover**. Each signal contributes 1 point (MACD can contribute 2). Higher = more indicators are simultaneously turning bullish.")
-                    
-                    if ind2 >= 6:
-                        st.success(f"🟢 **Strong Buy Signal** — {ind2:.0f} out of 10 indicators have triggered fresh buy crossovers. This level of agreement across MACD, RSI, EMA, SMA, Stochastic, CCI, KAMA, and CMF is unusual and suggests strong upward momentum is building.")
-                    elif ind2 >= 3:
-                        st.info(f"🔵 **Moderate Buy Signal** — {ind2:.0f} indicators are showing fresh crossovers. There is some positive momentum but not full consensus. Look at which specific indicators are confirming before acting.")
-                    elif ind2 >= 1:
-                        st.warning(f"🟡 **Weak / Neutral** — Only {ind2:.0f} indicator(s) triggered. The stock lacks broad technical confirmation. This could mean the stock is consolidating or between trend phases.")
+                    # --- Indicator Score Commentary ---
+                    st.markdown("#### 📊 Indicator Score — {:.1f} / 10".format(ind))
+                    st.caption("Counts how many of 10 technical signals just fired a fresh **buy crossover** (MACD, RSI, CCI, AO, KAMA, CMF, EMA10/EMA30, SMA5, SMA22, Stochastic). Each signal contributes exactly 1 point. Higher = more indicators are simultaneously turning bullish.")
+
+                    if ind >= 6:
+                        st.success(f"🟢 **Strong Buy Signal** — {ind:.0f} out of 10 indicators have triggered fresh buy crossovers. This level of agreement across MACD, RSI, EMA, SMA, Stochastic, CCI, KAMA, and CMF is unusual and suggests strong upward momentum is building.")
+                    elif ind > 2.5:
+                        st.info(f"🔵 **Moderate Buy Signal** — {ind:.0f} indicators are showing fresh crossovers. There is some positive momentum but not full consensus. Look at which specific indicators are confirming before acting.")
+                    elif ind >= 1:
+                        st.warning(f"🟡 **Weak / Neutral** — Only {ind:.0f} indicator(s) triggered. The stock lacks broad technical confirmation. This could mean the stock is consolidating or between trend phases.")
                     else:
                         st.error(f"🔴 **No Buy Signals** — Zero indicators are showing fresh buy crossovers. The stock may be in a downtrend or still falling. Wait for signals to emerge before considering entry.")
-                    
-                    # --- Volume Score 2 Commentary ---
-                    st.markdown("#### 📊 Volume Score 2 — {:.2f}x".format(vol2))
-                    st.caption("Current volume divided by the 15-period volume moving average. A value of 1.0 means average volume. Values above 0.7 indicate sufficient market participation to support a price move.")
-                    
-                    if vol2 > 2.0:
-                        st.success(f"🟢 **Very High Volume** ({vol2:.2f}x average) — Trading activity is more than double the norm. This strongly validates any price movement happening. High volume breakouts are more likely to sustain.")
-                    elif vol2 > 1.5:
-                        st.success(f"🟢 **High Volume** ({vol2:.2f}x average) — Significantly above normal. Strong market interest is present, which adds conviction to the current trend direction.")
-                    elif vol2 > 0.7:
-                        st.info(f"🔵 **Adequate Volume** ({vol2:.2f}x average) — Meets the minimum threshold for reliable signals. Volume is sufficient to support price action, though not exceptionally strong.")
-                    elif vol2 > 0.5:
-                        st.warning(f"🟡 **Below Average Volume** ({vol2:.2f}x average) — Trading activity is thin. Technical signals may be less reliable. Price moves on low volume can reverse easily.")
+
+                    # --- Volume Score Commentary ---
+                    st.markdown("#### 📊 Volume Score — {:.2f}x".format(vol))
+                    st.caption("Today's volume divided by the 50-day average volume. A value of 1.0 means average volume. Values above 1 indicate above-average market participation.")
+
+                    if vol > 2.0:
+                        st.success(f"🟢 **Very High Volume** ({vol:.2f}x average) — Trading activity is more than double the norm. This strongly validates any price movement happening. High volume breakouts are more likely to sustain.")
+                    elif vol > 1.5:
+                        st.success(f"🟢 **High Volume** ({vol:.2f}x average) — Significantly above normal. Strong market interest is present, which adds conviction to the current trend direction.")
+                    elif vol > 1:
+                        st.info(f"🔵 **Adequate Volume** ({vol:.2f}x average) — Meets the minimum threshold for reliable signals. Volume is sufficient to support price action, though not exceptionally strong.")
+                    elif vol > 0.7:
+                        st.warning(f"🟡 **Below Average Volume** ({vol:.2f}x average) — Trading activity is thin. Technical signals may be less reliable. Price moves on low volume can reverse easily.")
                     else:
-                        st.error(f"🔴 **Very Low Volume** ({vol2:.2f}x average) — Extremely low participation. Any price movement here is unreliable. Be cautious — this often signals lack of interest or a holiday/low-activity period.")
+                        st.error(f"🔴 **Very Low Volume** ({vol:.2f}x average) — Extremely low participation. Any price movement here is unreliable. Be cautious — this often signals lack of interest or a holiday/low-activity period.")
                     
                     st.markdown("---")
                     
@@ -4533,42 +4700,80 @@ def main():
                         st.markdown(f"📊 **Bollinger Bands:** Price is in the **upper half** of the bands (mid: ₺{bb_mid:.2f}). Mild bullish positioning within the normal range.")
                     else:
                         st.markdown(f"📊 **Bollinger Bands:** Price is in the **lower half** of the bands (mid: ₺{bb_mid:.2f}). Mild bearish positioning within the normal range.")
-                    
+
                     st.markdown("---")
-                    
+
+                    # --- Raw values of all 12 indicators used for Indicator Score ---
+                    # (10 katkida bulunan + AO/CCI/KAMA/EMA/Stochastic degerlerinin
+                    # HAM sayisal degerlerini, o gunku SUREKLI skor katkisini ve
+                    # gercekten O GUN taze kesisim olup olmadigini (yildiz) gormek
+                    # icin - kullanici talebi: "gerçekten keserek geçenler * ile
+                    # işaretlenerek göstersek")
+                    st.markdown("#### 📐 Indicator Values")
+                    ind_rows = [
+                        ("MACD", latest.get('MACD'), latest.get('Buy_MACDS'), latest.get('Score_MACD')),
+                        ("MACD Signal", latest.get('MACDS'), None, None),
+                        ("RSI", latest.get('RSI'), latest.get('Buy_RSIS'), latest.get('Score_RSI')),
+                        ("AO", latest.get('AO'), latest.get('Buy_AOS'), latest.get('Score_AO')),
+                        ("CCI", latest.get('CCI'), latest.get('Buy_CCIS'), latest.get('Score_CCI')),
+                        ("EMA10", latest.get('EMA10'), None, None),
+                        ("EMA30", latest.get('EMA30'), latest.get('Buy_EMA10_EMA30S'), latest.get('Score_EMA10_EMA30')),
+                        ("Stochastic", latest.get('Stochastic'), latest.get('Stochastic_BuyS'), latest.get('Score_Stochastic')),
+                        ("KAMA", latest.get('KAMA'), latest.get('Buy_KAMAS'), latest.get('Score_KAMA')),
+                        ("SMA5", latest.get('SMA5'), latest.get('Buy_SMA5S'), latest.get('Score_SMA5')),
+                        ("SMA22", latest.get('SMA22'), latest.get('Buy_SMA22S'), latest.get('Score_SMA22')),
+                        ("SMA50", latest.get('SMA50'), None, None),
+                        ("CMF", latest.get('CMF'), latest.get('Buy_CMFS'), latest.get('Score_CMF')),
+                    ]
+                    ind_df = pd.DataFrame([
+                        {
+                            "Indicator": (name + " *") if flag == 1 else name,
+                            "Value": round(val, 4) if pd.notna(val) else None,
+                            "Score Contribution": round(score, 2) if score is not None and pd.notna(score) else "",
+                        }
+                        for name, val, flag, score in ind_rows
+                    ])
+                    st.dataframe(ind_df, use_container_width=True, hide_index=True,
+                                 height=min(460, 35 * len(ind_df) + 38))
+                    st.caption("💡 **Score Contribution** o indikatorun Indicator Score'a o gunku (0-1 arasi) "
+                               "katkisi - deger bazli indikatorlerde (RSI/Stochastic/CCI/CMF) esik degerden "
+                               "asiri-alim tavanina dogru azalir; trend/kesisim bazlilarda (MACD/EMA/SMA/KAMA/AO) "
+                               "hem son taze kesisimden bu yana gecen gune HEM DE kesisim egrisinin (histogram/"
+                               "fark) EGIMINE gore azalir - momentum ivmelenirken yuksek, duzlesince orta, "
+                               "tersine donunce (asil kesisim henuz gerceklesmese bile) hizla dusuk puan alir. "
+                               "**'*'** o gun GERCEKTEN taze bir yukari kesisim oldugunu isaretler (MACD Signal, "
+                               "EMA10 ve SMA50 kendi basina bir sinyal degil, sadece referans/karsilastirma degeri).")
+
+                    st.markdown("---")
+
                     # --- Overall Assessment ---
                     st.markdown("#### 🎯 Overall Assessment")
-                    
-                    is_chosen = ind2 >= 3 and vol2 > 0.7
-                    
-                    if is_chosen and ind2 >= 6:
-                        st.success(f"✅ **{stock} qualifies as a CHOSEN STOCK** with a strong indicator score of {ind2:.0f}/10 backed by {vol2:.2f}x average volume. Multiple technical indicators are aligned bullish with sufficient volume confirmation. This is one of the strongest technical setups in the current scan.")
+
+                    is_chosen = ind > 2.5 and vol > 1
+
+                    if is_chosen and ind >= 6:
+                        st.success(f"✅ **{stock} qualifies as a CHOSEN STOCK** with a strong indicator score of {ind:.0f}/10 backed by {vol:.2f}x average volume. Multiple technical indicators are aligned bullish with sufficient volume confirmation. This is one of the strongest technical setups in the current scan.")
                     elif is_chosen:
-                        st.success(f"✅ **{stock} qualifies as a CHOSEN STOCK** (Indicator ≥ 3 and Volume > 0.7). The stock shows {ind2:.0f} fresh buy crossovers with adequate volume ({vol2:.2f}x). A moderate setup — not the strongest signal but enough for the screener criteria.")
-                    elif ind2 >= 3 and vol2 <= 0.7:
-                        st.warning(f"⚠️ **{stock} has good indicator signals ({ind2:.0f}/10) but volume is insufficient** ({vol2:.2f}x). Technical signals without volume backing are less reliable. The buy setup exists but lacks conviction from market participants.")
-                    elif ind2 < 3 and vol2 > 0.7:
-                        st.warning(f"⚠️ **{stock} has decent volume ({vol2:.2f}x) but few buy signals** ({ind2:.0f}/10). Volume is present but the technical indicators haven't aligned. This could mean distribution (selling with volume) rather than accumulation.")
+                        st.success(f"✅ **{stock} qualifies as a CHOSEN STOCK** (Indicator > 2.5 and Volume > 1). The stock shows {ind:.0f} fresh buy crossovers with adequate volume ({vol:.2f}x). A moderate setup — not the strongest signal but enough for the screener criteria.")
+                    elif ind > 2.5 and vol <= 1:
+                        st.warning(f"⚠️ **{stock} has good indicator signals ({ind:.0f}/10) but volume is insufficient** ({vol:.2f}x). Technical signals without volume backing are less reliable. The buy setup exists but lacks conviction from market participants.")
+                    elif ind <= 2.5 and vol > 1:
+                        st.warning(f"⚠️ **{stock} has decent volume ({vol:.2f}x) but few buy signals** ({ind:.0f}/10). Volume is present but the technical indicators haven't aligned. This could mean distribution (selling with volume) rather than accumulation.")
                     else:
-                        st.info(f"ℹ️ **{stock} does not currently meet the screener criteria.** Both indicator score ({ind2:.0f}/10) and volume ({vol2:.2f}x) are below thresholds. The stock lacks a clear technical entry signal at this time.")
-                
-                # Gauges in an expander (optional detail, not blocking mobile view)
+                        st.info(f"ℹ️ **{stock} does not currently meet the screener criteria.** Both indicator score ({ind:.0f}/10) and volume ({vol:.2f}x) are below thresholds. The stock lacks a clear technical entry signal at this time.")
+
+                # Gauge in an expander (optional detail, not blocking mobile view)
                 with st.expander("📊 Detailed Gauge Charts"):
                     gc1, gc2 = st.columns(2)
                     with gc1:
-                        st.plotly_chart(create_gauge(ind2, "Indicator 2", 10), use_container_width=True, config=PLOTLY_CONFIG)
+                        st.plotly_chart(create_gauge(ind, "Indicator Score", 10), use_container_width=True, config=PLOTLY_CONFIG)
                     with gc2:
-                        st.plotly_chart(create_gauge(ind1, "Indicator 1"), use_container_width=True, config=PLOTLY_CONFIG)
-                    gc3, gc4 = st.columns(2)
-                    with gc3:
-                        st.plotly_chart(create_gauge(vol1, "Volume 1"), use_container_width=True, config=PLOTLY_CONFIG)
-                    with gc4:
-                        st.markdown(f"**Volume Score 2:** {vol2:.2f}")
-                        if vol2 > 0.7:
-                            st.success("✅ Above 0.7")
+                        st.markdown(f"**Volume Score:** {vol:.2f}")
+                        if vol > 1:
+                            st.success("✅ Above 1")
                         else:
-                            st.warning("⚠️ Below 0.7")
-                if ind2 >= 3 and vol2 > 0.7:
+                            st.warning("⚠️ Below 1")
+                if ind > 2.5 and vol > 1:
                     st.markdown('<div class="chosen-stock"><h3>⭐ CHOSEN STOCK! ⭐</h3></div>', unsafe_allow_html=True)
                 
                 st.subheader("📊 Price Chart")
@@ -4603,31 +4808,77 @@ def main():
         
         elif mode == "🔍 Stock Screener":
             st.subheader("🔍 Chosen Stocks")
-            if selected_tf in st.session_state.chosen_stocks and st.session_state.chosen_stocks[selected_tf]:
-                results = st.session_state.chosen_stocks[selected_tf]
-                df_c = pd.DataFrame(results).sort_values('indicator_score_2', ascending=False)
-                
+
+            scanned = st.session_state.screener_scan.get(selected_tf)
+            results = None
+            rank_col = 'indicator_score'
+            indicator_label = "Tümü (10 indikatör toplamı)"
+            if scanned:
+                # Kullanici talebi: "screener de 10 indikatorun oldugu bir combobox
+                # eklesek... o indikatore gore screen etse". Faz-1 (scanned) TUM
+                # hisseler icin zaten cache'lendigi icin buradaki secim degisince
+                # YENIDEN tarama gerekmez - sadece _rank_and_enrich yeniden siralar
+                # ve (varsa) eksik birkac hisse icin degerleme ceker.
+                indicator_label = st.selectbox(
+                    "📌 Hangi indikatöre göre sırala/filtrele?",
+                    list(SCREENER_INDICATOR_OPTIONS.keys()),
+                    key="screener_indicator_choice",
+                    help=("'Tümü' 10 indikatörün toplamına göre sıralar (varsayılan, 0-10 ölçek). "
+                          "Tek bir indikatör seçersen SADECE onun skoruna göre (0-1 ölçek) en yüksek "
+                          "puanlı 20 hisse listelenir - yeniden tarama gerekmez, anında hesaplanır.")
+                )
+                rank_col = SCREENER_INDICATOR_OPTIONS[indicator_label]
+                val_cache = st.session_state.screener_val_cache.setdefault(selected_tf, {})
+                with st.spinner("Sıralanıyor..."):
+                    results = _rank_and_enrich(scanned, rank_col, val_cache, top_n=20)
+                st.session_state.chosen_stocks[selected_tf] = results
+
+            if results:
+                is_single = rank_col != 'indicator_score'
+                score_header = f"{indicator_label.split(' (')[0]} Score" if is_single else "Indicator Score"
+                score_fmt = '{:.2f}' if is_single else '{:.1f}'
+                threshold_txt = (f"{score_header} > 0.5 VE Volume Score > 1" if is_single
+                                 else "Indicator Score > 2.5 VE Volume Score > 1")
+
+                df_c = pd.DataFrame(results).sort_values(rank_col, ascending=False)
+
                 # Display summary metrics
-                sc1, sc2, sc3 = st.columns(3)
+                n_qualifies = int(df_c['qualifies'].sum()) if 'qualifies' in df_c.columns else 0
+                sc1, sc2, sc3, sc4 = st.columns(4)
                 with sc1:
-                    st.metric("Chosen Stocks", len(df_c))
+                    st.metric("Listed (Top)", len(df_c))
                 with sc2:
-                    avg_ind = df_c['indicator_score_2'].mean()
-                    st.metric("Avg Indicator", f"{avg_ind:.1f}")
+                    st.metric("✅ Qualifies", f"{n_qualifies}/{len(df_c)}")
                 with sc3:
+                    avg_score = df_c[rank_col].mean()
+                    st.metric(f"Avg {score_header}", score_fmt.format(avg_score))
+                with sc4:
                     has_pe = df_c['P/E'].notna().sum()
                     st.metric("With Financials", f"{has_pe}/{len(df_c)}")
+                st.caption(f"📌 Bu liste, taranan tüm hisseler arasından **{score_header}'a göre en yüksek "
+                           f"puanlı 20 hisse** - kriterleri ({threshold_txt}) karşılayıp karşılamadığına "
+                           "bakılmaksızın gösterilir. '✅ Kriter' sütunu hangi hisselerin bu eşiği "
+                           "gerçekten geçtiğini işaretler.")
 
                 if 'Fon Net Alımı' in df_c.columns:
                     st.caption("💰 **Fon Net Alımı**: son ay için takip edilen fonların o hissede aldığı/sattığı "
                                "net TL tutarı (bkz. 💰 Funds sekmesi). Boş (—) satırlar 'fon almadı' değil, "
                                "'sadece takip edilen fonların hiçbiri bu hisseyi tutmuyor' demektir.")
-                
+
                 # Format display columns
-                display_cols = ['symbol', 'price', 'chg%', 'RSI', 'indicator_score_2', 'volume_score_2',
+                df_c['Kriter'] = df_c['qualifies'].map(lambda v: '✅' if v else '—') if 'qualifies' in df_c.columns else '—'
+                display_cols = ['symbol', 'price', 'chg%', 'RSI', rank_col, 'volume_score', 'Kriter',
                                'Fon Net Alımı',
                                'P/E', 'PD/DD', 'EV/EBITDA', 'Fwd P/E', 'Fwd PD/DD', 'Fwd EV/EBITDA', 'P/E Δ', 'EV/EBITDA Δ']
+                if is_single and 'indicator_score' in df_c.columns:
+                    # Tek indikator secilse bile toplam (10 indikator) skoru referans
+                    # olarak yaninda gosterilir - "bu hisse tek basina X'te guclu ama
+                    # genelde nasil" sorusuna cevap versin diye.
+                    display_cols.insert(display_cols.index('volume_score'), 'indicator_score')
                 available_display = [c for c in display_cols if c in df_c.columns]
+                rename_map = {rank_col: score_header, 'volume_score': 'Volume Score'}
+                if is_single:
+                    rename_map['indicator_score'] = 'Toplam (10) Score'
 
                 def _fmt_fund_flow(v):
                     if v is None or pd.isna(v):
@@ -4640,26 +4891,32 @@ def main():
                         return f"{sign}{v/1e6:.1f} Mn"
                     return f"{sign}{v:,.0f}"
 
+                fmt_dict = {
+                    'price': '₺{:.2f}',
+                    'chg%': '{:+.2f}%',
+                    'RSI': '{:.1f}',
+                    score_header: score_fmt,
+                    'Volume Score': '{:.2f}',
+                    'Fon Net Alımı': _fmt_fund_flow,
+                    'P/E': '{:.1f}x',
+                    'PD/DD': '{:.2f}x',
+                    'EV/EBITDA': '{:.1f}x',
+                    'Fwd P/E': '{:.1f}x',
+                    'Fwd PD/DD': '{:.2f}x',
+                    'Fwd EV/EBITDA': '{:.1f}x',
+                    'P/E Δ': '{:+.1f}',
+                    'EV/EBITDA Δ': '{:+.1f}',
+                }
+                if is_single:
+                    fmt_dict['Toplam (10) Score'] = '{:.1f}'
+
                 st.dataframe(
-                    df_c[available_display].style.format({
-                        'price': '₺{:.2f}',
-                        'chg%': '{:+.2f}%',
-                        'RSI': '{:.1f}',
-                        'indicator_score_2': '{:.1f}',
-                        'volume_score_2': '{:.2f}',
-                        'Fon Net Alımı': _fmt_fund_flow,
-                        'P/E': '{:.1f}x',
-                        'PD/DD': '{:.2f}x',
-                        'EV/EBITDA': '{:.1f}x',
-                        'Fwd P/E': '{:.1f}x',
-                        'Fwd PD/DD': '{:.2f}x',
-                        'Fwd EV/EBITDA': '{:.1f}x',
-                        'P/E Δ': '{:+.1f}',
-                        'EV/EBITDA Δ': '{:+.1f}',
-                    }, na_rep='—', subset=available_display[1:]),
+                    df_c[available_display].rename(columns=rename_map).style.format(
+                        fmt_dict, na_rep='—',
+                        subset=[rename_map.get(c, c) for c in available_display[1:] if c != 'Kriter']),
                     use_container_width=True, hide_index=True, height=min(400, 35 * len(df_c) + 38)
                 )
-                
+
                 # Cards view
                 st.markdown("---")
                 cols = st.columns(min(3, max(1, len(df_c))))
@@ -4670,19 +4927,21 @@ def main():
                         ev_str = f"{s['EV/EBITDA']:.1f}x" if s.get('EV/EBITDA') else "—"
                         fpe_str = f"{s['Fwd P/E']:.1f}x" if s.get('Fwd P/E') else "—"
                         fev_str = f"{s['Fwd EV/EBITDA']:.1f}x" if s.get('Fwd EV/EBITDA') else "—"
+                        badge = "✅ " if s.get('qualifies') else ""
+                        score_val = s.get(rank_col, 0) or 0
+                        score_str = f"{score_val:.2f}" if is_single else f"{score_val:.1f}"
                         st.markdown(f"""
                         <div class="chosen-stock">
-                            <h4>{s['symbol']} — ₺{s['price']:.2f}</h4>
-                            <p><b>Ind:</b> {s['indicator_score_2']} | <b>Vol:</b> {s['volume_score_2']}</p>
+                            <h4>{badge}{s['symbol']} — ₺{s['price']:.2f}</h4>
+                            <p><b>{score_header}:</b> {score_str} | <b>Vol:</b> {s['volume_score']}</p>
                             <p><b>P/E:</b> {pe_str} → {fpe_str} | <b>PD/DD:</b> {pb_str}</p>
                             <p><b>EV/EBITDA:</b> {ev_str} → {fev_str}</p>
                         </div>
                         """, unsafe_allow_html=True)
-            elif selected_tf in st.session_state.chosen_stocks:
+            elif scanned is not None:
                 # Tarama calisti ama sonuc bos - "hic taramadin" mesajiyla karistirilmasin.
-                st.info("Bu taramada kriterlere uyan hisse bulunamadı. Farklı bir zaman "
-                        "diliminde tekrar deneyebilir veya piyasa daha hareketlendiğinde "
-                        "yeniden tarayabilirsin.")
+                st.info("Bu taramada hiçbir hisse için veri çekilemedi. Ağ/veri kaynağı "
+                        "sorunu olabilir - tekrar deneyebilirsin.")
             else:
                 st.info("Click 'Run Screener'")
 
