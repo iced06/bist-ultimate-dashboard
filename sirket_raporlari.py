@@ -1427,8 +1427,26 @@ def compute_sector_rollup(yil, donem, financial_margins=None):
         donem_label=DONEM_LABELS.get(donem, donem), yil=yil,
         sektor_listesi=", ".join(SEKTOR_LISTESI), sirket_verileri=sirket_verileri,
     )
-    response = _call_gemini_with_retry(client, prompt, max_output_tokens=12000)
-    parsed = _parse_llm_json(response.text)
+    # 12000 token limiti, cok sayida sirketin oldugu donemlerde (orn. 55+
+    # sirket) yaniti ortasindan kesip bozuk/yarim JSON'a yol aciyordu
+    # (kullanici sikayeti: "Unterminated string..." parse hatasi). Her
+    # sirket bir ticker+puan+kisa yorum + her sektor bir 3-5 cumlelik
+    # analiz urettigi icin dogrusal olarak buyuyor - 32000'e cikarildi.
+    response = _call_gemini_with_retry(client, prompt, max_output_tokens=32000)
+    try:
+        parsed = _parse_llm_json(response.text)
+    except json.JSONDecodeError as exc:
+        # Kismi/bozuk veriyi sessizce DB'ye YAZMIYORUZ (sector_rollup_analysis +
+        # company_report_summaries'e ayni anda yaziliyor, yarim veri tutarsizlik
+        # yaratir) - net bir aciklamayla hata firlatip kullaniciyi tekrar
+        # denemeye yonlendiriyoruz.
+        raise RuntimeError(
+            f"Gemini'nin yanıtı JSON olarak ayrıştırılamadı - muhtemelen "
+            f"{len(reports)} şirket için üretilen yanıt token limitine takılıp "
+            f"yarıda kesildi. 'Hesapla/Yenile'ye tekrar basmayı dene; sorun "
+            f"tekrarlarsa bu dönem için çok fazla şirket rapor var demektir, "
+            f"token limitinin daha da artırılması gerekebilir."
+        ) from exc
 
     conn = _get_live_connection()
     if conn is None:
