@@ -735,12 +735,18 @@ def _parse_llm_json(raw_text):
         return json.loads(cleaned)
 
 
-def _call_gemini_with_retry(client, prompt, max_attempts=3, max_output_tokens=8000):
+def _call_gemini_with_retry(client, prompt, max_attempts=5, max_output_tokens=8000):
     """Gemini API bazen gecici olarak asiri yuklu oluyor (503 UNAVAILABLE,
     canli hatada gozlemlendi) veya rate-limit'e takiliyor (429). Ikisi de
-    gecici - kisa bir bekleme ile tekrar denemek genelde yeterli. Diger
+    gecici - Google'in sunucu tarafinda bir yogunluk/kota sorunu, bizim kod
+    hatamiz degil (ozellikle ucretsiz katmanda daha sik gorulur). Diger
     hatalar (400 gecersiz istek, 404 model bulunamadi vb.) tekrar denemeden
-    direkt yukari firlatilir - onlar tekrar denense de duzelmez."""
+    direkt yukari firlatilir - onlar tekrar denense de duzelmez.
+
+    max_attempts 3'ten 5'e, bekleme 3s/6s (sabit artis) yerine katlanarak
+    artan 3s/6s/12s/24s'e cikarildi (toplam ~45s) - kullanici sikayeti:
+    3 deneme/9s bazen Google'in yogunluk anini atlatmaya yetmiyordu, hata
+    kullaniciya kadar ulasiyordu."""
     last_error = None
     for attempt in range(max_attempts):
         try:
@@ -756,10 +762,31 @@ def _call_gemini_with_retry(client, prompt, max_attempts=3, max_output_tokens=80
         except genai.errors.APIError as e:
             last_error = e
             if e.code in (503, 429) and attempt < max_attempts - 1:
-                time.sleep(3 * (attempt + 1))  # 3s, 6s
+                time.sleep(min(30, 3 * (2 ** attempt)))  # 3s, 6s, 12s, 24s
                 continue
             raise
     raise last_error
+
+
+def _friendly_gemini_error(e):
+    """Gemini API hatalarini kullaniciya anlamli bir mesajla gosterir.
+    503/429 - _call_gemini_with_retry zaten birkac kez (bkz. docstring'i)
+    otomatik tekrar denedi; hala basarisizsa bu Google'in sunucu tarafinda
+    GECICI bir yogunluk/kota sorunu oldugunu acikca belirtiyoruz (kullanici
+    talebi: "bunu niye yapıyor hep" - bizim kod hatamiz sanilmasin diye)."""
+    if genai is not None and isinstance(e, genai.errors.APIError):
+        if e.code in (503, 429):
+            return ("⏳ Google'ın Gemini API'si şu anda yoğun (503/429) - otomatik "
+                    "olarak birkaç kez tekrar denendi ama hâlâ meşgul. Bu bizim "
+                    "tarafımızdaki bir hata DEĞİL, Google'ın sunucu tarafında geçici "
+                    "bir kapasite/kota sorunu (özellikle ücretsiz API katmanında sık "
+                    "görülür). Genelde birkaç dakika içinde geçer - lütfen 'Analiz "
+                    "Et'e tekrar basmayı dene.")
+        if e.code == 400:
+            return f"Gemini isteği geçersiz (400): {e}"
+        if e.code == 404:
+            return f"Model bulunamadı (404) - GEMINI_MODEL ayarı hatalı olabilir: {e}"
+    return f"Hata: {e}"
 
 
 def _format_financial_context(fm):
@@ -1706,7 +1733,7 @@ def display_company_reports(financial_margins=None):
                             'ham_metin_uzunluk': len(text),
                         }
             except Exception as e:
-                st.error(f"Hata: {e}")
+                st.error(_friendly_gemini_error(e))
 
     r = st.session_state.get('_last_report')
     if r:
@@ -1847,7 +1874,7 @@ def display_company_reports(financial_margins=None):
                                f"{_period_fmt((sel_yil, sel_donem))} analizi güncellendi.")
                     st.session_state['_sektor_rollup_shown_period'] = (sel_yil, sel_donem)
                 except Exception as e:
-                    st.error(f"Hata: {e}")
+                    st.error(_friendly_gemini_error(e))
 
         if goster_clicked:
             st.session_state['_sektor_rollup_shown_period'] = (sel_yil, sel_donem)
