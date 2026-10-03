@@ -750,10 +750,11 @@ def _call_gemini_with_retry(client, prompt, max_attempts=5, max_output_tokens=80
     hatalar (400 gecersiz istek, 404 model bulunamadi vb.) tekrar denemeden
     direkt yukari firlatilir - onlar tekrar denense de duzelmez.
 
-    max_attempts 3'ten 5'e, bekleme 3s/6s (sabit artis) yerine katlanarak
-    artan 3s/6s/12s/24s'e cikarildi (toplam ~45s) - kullanici sikayeti:
-    3 deneme/9s bazen Google'in yogunluk anini atlatmaya yetmiyordu, hata
-    kullaniciya kadar ulasiyordu."""
+    Gecici sunucu hatalari (500/503/504): katlanarak artan 3s/6s/12s/24s
+    bekleme, en fazla max_attempts deneme. 429 (kota/rate-limit): GUNLUK kota
+    doluysa tekrar denemek ANLAMSIZ (ertesi gune kadar duzelmez, sadece
+    bekletir) - hemen yukari firlatilir; dakikalik limitse Google'in onerdigi
+    retryDelay kadar bekleyip en fazla 2 kez daha denenir."""
     last_error = None
     for attempt in range(max_attempts):
         try:
@@ -768,31 +769,108 @@ def _call_gemini_with_retry(client, prompt, max_attempts=5, max_output_tokens=80
             )
         except genai.errors.APIError as e:
             last_error = e
-            if e.code in (503, 429) and attempt < max_attempts - 1:
+            if e.code in (500, 503, 504) and attempt < max_attempts - 1:
                 time.sleep(min(30, 3 * (2 ** attempt)))  # 3s, 6s, 12s, 24s
+                continue
+            if e.code == 429 and attempt < min(2, max_attempts - 1):
+                info = _gemini_error_info(e)
+                if info["daily"]:
+                    raise
+                time.sleep(min(60, max(info["retry_delay"] or 0, 3 * (2 ** attempt))))
                 continue
             raise
     raise last_error
 
 
+def _gemini_error_info(e):
+    """genai APIError'dan (best-effort, hicbir alan garanti degil) teshis
+    bilgisi cikarir: code, status, message, quota_ids (429 QuotaFailure
+    ihlalleri), retry_delay (sn - RetryInfo veya mesajdaki 'retry in Ns'),
+    daily (GUNLUK kota mi - tekrar denemek anlamsiz)."""
+    code = getattr(e, 'code', None)
+    status = getattr(e, 'status', None)
+    message = getattr(e, 'message', None) or ""
+    details = getattr(e, 'details', None)
+    err = details.get('error', details) if isinstance(details, dict) else {}
+    quota_ids, retry_delay = [], None
+    for d in ((err.get('details') if isinstance(err, dict) else None) or []):
+        if not isinstance(d, dict):
+            continue
+        for v in (d.get('violations') or []):
+            qid = v.get('quotaId') or v.get('quotaMetric')
+            if qid:
+                quota_ids.append(str(qid))
+        rd = d.get('retryDelay')
+        if isinstance(rd, str) and rd.endswith('s'):
+            try:
+                retry_delay = float(rd[:-1])
+            except ValueError:
+                pass
+    if retry_delay is None:
+        m = re.search(r'retry in ([\d.]+)\s*s', message, re.I)
+        if m:
+            retry_delay = float(m.group(1))
+    daily = (any('perday' in q.lower().replace('_', '').replace(' ', '') for q in quota_ids)
+             or bool(re.search(r'per\s*day', message, re.I)))
+    return {"code": code, "status": status, "message": message,
+            "quota_ids": quota_ids, "retry_delay": retry_delay, "daily": daily}
+
+
+def _response_diagnostics(response):
+    """Bozuk/kesik yanit durumunda ONEMLI ipuclari (best-effort): bitis nedeni
+    (MAX_TOKENS = limite takildi) ve token dagilimi - thinking token'lari da
+    max_output_tokens'tan yer."""
+    parts = []
+    try:
+        fr = response.candidates[0].finish_reason
+        parts.append(f"finish_reason={getattr(fr, 'name', fr)}")
+    except Exception:
+        pass
+    um = getattr(response, 'usage_metadata', None)
+    for label, attr in (("girdi", "prompt_token_count"), ("thinking", "thoughts_token_count"),
+                        ("cikti", "candidates_token_count")):
+        v = getattr(um, attr, None) if um is not None else None
+        if v is not None:
+            parts.append(f"{label}_token={v}")
+    return ", ".join(parts) or "bilgi yok"
+
+
 def _friendly_gemini_error(e):
-    """Gemini API hatalarini kullaniciya anlamli bir mesajla gosterir.
-    503/429 - _call_gemini_with_retry zaten birkac kez (bkz. docstring'i)
-    otomatik tekrar denedi; hala basarisizsa bu Google'in sunucu tarafinda
-    GECICI bir yogunluk/kota sorunu oldugunu acikca belirtiyoruz (kullanici
-    talebi: "bunu niye yapıyor hep" - bizim kod hatamiz sanilmasin diye)."""
+    """Gemini API hatalarini kullaniciya anlamli bir mesajla gosterir -
+    GERCEK hata kodunu/durumunu/mesajini da (ve 429'da hangi kotanin
+    dolduguyu) 'Teknik detay' olarak gostererek. (Onceki surum 503 ile 429'u
+    tek bir 'yogun' mesajinda birlestiriyordu - ikisi cok farkli: 503 Google'in
+    anlik yogunlugu, 429 bizim kotamiz; hangisi oldugunu gostermek sart.)"""
     if genai is not None and isinstance(e, genai.errors.APIError):
-        if e.code in (503, 429):
-            return ("⏳ Google'ın Gemini API'si şu anda yoğun (503/429) - otomatik "
-                    "olarak birkaç kez tekrar denendi ama hâlâ meşgul. Bu bizim "
-                    "tarafımızdaki bir hata DEĞİL, Google'ın sunucu tarafında geçici "
-                    "bir kapasite/kota sorunu (özellikle ücretsiz API katmanında sık "
-                    "görülür). Genelde birkaç dakika içinde geçer - lütfen 'Analiz "
-                    "Et'e tekrar basmayı dene.")
-        if e.code == 400:
-            return f"Gemini isteği geçersiz (400): {e}"
-        if e.code == 404:
-            return f"Model bulunamadı (404) - GEMINI_MODEL ayarı hatalı olabilir: {e}"
+        info = _gemini_error_info(e)
+        code = info["code"]
+        tech = f"Teknik detay: {code} {info['status'] or ''}".strip()
+        if info["message"]:
+            tech += f" — {info['message'][:300]}"
+        if info["quota_ids"]:
+            tech += f" (kota: {', '.join(info['quota_ids'])})"
+        if code == 429 and info["daily"]:
+            body = ("🚫 Gemini'nin GÜNLÜK (ücretsiz katman) kotası dolmuş (429). Tekrar "
+                    "denemenin faydası yok - kota Pasifik saatiyle gece yarısı "
+                    "(Türkiye'de yaklaşık 10:00-11:00) sıfırlanır; ya da Google AI Studio'da "
+                    "faturalandırmayı açarak / daha yüksek kotalı bir modele geçerek aşılır.")
+        elif code == 429:
+            body = ("⏱️ Gemini'nin dakikalık kota/rate-limit sınırına takıldık (429) - "
+                    "otomatik olarak birkaç kez beklenip tekrar denendi. Bir dakika "
+                    "bekleyip tekrar dene.")
+        elif code in (500, 503, 504):
+            body = ("⏳ Google'ın Gemini modeli şu anda yoğun / yanıt veremiyor "
+                    f"({code}) - otomatik olarak birkaç kez tekrar denendi ama hâlâ "
+                    "meşgul. Bu bizim tarafımızdaki bir hata DEĞİL, Google'ın sunucu "
+                    "tarafında geçici bir kapasite sorunu (özellikle ücretsiz API "
+                    "katmanında sık görülür). Genelde birkaç dakika içinde geçer.")
+        elif code == 400:
+            body = "Gemini isteği geçersiz (400)."
+        elif code == 404:
+            body = "Model bulunamadı (404) - GEMINI_MODEL ayarı hatalı olabilir."
+        else:
+            body = f"Gemini API hatası ({code})."
+        return f"{body}\n\n{tech}"
     return f"Hata: {e}"
 
 
@@ -1276,20 +1354,24 @@ def get_sector_rollup(yil, donem):
 
 
 SECTOR_ROLLUP_PROMPT_TEMPLATE = """Sen kıdemli bir portföy stratejistisin. Aşağıda BIST
-şirketlerinin {donem_label} {yil} dönemine ait faaliyet raporu/yatırımcı sunumu özetleri var
-(bazılarında ayrıca şirketin gerçek finansallarından hesaplanmış bir "marj gelişimi" notu da
-bulunuyor - bu sadece bağlam için verildi, sen bu puanı DEĞİL, aşağıdaki görevleri üreteceksin).
-Şirketler henüz sektörlere ayrılmamış olabilir - bu senin görevinin bir parçası.
+şirketlerinin {donem_label} {yil} dönemine ait faaliyet raporu/yatırımcı sunumu özetleri var.
+Şirketlerin ÇOĞUNUN sektörü ve görünüm puanı (1-5) her raporun kendi analizi sırasında ZATEN
+belirlenmiş (başlıkta yazıyor) - bunları DEĞİŞTİRME, çıktıda TEKRAR ETME. (Bazılarında ayrıca
+şirketin gerçek finansallarından hesaplanmış bir "marj gelişimi" notu da bulunuyor - bu sadece
+bağlam için verildi, sen bu puanı DEĞİL, aşağıdaki görevleri üreteceksin).
 
 Görevlerin:
-1) HER şirketi, SADECE aşağıdaki listeden TEK bir sektöre ata (listedeki isimleri birebir kullan):
+1) Başlığında "SEKTÖR: (henüz atanmamış)" yazan HER şirketi, SADECE aşağıdaki listeden TEK bir
+   sektöre ata (listedeki isimleri birebir kullan):
    {sektor_listesi}
-2) HER şirket için, ÖZETİNDEKİ bilgilere dayanarak 1-5 arası (yarım puan olabilir, örn 3.5):
-   - gorunum_puani: Raporda yer alan pozitif/negatif beklentilerin genel değerlemesi
-     (5=çok olumlu görünüm, 1=çok olumsuz görünüm)
-   - gorunum_yorumu: "<1 kısa cümlelik gerekçe>"
-3) HER sektör için, o sektördeki şirketlerin verilerine dayanarak bir MAKRO SEKTÖR ANALİZİ yaz ve
-   sektörleri BİRBİRİYLE KIYASLAYARAK 1-5 arası bir sektör skoru ver (5=en güçlü/olumlu
+   ve ÖZETİNDEKİ bilgilere dayanarak 1-5 arası (yarım puan olabilir, örn 3.5) bir
+   gorunum_puani (Raporda yer alan pozitif/negatif beklentilerin genel değerlemesi: 5=çok olumlu
+   görünüm, 1=çok olumsuz görünüm) ile "<1 kısa cümlelik gerekçe>" olarak gorunum_yorumu ver.
+   Sektörü zaten belirlenmiş şirketleri bu listeye KOYMA; atanmamış şirket yoksa
+   "yeni_atamalar" boş liste olsun.
+2) Şirket dağılımına (başlıkta verilen sektörler + senin yeni atadıkların) göre, EN AZ BİR şirketi
+   olan HER sektör için o sektördeki şirketlerin verilerine dayanarak bir MAKRO SEKTÖR ANALİZİ yaz
+   ve sektörleri BİRBİRİYLE KIYASLAYARAK 1-5 arası bir sektör skoru ver (5=en güçlü/olumlu
    görünümlü sektör, 1=en zayıf/olumsuz). Skorlar mutlaka birbirinden farklılaşsın - bütün
    sektörlere aynı skoru verme, gerçek bir sıralama/kıyaslama yap.
 
@@ -1302,16 +1384,17 @@ gercek finansal verilerden ayrica ve deterministik olarak hesaplanacak.
 GÖREV: SADECE geçerli JSON döndür, başka hiçbir metin ekleme. Format:
 
 {{
+  "yeni_atamalar": [
+    {{"ticker": "<TICKER>", "sektor": "<yukarıdaki listeden birebir>", "gorunum_puani": <1-5>,
+      "gorunum_yorumu": "<kısa gerekçe>"}}
+  ],
   "sektorler": [
     {{
       "sektor": "<sektör adı, yukarıdaki listeden birebir>",
       "makro_analiz": "<3-5 cümlelik, o sektördeki şirketlerin ortak eğilimlerini özetleyen
 analiz - marjlar genel olarak iyiye mi kötüye mi gidiyor, hangi ortak temalar/riskler öne
 çıkıyor>",
-      "sektor_skoru": <1-5 arası, diğer sektörlerle kıyaslanmış tam sayı veya yarım puan (örn 3.5)>,
-      "sirketler": [
-        {{"ticker": "<TICKER>", "gorunum_puani": <1-5>, "gorunum_yorumu": "<kısa gerekçe>"}}
-      ]
+      "sektor_skoru": <1-5 arası, diğer sektörlerle kıyaslanmış tam sayı veya yarım puan (örn 3.5)>
     }}
   ]
 }}
@@ -1387,26 +1470,34 @@ def _apply_margin_scores(cur, ticker, yil, donem, sektor_tickers, financial_marg
 
 
 def compute_sector_rollup(yil, donem, financial_margins=None):
-    """Secilen (yil, donem) icin kayitli TUM rapor ozetlerini TEK bir Gemini
-    cagrisinda sektorlere siniflandirir + sektor/gorunum analizini uretir
-    (ayri ayri cagirsaydik model diger sektorleri/sirketleri gormeden
-    "kiyaslamali" skor veremezdi). Sektor atamasi onceden yapilmis olmasi
-    sart degil - bu fonksiyon o donemdeki TUM raporlari (sektoru bos olanlar
-    dahil) tarar ve siniflandirir.
+    """Secilen (yil, donem) icin kayitli rapor ozetlerini TEK bir Gemini
+    cagrisinda sektor duzeyinde analiz eder: her sektor icin makro analiz +
+    sektorler arasi KIYASLAMALI sektor skoru (ayri ayri cagirsaydik model
+    diger sektorleri gormeden "kiyaslamali" skor veremezdi).
+
+    Sirket-duzeyi bilgiler (sektor atamasi + Gorunum Puani) her raporun KENDI
+    analizi sirasinda (_summarize_with_gemini) zaten uretilip DB'ye yaziliyor
+    - bu yuzden KAYITLI olanlar yeniden uretilmez, sadece baglam olarak
+    prompt'a girer. Gemini'ye SADECE sektoru/gorunumu HENUZ atanmamis (yeni
+    eklenen/eksik) raporlar siniflandirilmak uzere sorulur. ESKIDEN her
+    "Hesapla/Yenile"de 55-58 raporun TAMAMI yeniden siniflandirilip yeniden
+    puanlaniyordu (~35K karakter girdi + sirket basina cikti) - ucretsiz
+    katmanda 503/429 riskini gereksiz yere artiran agir bir cagriydi
+    (kullanici gozlemi: "her defasinda tum raporlari gemini'dan getirtmeye
+    calistigi icin olabilir mi?").
 
     Marj Puani (FAVOK+Net Kar seviye skorlarinin ortalamasi), Gemini'nin
-    DEGIL, bu fonksiyonun Python tarafinin isi: Gemini'nin DONDURDUGU sektor
-    gruplarina gore, her sirketin (varsa) import edilmis GERCEK
-    finansallardan hesaplanan FAVOK ve Net Kar marjlarini AYRI AYRI AYNI
-    SEKTORDEKI diger sirketlerle kiyaslar (bkz. _apply_margin_scores /
-    compute_margin_scores_for_ticker). Ayrica Marj Gelisim Puani, Marj
-    Gelisim Puani (Yillik), Marj Toplam Puani ve Overall Puan da (varsa)
-    finansallardan tazelenir - ilk analiz sirasinda financial_store'da
-    olmayip sonradan import edilmis olabilir.
+    DEGIL, bu fonksiyonun Python tarafinin isi: sektor gruplarina gore, her
+    sirketin (varsa) import edilmis GERCEK finansallardan hesaplanan FAVOK ve
+    Net Kar marjlarini AYRI AYRI AYNI SEKTORDEKI diger sirketlerle kiyaslar
+    (bkz. _apply_margin_scores / compute_margin_scores_for_ticker). Ayrica
+    Marj Gelisim Puani, Marj Gelisim Puani (Yillik), Marj Toplam Puani ve
+    Overall Puan da (varsa) finansallardan tazelenir - ilk analiz sirasinda
+    financial_store'da olmayip sonradan import edilmis olabilir.
 
     Sonuclari sector_rollup_analysis tablosuna (yil, donem, sektor) anahtariyla
-    kaydeder (upsert); ayrica company_report_summaries uzerindeki sektor/marj/
-    gorunum alanlarini da gunceller."""
+    kaydeder (upsert); ayrica company_report_summaries uzerindeki marj
+    alanlarini (ve sadece YENI atananlarin sektor/gorunum alanlarini) gunceller."""
     if genai is None:
         raise RuntimeError("google-genai paketi kurulu değil.")
     api_key = _get_gemini_api_key()
@@ -1418,19 +1509,37 @@ def compute_sector_rollup(yil, donem, financial_margins=None):
         raise RuntimeError(f"{DONEM_LABELS.get(donem, donem)} {yil} için hiç kayıtlı rapor yok.")
 
     financial_margins = financial_margins or {}
-    valid_tickers = set(reports['ticker'])
+
+    # Kayitli (gecerli sektor + gorunum puani olan) atamalar yeniden uretilmez.
+    assignments = {}
+    unassigned = set()
+    for _, r in reports.iterrows():
+        sektor_kayitli, gp = r.get('sektor'), r.get('gorunum_puani')
+        if sektor_kayitli in SEKTOR_LISTESI and pd.notna(gp):
+            assignments[r['ticker']] = {
+                "sektor": sektor_kayitli, "gorunum_puani": float(gp),
+                "gorunum_yorumu": r.get('gorunum_yorumu'), "yeni": False}
+        else:
+            unassigned.add(r['ticker'])
+
     lines = []
     for _, r in reports.iterrows():
+        t = r['ticker']
         ozet_kisa = (r['ozet'] or '')[:600]
         # marj_development_puani/marj_ytd_puani artik AYNI (ikisi de YTD YoY,
-        # bkz. compute_margin_scores_for_ticker) - tek not yeterli, ayrica
-        # 55+ sirketlik donemlerde prompt boyutunu da kucultur (bkz.
-        # compute_sector_rollup'taki max_output_tokens truncation fix'i).
+        # bkz. compute_margin_scores_for_ticker) - tek not yeterli.
         dev_note = ""
         if pd.notna(r.get('marj_development_puani')):
             dev_note = (f"\n(Bağlam - marj gelişimi notu (YTD YoY): {r['marj_development_puani']}/5, "
                         f"{r.get('marj_development_yorumu') or ''})")
-        lines.append(f"\n## {r['ticker']}\nÖzet: {ozet_kisa}...{dev_note}")
+        if t in assignments:
+            a = assignments[t]
+            baslik = f"## {t} | SEKTÖR: {a['sektor']} | GÖRÜNÜM: {a['gorunum_puani']:.1f}/5"
+            if a['gorunum_yorumu']:
+                baslik += f" ({a['gorunum_yorumu']})"
+        else:
+            baslik = f"## {t} | SEKTÖR: (henüz atanmamış)"
+        lines.append(f"\n{baslik}\nÖzet: {ozet_kisa}...{dev_note}")
     sirket_verileri = "\n".join(lines)
 
     client = genai.Client(api_key=api_key)
@@ -1452,52 +1561,64 @@ def compute_sector_rollup(yil, donem, financial_margins=None):
         # yaratir) - net bir aciklamayla hata firlatip kullaniciyi tekrar
         # denemeye yonlendiriyoruz.
         raise RuntimeError(
-            f"Gemini'nin yanıtı JSON olarak ayrıştırılamadı - muhtemelen "
-            f"{len(reports)} şirket için üretilen yanıt token limitine takılıp "
-            f"yarıda kesildi. 'Hesapla/Yenile'ye tekrar basmayı dene; sorun "
-            f"tekrarlarsa bu dönem için çok fazla şirket rapor var demektir, "
-            f"token limitinin daha da artırılması gerekebilir."
+            f"Gemini'nin yanıtı JSON olarak ayrıştırılamadı - muhtemelen yanıt "
+            f"token limitine takılıp yarıda kesildi. 'Hesapla/Yenile'ye tekrar "
+            f"basmayı dene. Teknik detay: {_response_diagnostics(response)}"
         ) from exc
+
+    # Yeni atamalar: sadece gercekten atanmamis olan ticker'lar + gecerli sektor.
+    for c in (parsed.get('yeni_atamalar') or []):
+        t = c.get('ticker')
+        if t in unassigned and c.get('sektor') in SEKTOR_LISTESI:
+            assignments[t] = {
+                "sektor": c['sektor'], "gorunum_puani": c.get('gorunum_puani'),
+                "gorunum_yorumu": c.get('gorunum_yorumu'), "yeni": True}
+    by_sector = {}
+    for t, a in assignments.items():
+        by_sector.setdefault(a['sektor'], []).append(t)
+    sector_info = {s.get('sektor'): s for s in (parsed.get('sektorler') or [])
+                   if s.get('sektor') in SEKTOR_LISTESI}
 
     conn = _get_live_connection()
     if conn is None:
         raise RuntimeError("Veritabanı bağlantısı yok - sonuçlar kaydedilemedi.")
     sirket_toplam = 0
+    n_sektor = 0
     with conn.cursor() as cur:
-        for s in parsed.get('sektorler', []):
-            sektor = s.get('sektor')
-            if sektor not in SEKTOR_LISTESI:
-                continue  # model listeden sapmis olabilir - guvenlik icin atla
-            sirketler = [c for c in s.get('sirketler', []) if c.get('ticker') in valid_tickers]
-            sektor_tickers = [c['ticker'] for c in sirketler]
-            cur.execute("""
-                INSERT INTO sector_rollup_analysis (yil, donem, sektor, makro_analiz, sektor_skoru, sirket_sayisi)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (yil, donem, sektor) DO UPDATE SET
-                    makro_analiz = EXCLUDED.makro_analiz,
-                    sektor_skoru = EXCLUDED.sektor_skoru,
-                    sirket_sayisi = EXCLUDED.sirket_sayisi,
-                    olusturma_zamani = now()
-            """, (int(yil), donem, sektor, s.get('makro_analiz'), s.get('sektor_skoru'),
-                  len(sirketler)))
-            for c in sirketler:
-                ticker = c['ticker']
-                gorunum_puani = c.get('gorunum_puani')
+        for sektor, sektor_tickers in by_sector.items():
+            info = sector_info.get(sektor)
+            if info is not None:
                 cur.execute("""
-                    UPDATE company_report_summaries
-                    SET sektor = %s, gorunum_puani = %s, gorunum_yorumu = %s
-                    WHERE ticker = %s AND yil = %s AND donem = %s
-                """, (sektor, gorunum_puani, c.get('gorunum_yorumu'), ticker, int(yil), donem))
+                    INSERT INTO sector_rollup_analysis (yil, donem, sektor, makro_analiz, sektor_skoru, sirket_sayisi)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (yil, donem, sektor) DO UPDATE SET
+                        makro_analiz = EXCLUDED.makro_analiz,
+                        sektor_skoru = EXCLUDED.sektor_skoru,
+                        sirket_sayisi = EXCLUDED.sirket_sayisi,
+                        olusturma_zamani = now()
+                """, (int(yil), donem, sektor, info.get('makro_analiz'), info.get('sektor_skoru'),
+                      len(sektor_tickers)))
+                n_sektor += 1
+            # Model bir sektoru atlamissa (info yok) o sektorun ONCEKI analizini
+            # NULL ile EZMEYIZ - sadece sirketlerin marj skorlari tazelenir.
+            for ticker in sektor_tickers:
+                a = assignments[ticker]
+                if a['yeni']:
+                    cur.execute("""
+                        UPDATE company_report_summaries
+                        SET sektor = %s, gorunum_puani = %s, gorunum_yorumu = %s
+                        WHERE ticker = %s AND yil = %s AND donem = %s
+                    """, (sektor, a['gorunum_puani'], a['gorunum_yorumu'], ticker, int(yil), donem))
                 # FAVÖK/Net Kâr Puanı, Marj Puanı, gelişim skorları, Marj
                 # Toplam Puanı, Overall Puan - bkz. _apply_margin_scores.
                 _apply_margin_scores(cur, ticker, yil, donem, sektor_tickers,
-                                      financial_margins, gorunum_puani)
+                                      financial_margins, a['gorunum_puani'])
                 sirket_toplam += 1
     conn.commit()
     get_sector_rollup.clear()
     get_reports_for_period.clear()
     get_available_periods_for_rollup.clear()
-    return len(parsed.get('sektorler', [])), sirket_toplam
+    return n_sektor, sirket_toplam
 
 
 def refresh_all_margin_scores(financial_margins):
@@ -1834,8 +1955,11 @@ def display_company_reports(financial_margins=None):
     st.markdown("#### 🏭 Sektör Analizi")
     st.caption("Seçilen yıl/dönem içindeki raporları sektörlere göre kümeleyip, sektörleri "
                "birbirleriyle kıyaslayarak analiz eder. **Hesapla/Yenile** o dönem için yeni "
-               "bir Gemini çağrısı yapar (yeni eklenen raporlar da dahil edilir); **Göster** "
-               "ise hiçbir çağrı yapmadan en son hesaplanmış tabloyu getirir.")
+               "bir Gemini çağrısı yapar (sektör/görünüm ataması zaten kayıtlı raporlar "
+               "yeniden sınıflandırılmaz; sadece sektörü henüz atanmamış yeni raporlar "
+               "sınıflandırılır, sektör düzeyindeki kıyaslamalı analiz her seferinde "
+               "yenilenir); **Göster** ise hiçbir çağrı yapmadan en son hesaplanmış tabloyu "
+               "getirir.")
     if not financial_margins:
         st.caption("ℹ️ Marj Puanı/Gelişim Puanı/Gelişim Puanı (Yıllık), sidebar'dan **Import "
                    "Financials** çalıştırılmış hisseler için gerçek finansal verilerden "
