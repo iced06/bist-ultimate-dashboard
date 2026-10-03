@@ -49,6 +49,14 @@ except ImportError:
 
 MAX_SUMMARY_INPUT_CHARS = 100_000  # Gemini'ye gonderilecek ham metnin ust siniri (token/kota kontrolu)
 GEMINI_MODEL = "gemini-3.6-flash"  # ucretsiz katmanda mevcut (2.5-flash yeni kullanicilara kapatildi)
+# Birincil model 503 (yogunluk)/429 (kota)/404 ile basarisiz olursa sirayla denenen
+# YEDEK modeller. Hepsinin ucretsiz katmani var (ai.google.dev/gemini-api/docs/pricing)
+# ve her modelin kapasitesi/kotasi AYRI - birincil yogunken digeri genelde calisir.
+# Sira: kaliteye en yakin (3.7) -> eski/legacy, muhtemelen daha az yogun (3.5) ->
+# en yeni (3.8) -> en hafif (3.5-lite, son care). GEMINI_FALLBACK_MODELS
+# secret/env'i (virgullu liste; "none" = yedeksiz) ile degistirilebilir.
+GEMINI_FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash",
+                           "gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
 DONEM_OPTIONS = ["Q1", "Q2", "Q3", "Q4", "FY"]
 DONEM_LABELS = {"Q1": "1. Çeyrek", "Q2": "2. Çeyrek", "Q3": "3. Çeyrek", "Q4": "4. Çeyrek", "FY": "Yıl Sonu"}
@@ -493,6 +501,42 @@ def _get_gemini_api_key():
     return os.getenv("GEMINI_API_KEY")
 
 
+def _get_fallback_models():
+    """Yedek model listesi: GEMINI_FALLBACK_MODELS secret/env'i (virgullu liste,
+    "none" = yedeksiz) varsa o, yoksa GEMINI_FALLBACK_MODELS sabiti."""
+    raw = None
+    try:
+        if "GEMINI_FALLBACK_MODELS" in st.secrets:
+            raw = st.secrets["GEMINI_FALLBACK_MODELS"]
+    except Exception:
+        pass
+    raw = raw or os.getenv("GEMINI_FALLBACK_MODELS")
+    if raw and str(raw).strip():
+        if str(raw).strip().lower() == "none":
+            return []
+        return [m.strip() for m in str(raw).split(",") if m.strip()]
+    return list(GEMINI_FALLBACK_MODELS)
+
+
+def _set_gemini_state(used, tried):
+    """Son cagrida hangi modelin KULLANILDIGI ve hangilerinin DENENDIGI -
+    session_state'te (oturumlar arasi karismasin diye modul degiskeni degil)."""
+    try:
+        st.session_state['_gemini_used_model'] = used
+        st.session_state['_gemini_tried_models'] = list(tried)
+    except Exception:
+        pass
+
+
+def _show_gemini_model_note():
+    """Basarili bir Gemini cagrisindan sonra, birincil model yerine YEDEK model
+    kullanildiysa kullaniciya bildirir (kalite/ton farkli olabilir)."""
+    used = st.session_state.get('_gemini_used_model') if hasattr(st, 'session_state') else None
+    if used and used != GEMINI_MODEL:
+        st.caption(f"ℹ️ Birincil model ({GEMINI_MODEL}) yanıt vermediği için bu işlem "
+                   f"yedek model ({used}) ile yapıldı.")
+
+
 def _make_connection():
     if psycopg2 is None:
         return None
@@ -750,36 +794,72 @@ def _call_gemini_with_retry(client, prompt, max_attempts=5, max_output_tokens=80
     hatalar (400 gecersiz istek, 404 model bulunamadi vb.) tekrar denemeden
     direkt yukari firlatilir - onlar tekrar denense de duzelmez.
 
-    Gecici sunucu hatalari (500/503/504): katlanarak artan 3s/6s/12s/24s
-    bekleme, en fazla max_attempts deneme. 429 (kota/rate-limit): GUNLUK kota
-    doluysa tekrar denemek ANLAMSIZ (ertesi gune kadar duzelmez, sadece
-    bekletir) - hemen yukari firlatilir; dakikalik limitse Google'in onerdigi
-    retryDelay kadar bekleyip en fazla 2 kez daha denenir."""
-    last_error = None
-    for attempt in range(max_attempts):
-        try:
-            return client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    max_output_tokens=max_output_tokens,
-                    temperature=0.3,
-                    response_mime_type="application/json",
-                ),
-            )
-        except genai.errors.APIError as e:
-            last_error = e
-            if e.code in (500, 503, 504) and attempt < max_attempts - 1:
-                time.sleep(min(30, 3 * (2 ** attempt)))  # 3s, 6s, 12s, 24s
-                continue
-            if e.code == 429 and attempt < min(2, max_attempts - 1):
-                info = _gemini_error_info(e)
-                if info["daily"]:
-                    raise
-                time.sleep(min(60, max(info["retry_delay"] or 0, 3 * (2 ** attempt))))
-                continue
-            raise
-    raise last_error
+    YEDEK MODEL ZINCIRI: birincil model (GEMINI_MODEL) basarisiz olursa
+    sirayla _get_fallback_models() denenir - 503 yogunlugu da 429 kotasi da
+    MODEL BAZLI (her modelin kapasitesi/kotasi ayri), yani baska modele
+    gecmek ikisini de asar (kullanici gozlemi: gemini-3.6-flash surekli 503
+    veriyor). Hangi model kullanildi/denendi session_state'e yazilir (bkz.
+    _show_gemini_model_note). Tum modeller basarisiz olursa BIRINCIL modelin
+    hatasi firlatilir (en temsili olan o; yedek modeldeki 404 gibi hatalar
+    asil sebebi gizlemesin).
+
+    Model basina davranis:
+      - 500/503/504: katlanarak artan 3s/6s/12s bekleyip tekrar dene
+        (birincil: 3 deneme, yedek: 2; yedek hic yoksa max_attempts), sonra
+        sonraki modele gec.
+      - 429: baska model varsa BEKLEMEDEN sonrakine gec (kota model bazli);
+        yoksa gunluk kota doluysa hemen firlat (beklemek anlamsiz), dakikalik
+        limitse Google'in retryDelay'i kadar bekleyip en fazla 2 kez daha dene.
+      - 403/404 (model bu anahtar icin kapali/yok): sonraki modele gec.
+      - 400 vb. (istegin KENDISI hatali): hic model degistirmeden firlat."""
+    models = [GEMINI_MODEL] + [m for m in _get_fallback_models() if m != GEMINI_MODEL]
+    has_fallbacks = len(models) > 1
+    first_error = None
+    tried = []
+    for mi, model in enumerate(models):
+        tried.append(model)
+        has_next = mi < len(models) - 1
+        n_attempts = (3 if mi == 0 else 2) if has_fallbacks else max_attempts
+        for attempt in range(n_attempts):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        max_output_tokens=max_output_tokens,
+                        temperature=0.3,
+                        response_mime_type="application/json",
+                    ),
+                )
+                _set_gemini_state(model, tried)
+                return response
+            except genai.errors.APIError as e:
+                if first_error is None:
+                    first_error = e
+                code = e.code
+                last_attempt = attempt >= n_attempts - 1
+                if code in (500, 503, 504):
+                    if not last_attempt:
+                        time.sleep(min(30, 3 * (2 ** attempt)))  # 3s, 6s, 12s...
+                        continue
+                    break  # bu model icin pes - sonraki modele
+                if code == 429:
+                    if has_next:
+                        break  # kota model bazli - beklemeden sonraki modele
+                    if attempt < min(2, n_attempts - 1):
+                        info = _gemini_error_info(e)
+                        if info["daily"]:
+                            _set_gemini_state(None, tried)
+                            raise first_error
+                        time.sleep(min(60, max(info["retry_delay"] or 0, 3 * (2 ** attempt))))
+                        continue
+                    break
+                if code in (403, 404) and has_next:
+                    break  # model bu anahtar icin kapali/yok - sonraki modele
+                _set_gemini_state(None, tried)
+                raise
+    _set_gemini_state(None, tried)
+    raise first_error
 
 
 def _gemini_error_info(e):
@@ -849,6 +929,12 @@ def _friendly_gemini_error(e):
             tech += f" — {info['message'][:300]}"
         if info["quota_ids"]:
             tech += f" (kota: {', '.join(info['quota_ids'])})"
+        try:
+            tried = st.session_state.get('_gemini_tried_models') or []
+        except Exception:
+            tried = []
+        if len(tried) > 1:
+            tech += f"\n\nDenenen modeller (hepsi başarısız): {' → '.join(tried)}"
         if code == 429 and info["daily"]:
             body = ("🚫 Gemini'nin GÜNLÜK (ücretsiz katman) kotası dolmuş (429). Tekrar "
                     "denemenin faydası yok - kota Pasifik saatiyle gece yarısı "
@@ -1877,6 +1963,7 @@ def display_company_reports(financial_margins=None):
                             get_all_summaries.clear()
                             get_ticker_history.clear()
                             st.success("✅ Analiz tamamlandı ve kalıcı olarak kaydedildi.")
+                            _show_gemini_model_note()
                         else:
                             st.warning("⚠️ Analiz tamamlandı ama veritabanına kaydedilemedi — "
                                        "sayfa yenilenirse kaybolabilir.")
@@ -2027,6 +2114,7 @@ def display_company_reports(financial_margins=None):
                     st.success(f"✅ {n_sirket} şirket, {n_sektor} sektöre ayrılarak "
                                f"{_period_fmt((sel_yil, sel_donem))} analizi güncellendi.")
                     st.session_state['_sektor_rollup_shown_period'] = (sel_yil, sel_donem)
+                    _show_gemini_model_note()
                 except Exception as e:
                     st.error(_friendly_gemini_error(e))
 
