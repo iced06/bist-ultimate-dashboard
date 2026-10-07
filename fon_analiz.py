@@ -795,8 +795,9 @@ def _render_kap_import_section():
                    "reconciliation (PDF'in kendi yazdığı toplamla karşılaştırma) başarısız "
                    "olursa o rapor GÜVENLİK İÇİN hiç yazılmaz. Bazı PDF'lerde (bazı 'Model "
                    "Portföy' fonlarında gözlemlendi) fon kodu metnin hiçbir yerinde geçmiyor — "
-                   "böyle bir satır için `KOD|link` yazarak (örn. `YDI|https://...`) kodu "
-                   "kendin verebilirsin.")
+                   "bu durumda PDF'teki fon adı, daha önce kayıtlı bir fonla BİREBİR eşleşiyorsa "
+                   "kod otomatik bulunur (örn. YDI); eşleşme yoksa (ilk kez eklenen fon) "
+                   "`KOD|link` yazarak (örn. `YDI|https://...`) kodu kendin verebilirsin.")
 
         if _kap_import_one is None:
             st.error(f"İçe aktarma modülü yüklenemedi: {_KAP_IMPORT_ERROR}")

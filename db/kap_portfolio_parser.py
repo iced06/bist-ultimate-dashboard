@@ -163,6 +163,27 @@ FORMAT_B_CIKIS_RE_TR = re.compile(
 NUM_EN_RE = re.compile(r'-?\d{1,3}(?:,\d{3})*\.\d+')
 FORMAT_C_TITLE_RE = re.compile(r'^\(([A-ZÇĞİÖŞÜ0-9]{2,10})\)\s+(.+)$')
 FORMAT_C_PERIOD_RE = re.compile(r'^([A-ZÇĞİÖŞÜ]+)\s+(\d{4})\s+AYLIK\s+RAPORUDUR', re.IGNORECASE)
+# Yapı Kredi Portföy'un "Model Portföy" fonunda (YDI, Eylül 2026 raporu, gercek
+# veriyle yakalandi) donem satiri "{Ay} {Yil} AYLIK RAPORUDUR" YERINE bir TARIH
+# ARALIGI + BITISIK yazilmis ifade: "01.09.2026 - 30.09.2026PORTFÖY DAĞILIM
+# RAPORUDUR." (tarih ile "PORTFÖY" arasinda BOSLUK YOK - kaynak PDF'in kendi
+# metin katmani). Govde (ISIN'li satirlar, Ingilizce sayilar, harfli bolumler,
+# "TOPLAM <n> <n> <yuzde>") Format C ile BIREBIR ayni.
+FORMAT_C_PERIOD_RANGE_RE = re.compile(
+    r'^(\d{2})\.(\d{2})\.(\d{4})\s*-\s*(\d{2})\.(\d{2})\.(\d{4})\s*PORTF[ÖO]Y\s+DA[ĞG]ILIM\s+RAPORUDUR',
+    re.IGNORECASE,
+)
+
+
+def _period_from_range_match(m):
+    """FORMAT_C_PERIOD_RANGE_RE eslesmesinden (yil, ay): SADECE aralik TAM BIR
+    TAKVIM AYI ise (ayin 1'i -> ayin son gunu, ayni ay/yil). Aksi halde (0, 0)
+    - yanlis bir aya yazmaktansa rapor GUVENLI sekilde reddedilir."""
+    import calendar
+    d1, m1, y1, d2, m2, y2 = (int(g) for g in m.groups())
+    if d1 == 1 and m1 == m2 and y1 == y2 and 1 <= m2 <= 12 and d2 == calendar.monthrange(y2, m2)[1]:
+        return y2, m2
+    return 0, 0
 FORMAT_C_SECTION_RE = re.compile(r'^([A-ZÇĞİÖŞÜ]{1,3})\)\s*(.+?)\s*:?\s*$')
 FORMAT_C_TOPLAM_RE = re.compile(r'^TOPLAM\s+(.+)$')
 
@@ -414,7 +435,8 @@ def parse_pdf_text(all_text: str) -> ParseResult:
         early_lines = [l.strip() for l in all_text.split('\n')[:8] if l.strip()]
         title_lines = early_lines[:3]
         if (any(FORMAT_C_TITLE_RE.match(l) for l in title_lines)
-                or any(FORMAT_C_PERIOD_RE.match(l) for l in early_lines)):
+                or any(FORMAT_C_PERIOD_RE.match(l) for l in early_lines)
+                or any(FORMAT_C_PERIOD_RANGE_RE.match(l) for l in early_lines)):
             result = _parse_pdf_text_format_c(all_text)
         else:
             result = _parse_pdf_text_format_a(all_text)
@@ -692,6 +714,12 @@ def _parse_header_c(all_text):
         if m2 and not yil:
             ay = TURKISH_MONTHS.get(_tr_lower(m2.group(1)), 0)
             yil = int(m2.group(2))
+    if not yil:
+        for line in early_lines:
+            m3 = FORMAT_C_PERIOD_RANGE_RE.match(line)
+            if m3:
+                yil, ay = _period_from_range_match(m3)
+                break
     if not fon_adi:
         for line in all_lines[:15]:
             m = FORMAT_B_FON_ADI_RE.match(line)

@@ -30,7 +30,8 @@ import io
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kap_portfolio_parser import parse_pdf_text, aggregate_by_isin, check_reconciliation
+import re
+from kap_portfolio_parser import parse_pdf_text, aggregate_by_isin, check_reconciliation, _tr_lower
 
 try:
     import requests
@@ -164,6 +165,28 @@ def _log_etl(conn, fon_kodu, yil, ay, durum, detay):
         """, (fon_kodu or None, yil or None, ay or None, durum, detay))
 
 
+def _normalize_fon_adi(s):
+    return re.sub(r'\s+', ' ', _tr_lower(s or '')).strip()
+
+
+def _resolve_fon_kodu_by_name(conn, fon_adi):
+    """PDF'te fon kodu HIC gecmiyorsa (Yapı Kredi Portföy "Model Portföy"
+    fonlari - bkz. import_one'in override_fon_kodu notu) fonu, PDF'in
+    "A. FONUN ADI" alanindaki TAM ADLA, `funds` tablosunda DAHA ONCE kayitli
+    bir fonla eslestirir (Turkce-duyarli kucuk harf + bosluk normalizasyonu
+    sonrasi BIREBIR esitlik). SADECE TAM OLARAK BIR eslesme varsa kodu
+    doner - hic ya da birden fazla eslesme varsa None (belirsizlikte tahmin
+    YOK, eskisi gibi kullanicidan KOD|link istenir). Kullanici talebi: her
+    ay YDI|link yazmak zorunda kalinmasin."""
+    target = _normalize_fon_adi(fon_adi)
+    if not target:
+        return None
+    with conn.cursor() as cur:
+        cur.execute("SELECT fon_kodu, fon_adi FROM funds WHERE fon_adi IS NOT NULL")
+        matches = [k for k, a in cur.fetchall() if _normalize_fon_adi(a) == target]
+    return matches[0] if len(matches) == 1 else None
+
+
 def import_one(conn, path_or_url, override_fon_kodu=None):
     """Tek bir KAP fon portfoy raporu PDF'ini parse edip DB'ye yazar.
     override_fon_kodu: bazi PDF'lerde (Yapı Kredi Portföy'un "Model
@@ -187,6 +210,10 @@ def import_one(conn, path_or_url, override_fon_kodu=None):
     calculated, printed_total, recon_ok, recon_unit = check_reconciliation(result, holdings)
 
     fon_kodu = override_fon_kodu.strip().upper() if override_fon_kodu else result.fon_kodu
+    kod_adan_cozuldu = False
+    if not fon_kodu and result.fon_adi:
+        fon_kodu = _resolve_fon_kodu_by_name(conn, result.fon_adi) or ''
+        kod_adan_cozuldu = bool(fon_kodu)
     yil, ay = result.donem_yil, result.donem_ay
     meta = {
         'fon_kodu': fon_kodu, 'fon_adi': result.fon_adi, 'yil': yil, 'ay': ay,
@@ -265,6 +292,8 @@ def import_one(conn, path_or_url, override_fon_kodu=None):
     detay = (f"{n_written} hisse yazildi ({result.dialect} sablonu), "
              f"toplam {calculated:.2f}{recon_unit} (PDF: {printed_total}{recon_unit}), "
              f"katilma payi giris/cikis yontemi: {result.katilma_payi_extract_method}")
+    if kod_adan_cozuldu:
+        detay += f" | fon kodu PDF'te yok, fon adindan cozuldu: {fon_kodu}"
     if result.unmatched_prefix_tokens:
         detay += f" | UYARI unmatched_prefix_tokens={result.unmatched_prefix_tokens}"
     if result.katilma_payi_extract_method == 'UNRESOLVED':
