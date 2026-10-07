@@ -51,6 +51,13 @@ except Exception as _sirket_raporlari_import_error:
         st.error("📄 Şirket Raporları özelliği yüklenemedi (sirket_raporlari.py import hatası).")
         st.code(str(_sirket_raporlari_import_error))
 
+try:
+    from portfoy_olusturucu import display_portfolio_builder
+except Exception as _portfoy_import_error:
+    def display_portfolio_builder(*args, **kwargs):
+        st.error("📐 Portföy özelliği yüklenemedi (portfoy_olusturucu.py import hatası).")
+        st.code(str(_portfoy_import_error))
+
 st.set_page_config(
     page_title="BIST Technical Analysis",
     page_icon="📊",
@@ -734,7 +741,6 @@ def fetch_stock_data(symbol, start_date="2023-01-01", end_date=None, interval="1
                 continue
             return None
 
-@st.cache_data(ttl=300, show_spinner=False)
 def _decay_value_score(series, threshold, ceiling):
     """SINIRLI osilatorler (RSI/Stochastic/CCI/CMF) icin: deger BUY esigini
     (threshold) YUKARI kestigi anda 1 puanla baslar, 'asiri alim' tavanina
@@ -807,6 +813,7 @@ def _decay_slope_score(diff_series, state_series, cross_flag_series,
     return (time_decay * slope_multiplier).fillna(0)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def calculate_all_indicators(df):
     if df is None or df.empty:
         return None
@@ -4343,7 +4350,7 @@ def main():
         
         with st.sidebar:
             st.header("⚙️ Settings")
-            mode = st.radio("Mode", ["📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "🌍 Macro Analysis", "💰 Funds", "📄 Company Reports"])
+            mode = st.radio("Mode", ["📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "🌍 Macro Analysis", "💰 Funds", "📄 Company Reports", "📐 Portfolio"])
             st.markdown("---")
             st.subheader("⏱️ Timeframe")
             available_tf = {k: v for k, v in TIMEFRAMES.items() if not v["auth_required"] or auth}
@@ -4729,7 +4736,7 @@ def main():
                         {
                             "Indicator": (name + " *") if flag == 1 else name,
                             "Value": round(val, 4) if pd.notna(val) else None,
-                            "Score Contribution": round(score, 2) if score is not None and pd.notna(score) else "",
+                            "Score Contribution": round(score, 2) if score is not None and pd.notna(score) else None,
                         }
                         for name, val, flag, score in ind_rows
                     ])
@@ -5267,6 +5274,12 @@ def main():
             except Exception as e:
                 st.error(f"Company reports error: {str(e)}")
                 st.info("Database connection may be temporarily unavailable.")
+        elif mode == "📐 Portfolio":
+            try:
+                display_portfolio_builder(fetch_stock_data)
+            except Exception as e:
+                st.error(f"Portfolio error: {str(e)}")
+                st.info("Database or price data source may be temporarily unavailable.")
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
         st.info("Please refresh the page and try again.")
