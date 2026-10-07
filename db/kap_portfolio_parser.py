@@ -81,8 +81,12 @@ def _tr_lower(s):
 # ── Format B (Ata Portföy'de gozlemlendi) ──
 # Ingilizce sayi formati (virgul=binlik, nokta=ondalik) - Format A'nin
 # Turkce formatindan (nokta=binlik, virgul=ondalik) TAM TERSI.
+# Baslik iki varyantta gozlemlendi (AAV, Ata Portföy): eskiden "AAV FON
+# AĞUSTOS 2026 PORTFÖY DAĞILIM RAPORU", Eylül 2026 raporunda "AAV EYLÜL 2026
+# AYLIK PORTFÖY DAĞILIM RAPORU" ("FON" kalkti, "AYLIK" eklendi) - ikisi de
+# "FON " ve "AYLIK " opsiyonel tutularak taniniyor; govde ayni Format B.
 FORMAT_B_TITLE_RE = re.compile(
-    r'^([A-ZÇĞİÖŞÜ0-9]+)\s+FON\s+([A-ZÇĞİÖŞÜ]+)\s+(\d{4})\s+PORTF[ÖO]Y\s+DA[ĞG]ILIM\s+RAPORU',
+    r'^([A-ZÇĞİÖŞÜ0-9]+)\s+(?:FON\s+)?([A-ZÇĞİÖŞÜ]+)\s+(\d{4})\s+(?:AYLIK\s+)?PORTF[ÖO]Y\s+DA[ĞG]ILIM\s+RAPORU',
     re.IGNORECASE,
 )
 FORMAT_B_FON_ADI_RE = re.compile(r'^A\.\s*FONUN ADI\s*:\s*(.+)$', re.IGNORECASE)
