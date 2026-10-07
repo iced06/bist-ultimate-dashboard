@@ -302,6 +302,51 @@ def per_stock_stats(rets: pd.DataFrame, bench: pd.Series | None = None) -> pd.Da
     return pd.DataFrame(rows).set_index("ticker")
 
 
+def universe_stats(rets: pd.DataFrame, bench: pd.Series | None = None, min_obs: int = 30) -> pd.DataFrame:
+    """Evrendeki her hisse için (kendi geçmişiyle, NaN'lar atlanarak) yıllık getiri/
+    bileşik getiri/volatilite/beta/max drawdown. Dönüş: index=ticker."""
+    rows = {}
+    for t in rets.columns:
+        s = rets[t].dropna()
+        if len(s) < min_obs:
+            continue
+        rows[t] = per_stock_stats(s.to_frame(t), bench).loc[t]
+    return pd.DataFrame(rows).T if rows else pd.DataFrame(
+        columns=["ann_return", "cagr", "vol", "beta", "max_dd"])
+
+
+def correlation_embedding(rets: pd.DataFrame, k: int = 3, min_periods: int = 60):
+    """Hisseleri getiri korelasyon yapısından k boyutlu vektörlere gömer (korelasyon
+    matrisinin özayrışımı / PCA): x_i = sqrt(λ_j) · v_ij. Standartlaştırılmış getiri
+    vektörlerinin kosinüsü korelasyona eşit olduğundan x_i · x_j ≈ ρ_ij; iki vektörün
+    arasındaki açı ne kadar küçükse hisseler o kadar benzer hareket eder. Vektör boyu
+    (≤1) k faktörün o hisseyi ne kadar açıkladığını gösterir.
+
+    rets: date x ticker (NaN serbest; çiftler arası korelasyon min_periods ile). Dönüş:
+    (coords DataFrame [F1..Fk], açıklanan varyans oranları[k]). F1 işareti ortak
+    (piyasa) faktörü pozitif olacak şekilde sabitlenir, F2/F3'ün en büyük yükü pozitif."""
+    corr = rets.corr(min_periods=min_periods)
+    ok = corr.notna().sum(axis=1) > 1
+    corr = corr.loc[ok, ok]
+    C = corr.fillna(0.0).values.copy()
+    np.fill_diagonal(C, 1.0)
+    w, V = np.linalg.eigh(C)
+    order = np.argsort(w)[::-1]
+    w, V = np.clip(w[order], 0.0, None), V[:, order]
+    kk = min(k, len(w))
+    coords = np.zeros((len(w), k))
+    coords[:, :kk] = V[:, :kk] * np.sqrt(w[:kk])
+    for j in range(kk):
+        col = coords[:, j]
+        pivot = col.sum() if j == 0 else col[np.argmax(np.abs(col))]
+        if pivot < 0:
+            coords[:, j] = -col
+    total = w.sum()
+    explained = np.zeros(k)
+    explained[:kk] = w[:kk] / total if total > 0 else 0.0
+    return pd.DataFrame(coords, index=corr.index, columns=[f"F{j + 1}" for j in range(k)]), explained
+
+
 def diversification_stats(w, cov, corr: pd.DataFrame) -> dict:
     w = np.asarray(w, dtype=float)
     n = len(w)
