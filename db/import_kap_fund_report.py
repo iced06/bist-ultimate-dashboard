@@ -105,7 +105,7 @@ def _infer_uyruk(isin):
     return 'TC' if isin.startswith('TR') else 'FOR'
 
 
-def _upsert_security(cur, isin, ticker, uyruk):
+def _upsert_security(cur, isin, ticker, uyruk, varlik_sinifi='HISSE_SENEDI'):
     """securities'te isin UNIQUE'dir; (ticker, uyruk) esleme kurali UYRUK'A
     GORE FARKLI (bkz. schema.sql - idx_securities_ticker_uyruk_legacy):
 
@@ -151,9 +151,9 @@ def _upsert_security(cur, isin, ticker, uyruk):
 
     cur.execute("""
         INSERT INTO securities (isin, ticker, uyruk, varlik_sinifi)
-        VALUES (%s, %s, %s, 'HISSE_SENEDI')
+        VALUES (%s, %s, %s, %s)
         RETURNING id
-    """, (isin, ticker, uyruk))
+    """, (isin, ticker, uyruk, varlik_sinifi))
     return cur.fetchone()[0]
 
 
@@ -206,7 +206,7 @@ def import_one(conn, path_or_url, override_fon_kodu=None):
     uyusmadigini kontrol edebilmesi icin."""
     text = _load_pdf_text(path_or_url)
     result = parse_pdf_text(text)
-    holdings = aggregate_by_isin(result, 'HISSE_SENEDI')
+    holdings = aggregate_by_isin(result)  # bolum: result.holdings_section (HISSE_SENEDI, fon sepetinde BYF)
     calculated, printed_total, recon_ok, recon_unit = check_reconciliation(result, holdings)
 
     fon_kodu = override_fon_kodu.strip().upper() if override_fon_kodu else result.fon_kodu
@@ -272,7 +272,8 @@ def import_one(conn, path_or_url, override_fon_kodu=None):
         for h in holdings:
             isin = h['isin']
             uyruk = _infer_uyruk(isin)
-            security_id = _upsert_security(cur, isin, h['ticker'], uyruk)
+            security_id = _upsert_security(cur, isin, h['ticker'], uyruk,
+                                           h.get('varlik_sinifi', 'HISSE_SENEDI'))
 
             cur.execute("""
                 INSERT INTO fund_holdings
@@ -292,6 +293,9 @@ def import_one(conn, path_or_url, override_fon_kodu=None):
     detay = (f"{n_written} hisse yazildi ({result.dialect} sablonu), "
              f"toplam {calculated:.2f}{recon_unit} (PDF: {printed_total}{recon_unit}), "
              f"katilma payi giris/cikis yontemi: {result.katilma_payi_extract_method}")
+    if result.holdings_section == 'BYF':
+        detay += (" | UYARI fonda hisse senedi bolumu yok - BYF/ETF bolumu esas kalem "
+                  "olarak yazildi (varlik_sinifi='FON')")
     if kod_adan_cozuldu:
         detay += f" | fon kodu PDF'te yok, fon adindan cozuldu: {fon_kodu}"
     if result.unmatched_prefix_tokens:

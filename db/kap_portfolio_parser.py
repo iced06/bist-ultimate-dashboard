@@ -267,6 +267,10 @@ class ParseResult:
                           # FARKLI oldugu anlamina gelir, bkz. _detect_number_format)
     reconciliation_metric: str = 'agirlik_pct'  # 'agirlik_pct' | 'toplam_tl' - printed_group_totals
                                                   # neyle kiyaslanmali (dialect'e gore degisir)
+    holdings_section: str = 'HISSE_SENEDI'  # fonun "esas kalemleri"nin geldigi bolum: normalde
+                                              # HISSE_SENEDI; fonda HIC hisse senedi bolumu yoksa
+                                              # ama BYF/ETF varsa (fon sepeti fonlari, bkz.
+                                              # _parse_pdf_text_format_c) 'BYF'
 
 
 def _to_float(s):
@@ -762,6 +766,11 @@ def _classify_section_c(name):
     n = name.strip().upper()
     if n.startswith('HİSSE') or n.startswith('YABANCI HİSSE') or n.startswith('HISSE'):
         return 'HISSE_SENEDI'
+    # "H) BORSA YATIRIM FONU / :" + "ETF" (pdfplumber ikiye boluyor) - Yapı
+    # Kredi Portföy'un Yabancı Fon Sepeti fonunda (YTD) gercek veriyle
+    # yakalandi: portfoyun %94'u yabanci ETF, HIC hisse senedi bolumu yok.
+    if n.startswith('BORSA YATIRIM FON') or n.startswith('BORSA YATIRIM FUND'):
+        return 'BYF'
     return 'DIGER'
 
 
@@ -793,12 +802,12 @@ def _parse_pdf_text_format_c(all_text: str) -> ParseResult:
                 result.printed_group_totals[current_section] = _to_float_en(nums[-1])
             continue
 
-        if current_section != 'HISSE_SENEDI':
+        if current_section not in ('HISSE_SENEDI', 'BYF'):
             continue
 
         isin_match = ISIN_RE.search(line)
         if not isin_match:
-            # HISSE_SENEDI bolumunde ama ISIN yok - sirket adinin devam
+            # HISSE_SENEDI/BYF bolumunde ama ISIN yok - sirket adinin devam
             # satiri (orn. 'Common Stock' tek basina) - sessizce atla.
             continue
         nums = NUM_EN_RE.findall(line)
@@ -822,12 +831,22 @@ def _parse_pdf_text_format_c(all_text: str) -> ParseResult:
             raw_line=line,
         ))
 
+    # Fon sepeti fonlari (orn. YTD): HIC hisse senedi satiri yok ama BYF/ETF
+    # satirlari var -> portfoyun esas kalemleri BYF'dir. Hisse iceren fonlarda
+    # (BYF'si olsa bile) davranis DEGISMEZ: sadece hisse bolumu alinir.
+    if (not any(l.section == 'HISSE_SENEDI' for l in result.lots)
+            and any(l.section == 'BYF' for l in result.lots)):
+        result.holdings_section = 'BYF'
+
     return result
 
 
-def aggregate_by_isin(result: ParseResult, section='HISSE_SENEDI'):
+def aggregate_by_isin(result: ParseResult, section=None):
     """Isim aksine ragmen ISIN'i olmayan (Format B) satirlar icin ticker'a
-    gore de aggregate edebilir - anahtar ISIN varsa ISIN, yoksa ticker'dir."""
+    gore de aggregate edebilir - anahtar ISIN varsa ISIN, yoksa ticker'dir.
+    section verilmezse result.holdings_section (normalde HISSE_SENEDI,
+    fon sepeti fonlarinda BYF) kullanilir."""
+    section = section or result.holdings_section
     agg = {}
     for lot in result.lots:
         if lot.section != section:
@@ -838,6 +857,7 @@ def aggregate_by_isin(result: ParseResult, section='HISSE_SENEDI'):
                 'ticker': lot.ticker, 'isin': lot.isin,
                 'nominal_deger': 0.0, 'toplam_tutar_tl': 0.0,
                 'agirlik_ftd_pct': 0.0, 'lot_sayisi': 0,
+                'varlik_sinifi': 'FON' if lot.section == 'BYF' else 'HISSE_SENEDI',
             }
         agg[key]['nominal_deger'] += lot.nominal_deger
         agg[key]['toplam_tutar_tl'] += lot.toplam_tutar_tl
@@ -850,7 +870,7 @@ def check_reconciliation(result: ParseResult, holdings: list):
     """result.reconciliation_metric'e gore (dialect'e bagli) dogru olcuyu
     secip PDF'in kendi yazdigi toplamla kiyaslar. Donus:
     (hesaplanan, yazili_toplam, ok, olcu_etiketi)."""
-    printed_total = result.printed_group_totals.get('HISSE_SENEDI')
+    printed_total = result.printed_group_totals.get(result.holdings_section)
     if result.reconciliation_metric == 'toplam_tl':
         calculated = sum(h['toplam_tutar_tl'] for h in holdings)
         tol = max(1.0, abs(printed_total or 0) * 0.001)
@@ -872,7 +892,7 @@ if __name__ == '__main__':
     for path in sys.argv[1:]:
         text = _load_pdf_text(path)
         result = parse_pdf_text(text)
-        holdings = aggregate_by_isin(result, 'HISSE_SENEDI')
+        holdings = aggregate_by_isin(result)
         calculated, printed_total, ok, unit = check_reconciliation(result, holdings)
 
         print(f"\n=== {path} ===")
