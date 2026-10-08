@@ -34,6 +34,11 @@ secilir:
     "4 - TOPLAM DEĞERİ TABLOSU > A. FON PORTFÖY DEĞERİ" (butun portfoy, TL);
     reconciliation bu toplamdan hisse DISI kalemler cikarilarak yapilir.
 
+  - Format E (Garanti Portföy; standart SPK "YATIRIM FONLARI PORTFÖY DAĞILIM RAPORU"):
+    baslikta fon KODU yok (fon adindan cozulur), donem "Rapor Dönemi GG/AA/YYYY-GG/AA/YYYY",
+    hisse bolumu "A.PAY", HER ALIM LOTU ayri satir, ISIN var, Ingilizce sayi, yapisik
+    fiyat+tarih / toplam+yuzde; reconciliation "Ana Grup Toplam;" TL toplamina gore.
+
 Bilinen sinirlamalar (readme_findings.md'de detayli):
 - "Tem.Ver." gibi az sayida bilinen on-ek disinda yeni bir on-ek turu
   cikarsa ticker yanlis yakalanabilir -> unmatched_prefix_tokens listesine
@@ -427,6 +432,8 @@ def parse_pdf_text(all_text: str) -> ParseResult:
         result = _parse_pdf_text_format_b(all_text)
     elif _is_format_d(all_text):
         result = _parse_pdf_text_format_d(all_text)
+    elif _is_format_e(all_text):
+        result = _parse_pdf_text_format_e(all_text)
     else:
         # Format C: ilk ~8 dolu satirdan biri "{Ay} {Yil} AYLIK RAPORUDUR"
         # (cok kendine ozgu bir ifade, genis pencerede aransa da guvenli)
@@ -958,6 +965,95 @@ def _parse_pdf_text_format_d(all_text: str) -> ParseResult:
                     agirlik_grup_pct=pct, agirlik_fpd_pct=pct, agirlik_ftd_pct=pct, raw_line=line))
     if printed_total is not None:
         result.printed_group_totals['HISSE_SENEDI'] = printed_total - other_sum
+    return result
+
+
+# ── Format E (Garanti Portföy "YATIRIM FONLARI PORTFÖY DAĞILIM RAPORU" - GHS fonuyla gercek
+# veride yakalandi) ──
+# Standart SPK sablonu: baslikta fon KODU YOK ("YATIRIM FONLARI PORTFÖY DAĞILIM RAPORU" /
+# "Rapor Dönemi 01/09/2026-30/09/2026" / "A. FONUN ADI: ..."), donem tarih araligi (ayin 1'i-son
+# gunu). Hisse bolumu "A.PAY"; her ALIM LOTU ayri satir (cok sayida satir/hisse):
+#   AEFES.E ADI ISIN faiz% 0 nominal <alis_fiyati><alis_tarihi YAPISIK> oran% 0 tutar gunluk_fyt
+#   toplam_deger [grup% toplam%]
+# (alis fiyati ile tarih arasinda BOSLUK YOK: "20.2603.02.2026" = 20.26 + 03.02.2026). Sayilar
+# Ingilizce. Bolum toplami "Ana Grup Toplam; <nominal> <toplam_deger><grup%> <toplam%>" -
+# toplam deger ile grup yuzdesi de YAPISIK ("2,462,156,527.96100.04%"). Yazdirilan yuzdeler 2
+# basamaga yuvarlandigindan (ve bazi satirlarda hic basilmadigindan) agirlik, lot TL tutarinin
+# "FON TOPLAM DEĞERİ"ne bolunmesiyle hesaplanir; reconciliation TL bazli.
+FORMAT_E_TITLE_RE = re.compile(r'^YATIRIM FONLARI PORTF[ÖO]Y DA[ĞG]ILIM RAPORU', re.IGNORECASE)
+FORMAT_E_PERIOD_RE = re.compile(
+    r'Rapor D[öo]nemi\s+(\d{2})/(\d{2})/(\d{4})\s*-\s*(\d{2})/(\d{2})/(\d{4})', re.IGNORECASE)
+FORMAT_E_PAY_RE = re.compile(r'^A\.\s*PAY\b', re.IGNORECASE)
+FORMAT_E_NEXT_SECTION_RE = re.compile(r'^[B-Z]\.\s*[A-ZÇĞİÖŞÜ]')
+FORMAT_E_ROW_RE = re.compile(
+    r'^([A-ZÇĞİÖŞÜ0-9]{2,8})\.([EF])\s+.+?\s+([A-Z]{2}[A-Z0-9]{9}\d)\s+'
+    r'[\d.]+%\s+\d+\s+([\d,]+\.\d+)\s+\S+\s+[\d.]+%\s+\d+\s+-?[\d,]+\.\d+\s+[\d,]+\.\d+\s+'
+    r'(-?[\d,]+\.\d+)(?:\s+(-?[\d.]+)%\s+(-?[\d.]+)%)?\s*$')
+FORMAT_E_GROUP_TOTAL_RE = re.compile(r'^Ana Grup Toplam;\s+([\d,]+\.\d+)\s+([\d,]+\.\d{2})(\d+\.\d{2})%\s+([\d.]+)%')
+FORMAT_E_FON_TOPLAM_RE = re.compile(r'^FON TOPLAM DE[ĞG]ER[İI]:\s*([\d,]+\.\d+)', re.IGNORECASE)
+FORMAT_E_GIRIS_RE = re.compile(r'KATILMA PAYI [İI]HR[ÇC]\.?\s*NAK[İI]T G[İI]R[İI][ŞS]LER[İI]:\s*([\d,]+\.\d+)', re.IGNORECASE)
+FORMAT_E_CIKIS_RE = re.compile(r'KATILMA PAYI [İI]ADE\.?\s*NAK[İI]T [ÇC]IKI[ŞS]LARI:\s*([\d,]+\.\d+)', re.IGNORECASE)
+
+
+def _is_format_e(all_text):
+    head = [l.strip() for l in all_text.split('\n')[:4] if l.strip()]
+    return bool(head and FORMAT_E_TITLE_RE.match(head[0]) and FORMAT_E_PERIOD_RE.search(all_text[:600]))
+
+
+def _parse_pdf_text_format_e(all_text: str) -> ParseResult:
+    result = ParseResult(dialect='E', reconciliation_metric='toplam_tl')
+    m = FORMAT_E_PERIOD_RE.search(all_text[:600])
+    if m:
+        result.donem_yil, result.donem_ay = _period_from_range_match(m)
+    lines = [l.strip() for l in all_text.split('\n')]
+    for line in lines:
+        fm = FORMAT_B_FON_ADI_RE.match(line)
+        if fm:
+            result.fon_adi = fm.group(1).strip()
+            break
+    # fon kodu bu sablonda PDF'te yok -> '' (import_one fon adindan cozer ya da kullanicidan ister)
+    m = FORMAT_E_GIRIS_RE.search(all_text)
+    if m:
+        result.katilma_payi_giris_tl = _to_float_en(m.group(1))
+    m = FORMAT_E_CIKIS_RE.search(all_text)
+    if m:
+        result.katilma_payi_cikis_tl = _to_float_en(m.group(1))
+    result.katilma_payi_extract_method = (
+        'same-line' if result.katilma_payi_giris_tl is not None and result.katilma_payi_cikis_tl is not None
+        else 'UNRESOLVED')
+    fon_toplam = next((_to_float_en(FORMAT_E_FON_TOPLAM_RE.match(l).group(1))
+                       for l in lines if FORMAT_E_FON_TOPLAM_RE.match(l)), None)
+
+    in_pay = False
+    for line in lines:
+        if not line:
+            continue
+        if not in_pay:
+            if FORMAT_E_PAY_RE.match(line):
+                in_pay = True
+            continue
+        gm = FORMAT_E_GROUP_TOTAL_RE.match(line)
+        if gm:
+            result.printed_group_totals['HISSE_SENEDI'] = _to_float_en(gm.group(2))
+            in_pay = False
+            continue
+        if FORMAT_E_NEXT_SECTION_RE.match(line):
+            in_pay = False
+            continue
+        rm = FORMAT_E_ROW_RE.match(line)
+        if not rm:
+            if re.match(r'^[A-ZÇĞİÖŞÜ0-9]{2,8}\.[EF]\s', line):
+                result.unknown_sections.append(line)      # hisse satiri gibi ama kalip tutmadi
+            continue                                       # sayfa alt bilgisi vb.
+        ticker, ext, isin, nominal, toplam, grup_pct, ftd_pct = rm.groups()
+        tl = _to_float_en(toplam)
+        ftd = tl / fon_toplam * 100.0 if fon_toplam else (float(ftd_pct) if ftd_pct else 0.0)
+        result.lots.append(Lot(
+            section='HISSE_SENEDI', ticker=ticker, isin=isin, nominal_deger=_to_float_en(nominal),
+            tarih='', toplam_tutar_tl=tl,
+            agirlik_grup_pct=float(grup_pct) if grup_pct else 0.0,
+            agirlik_fpd_pct=ftd, agirlik_ftd_pct=ftd, raw_line=line,
+            varlik_sinifi='FON' if ext == 'F' else 'HISSE_SENEDI'))
     return result
 
 

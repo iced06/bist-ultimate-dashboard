@@ -183,8 +183,23 @@ def _resolve_fon_kodu_by_name(conn, fon_adi):
         return None
     with conn.cursor() as cur:
         cur.execute("SELECT fon_kodu, fon_adi FROM funds WHERE fon_adi IS NOT NULL")
-        matches = [k for k, a in cur.fetchall() if _normalize_fon_adi(a) == target]
-    return matches[0] if len(matches) == 1 else None
+        rows = cur.fetchall()
+    matches = [k for k, a in rows if _normalize_fon_adi(a) == target]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        # Ikinci sans: parantez ici ekleri ("(TL)", "(HISSE SENEDI YOGUN FON)") PDF ile
+        # funds kaydi arasinda farkli yazilabiliyor (Garanti Portfoy GHS fonunda gercek veriyle
+        # yakalandi: PDF "... HISSE SENEDI (TL) FONU(HISSE SENEDI YOGUN FON)", kayit "... Hisse
+        # Senedi Fonu"). Parantezli kisimlar atilarak yine BIREBIR esitlik aranir; yine SADECE
+        # tam olarak bir eslesme varsa kullanilir.
+        def core(x):
+            return _normalize_fon_adi(re.sub(r'\([^)]*\)', ' ', x or ''))
+        tcore = core(fon_adi)
+        loose = [k for k, a in rows if tcore and core(a) == tcore]
+        if len(loose) == 1:
+            return loose[0]
+    return None
 
 
 def import_one(conn, path_or_url, override_fon_kodu=None):
