@@ -235,9 +235,15 @@ def _render_settings() -> dict:
                              round((rf_def or 0.35) * 100, 1), 0.5, key="pf_rf",
                              help="Varsayılan: TR 2 yıllık tahvil faizi (alınamazsa %35). "
                                   "Sharpe/Sortino bu değere çok duyarlıdır.") / 100.0
+        tilt = 2.0
+        if method == "quality_rp":
+            tilt = st.slider("Kalite eğimi", 0.5, 4.0, 2.0, 0.5, key="pf_tilt",
+                             help="Risk bütçesi ∝ Overall puanı^eğim. 0'a yakın düz risk parity'ye "
+                                  "yaklaşır; yüksek değer iyi puanlı hisselere daha çok risk payı verir.")
         source = st.radio("Ağırlık kaynağı", ["Optimizasyon", "Elle"], horizontal=True,
                           key="pf_wsource")
-    return dict(method=method, lookback=LOOKBACKS[lb_label], max_w=max_w, rf=rf, source=source)
+    return dict(method=method, lookback=LOOKBACKS[lb_label], max_w=max_w, rf=rf, source=source,
+                tilt=tilt)
 
 
 def _render_manual(tickers) -> dict:
@@ -289,12 +295,17 @@ def _analyze(tickers, uni, fetch_fn, s, manual):
             "cagr": "Yıllık getiri % (bileşik)", "vol": "Volatilite %", "beta": "Beta",
             "max_dd": "Max DD %"})}
 
+    overall_of = {t: (_num(uni.loc[t, "overall_puani"]) if t in uni.index else np.nan) for t in names}
+    overall_of = {t: (None if np.isnan(v) else v) for t, v in overall_of.items()}
+
     if s["source"] == "Elle":
         vals = np.array([(manual or {}).get(t, 0.0) for t in names], dtype=float)
         w = vals / vals.sum() if vals.sum() > 0 else np.full(len(names), 1.0 / len(names))
         opt_note, method_label = None, "Elle girilen ağırlıklar"
     else:
-        w, opt_note = pa.optimize_weights(s["method"], mu, cov, s["max_w"], s["rf"])
+        w, opt_note = pa.optimize_weights(s["method"], mu, cov, s["max_w"], s["rf"],
+                                          quality=[overall_of[t] for t in names],
+                                          tilt=s.get("tilt", 2.0))
         method_label = pa.METHODS[s["method"]]
 
     pr = pa.portfolio_return_series(w, returns)
@@ -304,8 +315,6 @@ def _analyze(tickers, uni, fetch_fn, s, manual):
     rc = pa.risk_contributions(w, cov)
     sector_of = {t: (uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"])
                      else UNASSIGNED) for t in names}
-    overall_of = {t: (_num(uni.loc[t, "overall_puani"]) if t in uni.index else np.nan) for t in names}
-    overall_of = {t: (None if np.isnan(v) else v) for t, v in overall_of.items()}
     sect_w: dict = {}
     for t, wi in zip(names, w):
         sect_w[sector_of[t]] = sect_w.get(sector_of[t], 0.0) + wi

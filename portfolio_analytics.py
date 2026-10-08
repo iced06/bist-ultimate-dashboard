@@ -17,6 +17,7 @@ TRADING_DAYS = 252
 
 METHODS = {
     "risk_parity": "Risk parity (eşit risk katkısı)",
+    "quality_rp": "Kalite eğimli risk parity (Overall puanına göre risk bütçesi)",
     "min_var": "Minimum varyans",
     "max_sharpe": "Maksimum Sharpe",
     "inv_vol": "Ters volatilite",
@@ -128,18 +129,20 @@ def _min_variance(cov, cap):
     return _clean(res.x)
 
 
-def _risk_parity(cov, cap):
-    """min 0.5 y'Σy - (1/n) Σ ln y  (dışbükey; çözüm tam eşit risk katkısı verir),
-    sonra normalize. Üst sınır bağlayıcıysa kırpılır (risk katkıları artık tam eşit olmaz)."""
+def _risk_parity(cov, cap, budget=None):
+    """min 0.5 y'Σy - Σ b_i ln y_i  (dışbükey; çözümde risk katkıları b_i ile orantılı),
+    sonra normalize. budget=None → b_i=1/n, yani tam eşit risk katkısı. Üst sınır
+    bağlayıcıysa kırpılır (risk katkıları artık tam b_i'ye uymaz)."""
     n = cov.shape[0]
+    b = np.full(n, 1.0 / n) if budget is None else np.asarray(budget, dtype=float) / np.sum(budget)
     d = np.sqrt(np.diag(cov))
-    y0 = 1.0 / (d * d.sum())
+    y0 = b / (d * d.sum())
 
     def f(y):
-        return 0.5 * y @ cov @ y - np.log(y).sum() / n
+        return 0.5 * y @ cov @ y - (b * np.log(y)).sum()
 
     def g(y):
-        return cov @ y - 1.0 / (n * y)
+        return cov @ y - b / y
 
     res = minimize(f, y0, jac=g, method="L-BFGS-B", bounds=[(1e-10, None)] * n,
                    options={"maxiter": 1000, "ftol": 1e-15, "gtol": 1e-12})
@@ -174,9 +177,25 @@ def _max_sharpe(mu, cov, rf, cap, seed=0):
     return best_w, -best_v
 
 
+def quality_budget(quality, tilt: float = 2.0) -> np.ndarray | None:
+    """Overall puanlarından risk bütçesi: b_i ∝ puan_i^tilt (toplam 1). Puanı olmayan
+    hisse ortalama puanı alır. Hiç puan yoksa None."""
+    q = np.asarray([np.nan if v is None else v for v in quality], dtype=float)
+    ok = np.isfinite(q) & (q > 0)
+    if not ok.any():
+        return None
+    q = np.where(ok, q, q[ok].mean())
+    b = q ** float(tilt)
+    return b / b.sum()
+
+
 def optimize_weights(method: str, mu: np.ndarray, cov: np.ndarray,
-                     max_weight: float = 1.0, rf: float = 0.0):
+                     max_weight: float = 1.0, rf: float = 0.0,
+                     quality=None, tilt: float = 2.0):
     """Long-only ağırlıklar. mu/cov YILLIK. Dönüş: (weights, not).
+
+    quality_rp: risk bütçesi Overall puanıyla orantılı (puan^tilt); quality (hisse
+    başına puan listesi) verilmezse düz risk parity'ye düşülür.
 
     Maksimum Sharpe için tarihsel ortalama getiri çok gürültülü olduğundan mu,
     kesit ortalamasına %50 çekilir (shrinkage). Hiçbir portföyün fazla getirisi
@@ -205,8 +224,19 @@ def optimize_weights(method: str, mu: np.ndarray, cov: np.ndarray,
             note = ((note + " ") if note else "") + (
                 "Üst sınır bağlayıcı oldu; risk katkıları tam eşit değil.")
         return w, note
+    if method == "quality_rp":
+        b = quality_budget(quality, tilt) if quality is not None else None
+        pre = (note + " ") if note else ""
+        if b is None:
+            return _risk_parity(cov, cap), pre + (
+                "Overall puanı bulunamadı; düz Risk parity kullanıldı.")
+        w = _risk_parity(cov, cap, b)
+        if abs(w.max() - cap) < 1e-9:
+            pre += "Üst sınır bağlayıcı oldu; risk bütçesi tam uygulanamadı. "
+        return w, pre + (f"Risk bütçesi Overall puanının {tilt:g}. kuvvetiyle orantılı; "
+                         "yüksek puanlı hisse daha fazla risk payı alır.")
     if method == "max_sharpe":
-        mu_s = 0.5 * mu + 0.5 * mu.mean()
+        mu_s =0.5 * mu + 0.5 * mu.mean()
         w, sharpe = _max_sharpe(mu_s, cov, rf, cap)
         pre = (note + " ") if note else ""
         if sharpe <= 0:
