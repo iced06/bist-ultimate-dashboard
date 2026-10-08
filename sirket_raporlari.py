@@ -1071,7 +1071,9 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis, fi
         sektor_listesi=", ".join(SEKTOR_LISTESI),
         report_text=truncated,
     )
-    response = _call_gemini_with_retry(client, prompt)
+    # Gemini 'thinking' token'lari da max_output_tokens'tan yer: varsayilan 8000, uzun
+    # raporlarda (kullanici: GENIL 18 sayfa) JSON'u yarida kesiyordu -> parse hatasi.
+    response = _call_gemini_with_retry(client, prompt, max_output_tokens=32000)
     raw = response.text
 
     try:
@@ -1089,6 +1091,7 @@ def _summarize_with_gemini(report_text, ticker, donem_label, yil, prior_kpis, fi
             "net_kar_hedefi": None, "net_kar_yonu": "BELIRSIZ",
             "metin_ozeti": "⚠️ *Yapısal KPI çıkarımı başarısız oldu, ham yanıt gösteriliyor:*\n\n" + (raw or ""),
             "_parse_failed": True,  # caller bunu goruyorsa DB'ye KAYDETMEMELI (bozuk veri kalici olmasin)
+            "_diagnostics": _response_diagnostics(response),
         }
 
     if was_truncated:
@@ -1952,7 +1955,8 @@ def display_company_reports(financial_margins=None):
                         # bu bozuk sonucu sonsuza kadar cache'den gosterirdik.
                         st.error("⚠️ Gemini'nin yanıtı yapısal olarak işlenemedi (muhtemelen "
                                  "yanıt yarıda kesildi). Kaydedilmedi — lütfen 'Analiz Et'e "
-                                 "tekrar basmayı dene.")
+                                 "tekrar basmayı dene. Teknik detay: "
+                                 f"{kpis.get('_diagnostics', 'bilgi yok')}")
                         with st.expander("Ham yanıtı gör"):
                             st.text(kpis.get('metin_ozeti', ''))
                     else:
