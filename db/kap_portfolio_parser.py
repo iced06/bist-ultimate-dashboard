@@ -121,6 +121,24 @@ FORMAT_B_SECTION_MAP = {
 }
 
 
+# Format B'nin GOVDESI (harfli "A) HİSSE SENETLERİ", ISIN'siz "TICKER AD nominal rayic %" satirlari,
+# "TOPLAM: <nominal> <rayic>") Oyak Portföy'un OHB fonunda BASLIK FARKLI geldi: ilk satir sadece
+# "EYLÜL 2026" (kod/"PORTFÖY DAĞILIM RAPORU" YOK), fon kodu "A. FONUN ADI : OHB-OYAK Portföy ..."
+# satirinin "KOD-" onekinden okunur. Govde ayni oldugundan Format B parser'i yeniden kullanilir.
+FORMAT_B_ALT_TITLE_RE = re.compile(r'^([A-ZÇĞİÖŞÜ]+)\s+(\d{4})\s*$')
+FORMAT_B_ALT_FONADI_CODE_RE = re.compile(r'^([A-ZÇĞİÖŞÜ0-9]{2,6})\s*-\s*\S')
+
+
+def _is_format_b_alt(all_text):
+    first_line = next((l.strip() for l in all_text.split('\n') if l.strip()), '')
+    m = FORMAT_B_ALT_TITLE_RE.match(first_line)
+    if not m or TURKISH_MONTHS.get(_tr_lower(m.group(1)), 0) == 0:
+        return False
+    head = all_text[:6000]
+    return bool(re.search(r'FON PORTF[ÖO]Y DE[ĞG]ER[İI] TABLOSU', head, re.IGNORECASE)
+                and re.search(r'^\s*A\)\s*H[İI]SSE SENETLER[İI]', all_text, re.IGNORECASE | re.MULTILINE))
+
+
 def _classify_section_b(name):
     """FORMAT_B_SECTION_MAP TAM eslesme arar ama bolum basligi pdfplumber'da
     devam satirina BOLUNEBILIYOR (AAV fonunda gercek veriyle yakalandi:
@@ -428,7 +446,7 @@ def parse_pdf_text(all_text: str) -> ParseResult:
     olup GUVENLI sekilde reddedilecektir (yeni bir dialect eklemek
     gerekecek anlamina gelir)."""
     first_line = next((l for l in all_text.split('\n') if l.strip()), '')
-    if FORMAT_B_TITLE_RE.search(first_line):
+    if FORMAT_B_TITLE_RE.search(first_line) or _is_format_b_alt(all_text):
         result = _parse_pdf_text_format_b(all_text)
     elif _is_format_d(all_text):
         result = _parse_pdf_text_format_d(all_text)
@@ -653,6 +671,14 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
         if m:
             result.fon_adi = m.group(1).strip()
             break
+    if not result.donem_yil:
+        am = FORMAT_B_ALT_TITLE_RE.match(first_line)
+        if am:                                     # "EYLÜL 2026" baslikli varyant (Oyak)
+            result.donem_ay = TURKISH_MONTHS.get(_tr_lower(am.group(1)), 0)
+            result.donem_yil = int(am.group(2))
+            cm = FORMAT_B_ALT_FONADI_CODE_RE.match(result.fon_adi or '')
+            if cm:
+                result.fon_kodu = cm.group(1)
 
     m = giris_re.search(all_text)
     if m:
@@ -666,6 +692,7 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
         result.katilma_payi_extract_method = 'UNRESOLVED'
 
     current_section = 'UNKNOWN'
+    last_lot = None
     for line in lines:
         if not line:
             continue
@@ -673,6 +700,7 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
         sm = FORMAT_B_SECTION_RE.match(line)
         if sm:
             current_section = _classify_section_b(sm.group(2))
+            last_lot = None
             continue
 
         tm = toplam_re.match(line)
@@ -691,7 +719,11 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
             # HISSE_SENEDI bolumunde ama satir kalibi tutmuyor - genelde
             # bir sirket adinin devam satiri (orn. "A.Ş" tek basina) -
             # sessizce atla, bu Format A'daki "ISIN yok -> atla" ile ayni
-            # mantik.
+            # mantik. Devam satiri "... YATIRIM FONU" diyorsa (orn. Oyak OHB'de ZPX30:
+            # "...HİSSE SENEDİ" / "YOĞUN BORSA YATIRIM FONU") onceki kalem hisse degil
+            # borsa yatirim fonudur - varlik sinifi 'FON' olarak isaretlenir.
+            if last_lot is not None and re.search(r'YATIRIM FONU', line, re.IGNORECASE):
+                last_lot.varlik_sinifi = 'FON'
             continue
 
         ticker, nominal_s, rayic_s, pct_s = rm.groups()
@@ -711,6 +743,20 @@ def _parse_pdf_text_format_b(all_text: str) -> ParseResult:
             agirlik_ftd_pct=pct_val,
             raw_line=line,
         ))
+        last_lot = result.lots[-1]
+
+    # "EYLÜL 2026" baslikli varyantta (Oyak OHB) basilan % FON PORTFÖY DEĞERİ'ne (brut portfoy,
+    # fon toplam degerinin %97,6'si) gore; diger dialect'lerle tutarli olmasi icin agirlik,
+    # "FON TOPLAM DEĞERİ"ne gore TL'den yeniden hesaplanir.
+    if FORMAT_B_ALT_TITLE_RE.match(first_line):
+        for line in lines:
+            fm = re.match(r'^FON TOPLAM DE[ĞG]ER[İI]\s+(-?[\d.,]+)\s*$', line, re.IGNORECASE)
+            if fm:
+                ft = to_float(fm.group(1))
+                if ft > 0:
+                    for lot in result.lots:
+                        lot.agirlik_grup_pct = lot.agirlik_fpd_pct = lot.agirlik_ftd_pct =                             lot.toplam_tutar_tl / ft * 100.0
+                break
 
     return result
 
