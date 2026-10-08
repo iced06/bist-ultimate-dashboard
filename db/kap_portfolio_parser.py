@@ -27,6 +27,13 @@ secilir:
     "TOPLAM <nominal> <rayic> <yuzde>" satirinda (bkz. FORMAT_C
     sabitlerinin ustundeki detayli not).
 
+  - Format D (Ziraat Portföy "Katılım" fonlari, eski numarali KAP sablonu:
+    "1 - FONU TANITICI BİLGİLER" / "3 - FON PORTFÖY DEĞERİ TABLOSU"): hisse
+    satirlari "N TICKER.E ADI nominal rayic oran(%) birim_alis" (ISIN YOK, ticker
+    ".E"/".F" uzantili), Turkce sayi formati, bolum toplam satiri YOK - tek toplam
+    "4 - TOPLAM DEĞERİ TABLOSU > A. FON PORTFÖY DEĞERİ" (butun portfoy, TL);
+    reconciliation bu toplamdan hisse DISI kalemler cikarilarak yapilir.
+
 Bilinen sinirlamalar (readme_findings.md'de detayli):
 - "Tem.Ver." gibi az sayida bilinen on-ek disinda yeni bir on-ek turu
   cikarsa ticker yanlis yakalanabilir -> unmatched_prefix_tokens listesine
@@ -249,6 +256,8 @@ class Lot:
     agirlik_fpd_pct: float
     agirlik_ftd_pct: float
     raw_line: str
+    varlik_sinifi: str = None  # None -> bolumden turetilir (bkz. aggregate_by_isin); Format D'de
+                               # ".F" (fon) uzantili kalemler 'FON' olarak isaretlenir
 
 
 @dataclass
@@ -416,6 +425,8 @@ def parse_pdf_text(all_text: str) -> ParseResult:
     first_line = next((l for l in all_text.split('\n') if l.strip()), '')
     if FORMAT_B_TITLE_RE.search(first_line):
         result = _parse_pdf_text_format_b(all_text)
+    elif _is_format_d(all_text):
+        result = _parse_pdf_text_format_d(all_text)
     else:
         # Format C: ilk ~8 dolu satirdan biri "{Ay} {Yil} AYLIK RAPORUDUR"
         # (cok kendine ozgu bir ifade, genis pencerede aransa da guvenli)
@@ -845,6 +856,111 @@ def _parse_pdf_text_format_c(all_text: str) -> ParseResult:
     return result
 
 
+# ── Format D (Ziraat Portföy "Katılım" fonlari - ZPE fonuyla gercek veride yakalandi) ──
+# Eski, numarali KAP sablonu. Hisse satirlari ISIN'siz ve ticker'a ".E" (hisse) / ".F" (fon,
+# orn. BIST30 BYF) uzantisi ekli: "1 ALBRK.E ALBARAKA TÜRK 1.500.926,032 12.457.686,07
+# 1,076626 7,644" (sira ticker ad nominal rayic oran(%) birim_alis_fiyati). Sayilar Turkce.
+# Bolum basliklari "A - HİSSE SENETLERİ İhraçcı Nominal Rayiç Değer Oran (%) ..." tek satirda;
+# alt gruplar ("1. Banka İştirak ve Hissedarları") noktali numara. Bolumun KENDI toplam satiri
+# YOK; PDF'in yazdigi tek toplam "4 - TOPLAM DEĞERİ TABLOSU" altindaki "A. FON PORTFÖY
+# DEĞERİ <TL> <% FTD>" (fon DEGERI > %100 olabilir: borclar - orn. pay geri alis borcu -
+# dusulmeden onceki brut portfoy). Reconciliation: bu toplamdan hisse DISI satirlarin
+# (katilim hesabi vb.) rayic toplami cikarilir; geri kalan hisse bolumunun yazili toplami
+# sayilir - hisse+diger satirlarin HEPSI dogru okunduysa esitlik tutar.
+FORMAT_D_MARK_RE = re.compile(r'1\s*-\s*FONU TANITICI B[İI]LG[İI]LER', re.IGNORECASE)
+FORMAT_D_PORTFOY_RE = re.compile(r'FON PORTF[ÖO]Y DE[ĞG]ER[İI] TABLOSU', re.IGNORECASE)
+FORMAT_D_SECTION_RE = re.compile(
+    r'^([A-ZÇĞİÖŞÜ]{1,2})\s*-\s*(.+?)\s+İhraçcı\s+Nominal\s+Rayiç\s+Değer\s+Oran', re.IGNORECASE)
+FORMAT_D_ENDSECTION_RE = re.compile(r'^4\s*-\s*TOPLAM DE[ĞG]ER[İI] TABLOSU', re.IGNORECASE)
+_TRN = r'-?\d{1,3}(?:\.\d{3})*,\d+'
+FORMAT_D_STOCK_RE = re.compile(
+    rf'^\d+\s+([A-ZÇĞİÖŞÜ0-9]{{2,8}})\.([EF])\s+(.+?)\s+({_TRN})\s+({_TRN})\s+({_TRN})\s+({_TRN})\s*$')
+# hisse disi satir: "<vade/tarih> <ad> <nominal> <rayic> <oran>" - son iki sayi rayic ve oran
+FORMAT_D_OTHER_RE = re.compile(rf'^.*?\s+(-?[\d.]+(?:,\d+)?)\s+({_TRN})\s+({_TRN})\s*$')
+FORMAT_D_TOPLAM_RE = re.compile(rf'^A\.\s*FON PORTF[ÖO]Y DE[ĞG]ER[İI]\s+({_TRN})\s+({_TRN})\s*$',
+                                re.IGNORECASE)
+FORMAT_D_FONADI_RE = re.compile(r'^A\s*-\s*FONUN ADI\s*:\s*(.+)$', re.IGNORECASE)
+
+
+def _is_format_d(all_text):
+    return bool(FORMAT_D_MARK_RE.search(all_text[:4000]) and FORMAT_D_PORTFOY_RE.search(all_text))
+
+
+def _parse_pdf_text_format_d(all_text: str) -> ParseResult:
+    result = ParseResult(dialect='D', reconciliation_metric='toplam_tl')
+    result.fon_kodu, result.fon_adi, result.donem_yil, result.donem_ay = _parse_header(all_text)
+    lines = [l.strip() for l in all_text.split('\n')]
+    for line in lines:
+        m = FORMAT_D_FONADI_RE.match(line)
+        if m:
+            result.fon_adi = m.group(1).strip()
+            break
+
+    m = FORMAT_B_GIRIS_RE_TR.search(all_text)
+    if m:
+        result.katilma_payi_giris_tl = _to_float(m.group(1))
+    m = FORMAT_B_CIKIS_RE_TR.search(all_text)
+    if m:
+        result.katilma_payi_cikis_tl = _to_float(m.group(1))
+    result.katilma_payi_extract_method = (
+        'same-line' if result.katilma_payi_giris_tl is not None and result.katilma_payi_cikis_tl is not None
+        else 'UNRESOLVED')
+
+    in_table = False
+    current = 'UNKNOWN'
+    other_sum = 0.0
+    printed_total = None
+    for line in lines:
+        if not line:
+            continue
+        if re.match(r'^3\s*-', line) and FORMAT_D_PORTFOY_RE.search(line):
+            in_table = True
+            continue
+        if FORMAT_D_ENDSECTION_RE.match(line):
+            in_table = False
+            continue
+        tm = FORMAT_D_TOPLAM_RE.match(line)
+        if tm:
+            printed_total = _to_float(tm.group(1))
+            continue
+        if not in_table:
+            continue
+        sm = FORMAT_D_SECTION_RE.match(line)
+        if sm:
+            name = sm.group(2).strip().upper()
+            current = 'HISSE_SENEDI' if name.startswith('HİSSE') or name.startswith('HISSE') else 'DIGER'
+            continue
+        if re.match(r'^\d\.\s', line):          # "1. Banka İştirak ..." alt grup basligi
+            continue
+        if current == 'HISSE_SENEDI':
+            sm = FORMAT_D_STOCK_RE.match(line)
+            if sm:
+                ticker, ext, _name, nominal, rayic, oran, _alis = sm.groups()
+                pct = _to_float(oran)
+                result.lots.append(Lot(
+                    section='HISSE_SENEDI', ticker=ticker, isin=None, nominal_deger=_to_float(nominal),
+                    tarih='', toplam_tutar_tl=_to_float(rayic),
+                    agirlik_grup_pct=pct, agirlik_fpd_pct=pct, agirlik_ftd_pct=pct, raw_line=line,
+                    varlik_sinifi='FON' if ext == 'F' else 'HISSE_SENEDI'))
+            elif FORMAT_D_OTHER_RE.match(line):
+                result.unknown_sections.append(line)   # hisse bolumunde taninmayan veri satiri
+            continue
+        if current == 'DIGER':
+            om = FORMAT_D_OTHER_RE.match(line)
+            if om:
+                tl = _to_float(om.group(2))
+                other_sum += tl
+                pct = _to_float(om.group(3))
+                parts = line.split()
+                result.lots.append(Lot(
+                    section='DIGER', ticker=parts[1] if len(parts) > 1 else '', isin=None,
+                    nominal_deger=0.0, tarih='', toplam_tutar_tl=tl,
+                    agirlik_grup_pct=pct, agirlik_fpd_pct=pct, agirlik_ftd_pct=pct, raw_line=line))
+    if printed_total is not None:
+        result.printed_group_totals['HISSE_SENEDI'] = printed_total - other_sum
+    return result
+
+
 def aggregate_by_isin(result: ParseResult, section=None):
     """Isim aksine ragmen ISIN'i olmayan (Format B) satirlar icin ticker'a
     gore de aggregate edebilir - anahtar ISIN varsa ISIN, yoksa ticker'dir.
@@ -861,7 +977,7 @@ def aggregate_by_isin(result: ParseResult, section=None):
                 'ticker': lot.ticker, 'isin': lot.isin,
                 'nominal_deger': 0.0, 'toplam_tutar_tl': 0.0,
                 'agirlik_ftd_pct': 0.0, 'lot_sayisi': 0,
-                'varlik_sinifi': 'FON' if lot.section == 'BYF' else 'HISSE_SENEDI',
+                'varlik_sinifi': lot.varlik_sinifi or ('FON' if lot.section == 'BYF' else 'HISSE_SENEDI'),
             }
         agg[key]['nominal_deger'] += lot.nominal_deger
         agg[key]['toplam_tutar_tl'] += lot.toplam_tutar_tl
