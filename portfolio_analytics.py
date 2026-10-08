@@ -393,7 +393,10 @@ def correlation_embedding(rets: pd.DataFrame, k: int = 3, min_periods: int = 60)
     rets: date x ticker (NaN serbest; çiftler arası korelasyon min_periods ile). Dönüş:
     (coords DataFrame [F1..Fk], açıklanan varyans oranları[k]). F1 işareti ortak
     (piyasa) faktörü pozitif olacak şekilde sabitlenir, F2/F3'ün en büyük yükü pozitif."""
-    corr = rets.corr(min_periods=min_periods)
+    return _embed_from_corr(rets.corr(min_periods=min_periods), k)
+
+
+def _embed_from_corr(corr: pd.DataFrame, k: int = 3):
     ok = corr.notna().sum(axis=1) > 1
     corr = corr.loc[ok, ok]
     C = corr.fillna(0.0).values.copy()
@@ -499,6 +502,162 @@ def health_score(*, n: int, avg_corr: float, eff_n: float, max_weight: float,
     else:
         label = "Zayıf"
     return {"total": float(total), "label": label, "subs": subs}
+
+
+# ───────────────────────── zaman boyutu ─────────────────────────
+
+def time_grid(n_rows: int, window: int, step: int) -> list[int]:
+    """Kayan pencere / yeniden dengeleme için ortak bitiş indeksleri (artan). Her bitiş
+    indeksi e için pencere rets.iloc[e-window+1 : e+1]; son indeks her zaman n_rows-1
+    (bugün). Animasyon kareleri ve walk-forward ağırlıkları aynı ızgarayı kullanır."""
+    if n_rows < window:
+        return []
+    return sorted(range(n_rows - 1, window - 2, -step))
+
+
+def procrustes_rotation(X: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """||X Q - ref|| en küçük olacak dik (yansımaya izinli) Q. Her pencerenin PCA eksenleri
+    keyfi döndüğünden, kareleri birbirine hizalamak için kullanılır."""
+    U, _, Vt = np.linalg.svd(X.T @ ref)
+    return U @ Vt
+
+
+def rolling_embedding(rets: pd.DataFrame, window: int, step: int, k: int = 3,
+                      min_frac: float = 0.6) -> dict:
+    """Kayan pencerelerde korelasyon gömmesi, kareler arası Procrustes hizalamasıyla.
+
+    En son kare kanonik yönelimdedir (statik haritayla aynı işaret kuralı); öncekiler
+    sırayla bir sonraki (daha yeni) kareye hizalanır, böylece zamanda hareket gerçek
+    korelasyon değişimini gösterir. Pencerede gözlemlerinin en az min_frac'i olmayan
+    hisseler o kareden çıkar. Dönüş: dict(ends[int], dates[Timestamp], pos[DataFrame F1..Fk],
+    explained[array], avg_corr[float]) - hepsi kronolojik."""
+    ends = time_grid(len(rets), window, step)
+    min_obs = max(30, int(min_frac * window))
+    frames = []
+    for e in ends:
+        win = rets.iloc[e - window + 1: e + 1]
+        win = win.loc[:, win.notna().sum() >= min_obs]
+        if win.shape[1] < 3:
+            frames.append((e, pd.DataFrame(columns=[f"F{j + 1}" for j in range(k)], dtype=float),
+                           np.zeros(k), float("nan")))
+            continue
+        corr = win.corr(min_periods=min_obs)
+        coords, expl = _embed_from_corr(corr, k)
+        c = corr.loc[coords.index, coords.index].values
+        iu = np.triu_indices(len(c), 1)
+        avg = float(np.nanmean(c[iu])) if len(iu[0]) else float("nan")
+        frames.append((e, coords, expl, avg))
+    # sondan başa hizala
+    for i in range(len(frames) - 2, -1, -1):
+        e, cur, expl, avg = frames[i]
+        ref = frames[i + 1][1]
+        common = cur.index.intersection(ref.index)
+        if len(common) >= 4:
+            Q = procrustes_rotation(cur.loc[common].values, ref.loc[common].values)
+            cur = pd.DataFrame(cur.values @ Q, index=cur.index, columns=cur.columns)
+        frames[i] = (e, cur, expl, avg)
+    return dict(ends=[f[0] for f in frames], dates=[rets.index[f[0]] for f in frames],
+                pos=[f[1] for f in frames], explained=[f[2] for f in frames],
+                avg_corr=[f[3] for f in frames])
+
+
+def walk_forward(rets: pd.DataFrame, ends: list[int], window: int, method: str,
+                 max_weight: float = 1.0, rf: float = 0.0, quality=None, tilt: float = 2.0,
+                 mom_tilt: float = 0.0, manual=None, cost: float = 0.0) -> dict:
+    """Geriye dönük test: her bitiş indeksinde (yalnızca o güne kadarki veriyle) ağırlık
+    hesaplanır ve sonraki bitişe kadar tutulur (aradaki dönemde ağırlıklar fiyatla kayar).
+
+    quality: rets.columns sırasında Overall puanları (None=yok); manual: {ticker: ağırlık}
+    verilirse optimizasyon yerine her dönem bu oranlar (uygun hisseler üzerinden) kullanılır.
+    cost: işlem başına tek yön maliyet (ondalık; 0.001 = %0.1), işlem hacmi Σ|Δw| üzerinden.
+    Pencerede eksiksiz verisi olmayan hisse o dönem dışarıda kalır (ağırlık 0).
+    Dönüş: dict(weights[DataFrame, indeks=bitiş tarihi], port[Series günlük getiri],
+    turnover[Series tek yön], cost_paid[Series], notes[list])."""
+    cols = list(rets.columns)
+    qual = None if quality is None else np.asarray(
+        [np.nan if v is None else v for v in quality], dtype=float)
+    W = pd.DataFrame(0.0, index=[rets.index[e] for e in ends], columns=cols)
+    port_parts, turnover, cost_paid, notes = [], {}, {}, []
+    drifted = pd.Series(0.0, index=cols)      # önceki dönem sonundaki kaymış ağırlıklar
+    for j, e in enumerate(ends):
+        win = rets.iloc[e - window + 1: e + 1]
+        elig = [c for c in cols if win[c].notna().all()]
+        if len(elig) == 0:
+            notes.append(f"{rets.index[e].date()}: uygun hisse yok, nakitte kalındı.")
+            w_new = pd.Series(0.0, index=cols)
+        else:
+            sub = win[elig]
+            if len(elig) == 1:
+                w_el = np.array([1.0])
+            elif manual is not None:
+                v = np.array([max(float(manual.get(c, 0.0)), 0.0) for c in elig])
+                w_el = v / v.sum() if v.sum() > 0 else np.full(len(elig), 1.0 / len(elig))
+            else:
+                cov_d, _ = ledoit_wolf_cov(sub.values)
+                cov, mu = cov_d * TRADING_DAYS, sub.mean().values * TRADING_DAYS
+                q = None if qual is None else [qual[cols.index(c)] for c in elig]
+                mom = momentum_scores(sub).values if mom_tilt > 0 else None
+                w_el, _ = optimize_weights(method, mu, cov, max_weight, rf, quality=q,
+                                           tilt=tilt, momentum=mom, mom_tilt=mom_tilt)
+            w_new = pd.Series(0.0, index=cols)
+            w_new[elig] = w_el
+        W.iloc[j] = w_new.values
+        trade = float((w_new - drifted).abs().sum())
+        turnover[rets.index[e]] = trade / 2.0
+        cost_paid[rets.index[e]] = trade * cost
+        if j == len(ends) - 1:
+            break
+        hold = rets.iloc[e + 1: ends[j + 1] + 1].fillna(0.0)
+        growth = (1.0 + hold.values).cumprod(axis=0)
+        wv = w_new.values
+        V = growth @ wv
+        if V.sum() == 0 or wv.sum() == 0:
+            pr = np.zeros(len(hold))
+            drifted = w_new
+        else:
+            prev = np.concatenate([[1.0], V[:-1]])
+            pr = V / prev - 1.0
+            drifted = pd.Series(wv * growth[-1] / V[-1], index=cols)
+        pr = pr.copy()
+        pr[0] = (1.0 + pr[0]) * (1.0 - trade * cost) - 1.0
+        port_parts.append(pd.Series(pr, index=hold.index))
+    port = pd.concat(port_parts) if port_parts else pd.Series(dtype=float)
+    return dict(weights=W, port=port, turnover=pd.Series(turnover), cost_paid=pd.Series(cost_paid),
+                notes=notes)
+
+
+def health_over_time(rets: pd.DataFrame, ends: list[int], window: int, weights: pd.DataFrame,
+                     sector_of: dict, overall_of: dict) -> pd.DataFrame:
+    """Her bitiş tarihinde (walk-forward ağırlıklarıyla, o günkü pencere verisiyle)
+    portföy sağlık skoru. Dönüş: index=tarih, kolonlar: total, avg_corr, eff_n, vol, max_dd."""
+    rows = {}
+    for j, e in enumerate(ends):
+        w = weights.iloc[j]
+        held = [c for c in weights.columns if w[c] > 1e-9]
+        if len(held) < 2:
+            continue
+        sub = rets.iloc[e - window + 1: e + 1][held]
+        if sub.isna().any().any():
+            continue
+        wv = (w[held] / w[held].sum()).values
+        cov = ledoit_wolf_cov(sub.values)[0] * TRADING_DAYS
+        ds = diversification_stats(wv, cov, sub.corr())
+        pr = portfolio_return_series(wv, sub)
+        cum = np.cumprod(1.0 + pr.values)
+        vol = float(pr.std(ddof=1) * np.sqrt(TRADING_DAYS))
+        mdd = float(-_drawdown(cum).min())
+        sec: dict = {}
+        for c, x in zip(held, wv):
+            sec[sector_of.get(c)] = sec.get(sector_of.get(c), 0.0) + x
+        have = [c for c in held if overall_of.get(c) is not None]
+        quality = (sum(overall_of[c] * wv[held.index(c)] for c in have) /
+                   sum(wv[held.index(c)] for c in have)) if have else None
+        h = health_score(n=len(held), avg_corr=ds["avg_corr"], eff_n=ds["eff_n"],
+                         max_weight=ds["max_weight"], top_sector_share=max(sec.values()),
+                         vol=vol, max_dd=mdd, quality=quality)
+        rows[weights.index[j]] = dict(total=h["total"], avg_corr=ds["avg_corr"], eff_n=ds["eff_n"],
+                                      vol=vol, max_dd=mdd)
+    return pd.DataFrame(rows).T
 
 
 # ───────────────────────── öneri: çeşitlendirici adaylar ─────────────────────────

@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import portfolio_analytics as pa
+import portfoy_store as store
 from sirket_raporlari import (
     DONEM_LABELS,
     get_available_periods_for_rollup,
@@ -76,9 +77,213 @@ def _to_calendar(prices: pd.DataFrame, cal: pd.DatetimeIndex) -> pd.DataFrame:
 def _do_update():
     """🔄 Güncelle: Company Reports ve fiyat önbelleklerini temizler."""
     for fn in (get_reports_for_period, get_sector_rollup, get_available_periods_for_rollup,
-               _load_close_prices, _default_rf):
+               _load_close_prices, _default_rf, _saved_portfolios):
         fn.clear()
     st.session_state["pf_update_requested"] = True
+
+
+# ───────────────────────── kayıtlı (sabit) portföy ─────────────────────────
+
+PLACEHOLDER = "— kayıtlı portföy seç —"
+SETTING_KEYS = ("pf_method", "pf_lookback", "pf_maxw", "pf_tilt", "pf_mom_tilt", "pf_wsource")
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _saved_portfolios():
+    """(ok, [portföyler] | hata). Yazma işlemlerinden ve 🔄 Güncelle'den sonra temizlenir."""
+    return store.list_portfolios()
+
+
+def _valid_setting(key, v):
+    if key == "pf_method":
+        return v in pa.METHODS
+    if key == "pf_lookback":
+        return v in LOOKBACKS
+    if key == "pf_maxw":
+        return isinstance(v, (int, float)) and 10 <= v <= 100
+    if key == "pf_tilt":
+        return isinstance(v, (int, float)) and 0 <= v <= 4
+    if key == "pf_mom_tilt":
+        return isinstance(v, (int, float)) and 0 <= v <= 3
+    if key == "pf_wsource":
+        return v in ("Optimizasyon", "Elle")
+    return False
+
+
+def _current_settings() -> dict:
+    """Ağırlık ayarları (widget'ların o anki değerleri); henüz çizilmemiş olanlar atlanır."""
+    ss = st.session_state
+    return {k: ss[k] for k in SETTING_KEYS if k in ss and _valid_setting(k, ss[k])}
+
+
+def _snapshot(tickers, settings) -> dict:
+    return {"tickers": sorted(set(tickers)), "settings": dict(settings)}
+
+
+def _msg(kind, text):
+    st.session_state["pf_store_msg"] = (kind, text)
+
+
+def _apply_portfolio(p):
+    """Kayıtlı portföyü sepete ve ayarlara yükler (widget'lar çizilmeden önce çağrılmalı:
+    callback içinde ya da sayfa başında)."""
+    ss = st.session_state
+    ss["pf_basket"] = list(p["tickers"])
+    _bump()
+    for k, v in (p.get("settings") or {}).items():
+        if k in SETTING_KEYS and _valid_setting(k, v):
+            ss[k] = v
+    ss["pf_active"] = p["name"]
+    ss["pf_saved_sel"] = p["name"]
+    ss["pf_snapshot"] = _snapshot(p["tickers"], p.get("settings") or {})
+
+
+def _find_saved(name):
+    ok, rows = _saved_portfolios()
+    return next((r for r in rows if r["name"] == name), None) if ok else None
+
+
+def _on_pick():
+    name = st.session_state.get("pf_saved_sel")
+    if name == PLACEHOLDER:
+        st.session_state["pf_active"] = None
+        st.session_state.pop("pf_snapshot", None)
+        return
+    p = _find_saved(name)
+    if p:
+        _apply_portfolio(p)
+        _msg("ok", f"'{name}' yüklendi ({len(p['tickers'])} hisse).")
+
+
+def _save_active():
+    ss = st.session_state
+    name, tickers, sett = ss.get("pf_active"), list(_basket()), _current_settings()
+    ok, res = store.save_portfolio(name, tickers, sett, overwrite=True)
+    if ok:
+        ss["pf_snapshot"] = _snapshot(tickers, sett)
+        _saved_portfolios.clear()
+        _msg("ok", f"'{name}' güncellendi ({len(tickers)} hisse).")
+    else:
+        _msg("err", res)
+
+
+def _save_as():
+    ss = st.session_state
+    name, tickers, sett = ss.get("pf_save_name", ""), list(_basket()), _current_settings()
+    ok, res = store.save_portfolio(name, tickers, sett, overwrite=False)
+    if ok:
+        ss["pf_active"], ss["pf_saved_sel"] = res, res
+        ss["pf_snapshot"] = _snapshot(tickers, sett)
+        ss["pf_save_name"] = ""
+        _saved_portfolios.clear()
+        _msg("ok", f"'{res}' kaydedildi ({len(tickers)} hisse).")
+    else:
+        _msg("err", res)
+
+
+def _ask_delete(flag):
+    st.session_state["pf_confirm_del"] = flag
+
+
+def _delete_active():
+    ss = st.session_state
+    name = ss.get("pf_active")
+    ok, res = store.delete_portfolio(name)
+    ss["pf_confirm_del"] = False
+    if ok:
+        ss["pf_active"], ss["pf_saved_sel"] = None, PLACEHOLDER
+        ss.pop("pf_snapshot", None)
+        _saved_portfolios.clear()
+        _msg("ok", f"'{name}' silindi. Sepet olduğu gibi duruyor.")
+    else:
+        _msg("err", res)
+
+
+def _toggle_default():
+    ss = st.session_state
+    ok, res = store.set_default(ss.get("pf_active") if ss.get("pf_is_default") else None)
+    _saved_portfolios.clear()
+    if not ok:
+        _msg("err", res)
+
+
+def _autoload_default():
+    """Oturumun ilk çalışmasında, sepet boşsa varsayılan kayıtlı portföyü yükler."""
+    ss = st.session_state
+    if ss.get("pf_autoloaded"):
+        return
+    ss["pf_autoloaded"] = True
+    if ss.get("pf_basket"):
+        return
+    ok, rows = _saved_portfolios()
+    d = next((r for r in rows if r["is_default"]), None) if ok else None
+    if d:
+        _apply_portfolio(d)
+        _msg("ok", f"Varsayılan portföy yüklendi: '{d['name']}' ({len(d['tickers'])} hisse).")
+
+
+def _render_saved_portfolio():
+    """Sağ sütundaki kayıtlı portföy kontrolleri: seç/yükle, güncelle, farklı kaydet, sil."""
+    ss = st.session_state
+    st.markdown("#### 💾 Kayıtlı portföy")
+    if ss.get("pf_store_msg"):
+        kind, text = ss.pop("pf_store_msg")
+        (st.success if kind == "ok" else st.error)(text)
+    ok, rows = _saved_portfolios()
+    if not ok:
+        st.caption("⚠️ Kayıtlı portföyler kullanılamıyor: " + str(rows))
+        return
+    names = [r["name"] for r in rows]
+    active = ss.get("pf_active")
+    if active not in names:
+        active = ss["pf_active"] = None
+    if ss.get("pf_saved_sel") not in [PLACEHOLDER] + names:
+        ss["pf_saved_sel"] = active or PLACEHOLDER
+    st.selectbox("Portföy", [PLACEHOLDER] + names, key="pf_saved_sel", on_change=_on_pick,
+                 label_visibility="collapsed")
+    basket = list(_basket())
+    if active:
+        saved = _find_saved(active)
+        snap = ss.get("pf_snapshot") or _snapshot(saved["tickers"], saved["settings"])
+        added = [t for t in basket if t not in snap["tickers"]]
+        removed = [t for t in snap["tickers"] if t not in basket]
+        cur = _current_settings()
+        changed_settings = [k for k in cur if k in snap["settings"] and cur[k] != snap["settings"][k]]
+        dirty = bool(added or removed or changed_settings)
+        if dirty:
+            bits = ([f"➕ {', '.join(added)}"] if added else []) + \
+                   ([f"➖ {', '.join(removed)}"] if removed else [])
+            if changed_settings:
+                bits.append("⚙️ ayarlar")
+            st.caption("● Kaydedilmemiş değişiklik: " + " · ".join(bits))
+        else:
+            st.caption(f"✅ **{active}** güncel ({len(basket)} hisse).")
+        st.button("💾 Güncelle", key="pf_save_btn", on_click=_save_active,
+                  disabled=not dirty or not basket, type="primary" if dirty else "secondary",
+                  use_container_width=True)
+        ss["pf_is_default"] = bool(saved and saved["is_default"])
+        st.checkbox("⭐ Açılışta bu portföy gelsin", key="pf_is_default", on_change=_toggle_default)
+        if ss.get("pf_autosave") and dirty and basket:
+            _save_active()
+            st.rerun()
+    with st.expander("➕ Farklı kaydet / ⚙️ yönet"):
+        st.text_input("Yeni portföy adı", key="pf_save_name", max_chars=store.NAME_MAX,
+                      placeholder="örn. Çekirdek portföy")
+        st.button("➕ Sepeti bu adla kaydet", key="pf_saveas_btn", on_click=_save_as,
+                  disabled=not basket or not ss.get("pf_save_name", "").strip(),
+                  use_container_width=True)
+        if active:
+            st.toggle("Değişiklikleri otomatik kaydet", key="pf_autosave",
+                      help="Açıkken sepete hisse ekleyip çıkardığında aktif portföy kendiliğinden "
+                           "güncellenir.")
+            if not ss.get("pf_confirm_del"):
+                st.button("🗑️ Bu portföyü sil", key="pf_del_btn", on_click=_ask_delete, args=(True,),
+                          use_container_width=True)
+            else:
+                st.warning(f"'{active}' kalıcı olarak silinecek (sepet etkilenmez).")
+                c1, c2 = st.columns(2)
+                c1.button("Evet, sil", key="pf_del_yes", on_click=_delete_active, type="primary")
+                c2.button("Vazgeç", key="pf_del_no", on_click=_ask_delete, args=(False,))
 
 
 # ───────────────────────── sepet ─────────────────────────
@@ -228,8 +433,10 @@ def _render_settings() -> dict:
         c1, c2, c3, c4 = st.columns(4)
         method = c1.selectbox("Ağırlık yöntemi", list(pa.METHODS), format_func=pa.METHODS.get,
                               key="pf_method")
-        lb_label = c2.selectbox("Geriye bakış", list(LOOKBACKS), index=1, key="pf_lookback")
-        max_w = c3.slider("Hisse başına üst sınır %", 10, 100, 40, 5, key="pf_maxw") / 100.0
+        st.session_state.setdefault("pf_lookback", "1 yıl")
+        st.session_state.setdefault("pf_maxw", 40)
+        lb_label = c2.selectbox("Geriye bakış", list(LOOKBACKS), key="pf_lookback")
+        max_w = c3.slider("Hisse başına üst sınır %", 10, 100, step=5, key="pf_maxw") / 100.0
         rf_def = _default_rf()
         rf = c4.number_input("Risksiz faiz % (yıllık)", 0.0, 150.0,
                              round((rf_def or 0.35) * 100, 1), 0.5, key="pf_rf",
@@ -238,10 +445,12 @@ def _render_settings() -> dict:
         tilt, mom_tilt = 2.0, 0.0
         if method == "quality_rp":
             t1, t2 = st.columns(2)
-            tilt = t1.slider("Kalite eğimi", 0.0, 4.0, 2.0, 0.5, key="pf_tilt",
+            st.session_state.setdefault("pf_tilt", 2.0)
+            st.session_state.setdefault("pf_mom_tilt", 1.0)
+            tilt = t1.slider("Kalite eğimi", 0.0, 4.0, step=0.5, key="pf_tilt",
                              help="Risk bütçesi ∝ Overall puanı^eğim. 0 = kalite etkisiz; "
                                   "yüksek değer iyi puanlı hisselere daha çok risk payı verir.")
-            mom_tilt = t2.slider("Momentum eğimi", 0.0, 3.0, 1.0, 0.5, key="pf_mom_tilt",
+            mom_tilt = t2.slider("Momentum eğimi", 0.0, 3.0, step=0.5, key="pf_mom_tilt",
                                  help="Geriye bakış penceresindeki getiriye göre (son 1 ay hariç) "
                                       "sıralanır; risk bütçesi ∝ (0.5 + yüzdelik sıra)^eğim. "
                                       "0 = momentum etkisiz. Geçmiş getiri geleceği garanti etmez.")
@@ -334,7 +543,8 @@ def _analyze(tickers, uni, fetch_fn, s, manual):
     return dict(names=names, returns=returns, bench_ret=bench_ret, cov=cov, mu=mu, shrink=shrink,
                 w=w, method_label=method_label, opt_note=opt_note, stats=stats, pr=pr, m=m,
                 corr=corr, ds=ds, rc=rc, sector_of=sector_of, overall_of=overall_of, health=health,
-                dropped=dropped, failed=failed, lookback=lookback, start=start, cal=cal, s=s)
+                dropped=dropped, failed=failed, lookback=lookback, start=start, cal=cal, s=s,
+                manual=manual)
 
 
 def _render_results(a, uni, universe_tickers, fetch_fn):
@@ -645,6 +855,402 @@ def _render_map(a, uni, sector_score, universe_tickers, fetch_fn):
     st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG, key="pf_map_chart")
 
 
+# ───────────────────────── zaman yolculuğu & walk-forward ─────────────────────────
+
+TIME_STEPS = {"Aylık (21 gün)": 21, "3 aylık (63 gün)": 63}
+TIME_YEARS = {"1 yıl": 1, "2 yıl": 2, "3 yıl": 3}
+TRAIL_FRAMES = 5
+PRESET_LABELS = ["Eşit ağırlık", "Risk parity", "Minimum varyans", "Ters volatilite",
+                 "Maksimum Sharpe", "Kalite eğimli RP", "Momentum eğimli RP", "Kalite + momentum RP"]
+PRESET_DEFAULT = ["Eşit ağırlık", "Risk parity", "Kalite + momentum RP"]
+
+
+def _df_sig(df: pd.DataFrame, *extra) -> str:
+    """Önbellek anahtarı: kolonlar + şekil + ilk/son tarih (+ ekstra parametreler)."""
+    h = hashlib.md5()
+    h.update(",".join(map(str, df.columns)).encode())
+    h.update(f"{df.shape}|{df.index[0]}|{df.index[-1]}".encode())
+    for e in extra:
+        h.update(repr(e).encode())
+    return h.hexdigest()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_embedding(_urets, sig, window, step):
+    return pa.rolling_embedding(_urets, window, step)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_walk(_rets, sig, window, step, method, max_w, rf, quality, tilt, mom_tilt, manual, cost):
+    ends = pa.time_grid(len(_rets), window, step)
+    return pa.walk_forward(_rets, ends, window, method, max_w, rf,
+                           quality=list(quality) if quality is not None else None,
+                           tilt=tilt, mom_tilt=mom_tilt,
+                           manual=dict(manual) if manual else None, cost=cost)
+
+
+def _time_data(universe_tickers, window, years, fetch_fn):
+    """Zaman bölümü için uzun fiyat geçmişi: (evren getirileri, XU100 getirisi) ya da None."""
+    total = window + years * 252 + 5
+    start, bench_px = _market_window(total, fetch_fn)
+    uprices, _ = _load_close_prices(tuple(sorted(universe_tickers)), start, fetch_fn)
+    if uprices.empty:
+        return None
+    cal = (bench_px.index if bench_px is not None else uprices.index)[-(total + 1):]
+    up = _to_calendar(uprices, cal)
+    urets = (up / up.shift(1) - 1.0).iloc[1:].replace([np.inf, -np.inf], np.nan)
+    urets = urets.loc[:, urets.notna().sum() >= int(0.6 * window)]
+    bench_ret = ((bench_px / bench_px.shift(1) - 1.0).reindex(urets.index)
+                 if bench_px is not None else None)
+    return urets, bench_ret
+
+
+def _method_specs(s, manual) -> dict:
+    """Karşılaştırılacak yöntemler: etiket -> parametre dict'i. İlk giriş ayarlardaki yöntemdir."""
+    is_q = s["method"] == "quality_rp"
+    t = s.get("tilt", 2.0) if is_q else 2.0
+    m = s.get("mom_tilt", 1.0) if is_q else 1.0
+    if s["source"] == "Elle":
+        primary = ("▶ Elle girilen ağırlıklar (her dönem aynı oranlar)",
+                   dict(method="equal", manual=dict(manual or {})))
+    else:
+        primary = ("▶ " + pa.METHODS[s["method"]],
+                   dict(method=s["method"], tilt=t if is_q else 2.0, mom_tilt=m if is_q else 0.0))
+    presets = {
+        "Eşit ağırlık": dict(method="equal"),
+        "Risk parity": dict(method="risk_parity"),
+        "Minimum varyans": dict(method="min_var"),
+        "Ters volatilite": dict(method="inv_vol"),
+        "Maksimum Sharpe": dict(method="max_sharpe"),
+        "Kalite eğimli RP": dict(method="quality_rp", tilt=t, mom_tilt=0.0),
+        "Momentum eğimli RP": dict(method="quality_rp", tilt=0.0, mom_tilt=m),
+        "Kalite + momentum RP": dict(method="quality_rp", tilt=t, mom_tilt=m),
+    }
+    return primary, presets
+
+
+def _spec_key(sp):
+    q = sp["method"] == "quality_rp"
+    return (sp["method"], sp.get("tilt", 2.0) if q else None, sp.get("mom_tilt", 0.0) if q else None,
+            tuple(sorted(sp["manual"].items())) if sp.get("manual") else None)
+
+
+def _time_figure(tf, basket, W, health, bench_dd, uni, trail=TRAIL_FRAMES, height=900):
+    """Animasyonlu 3D korelasyon haritası + altında nabız şeridi (aynı zaman imleci)."""
+    from plotly.subplots import make_subplots
+    dates, pos = tf["dates"], tf["pos"]
+    n = len(dates)
+    all_t = sorted({t for p in pos for t in p.index} | set(basket))
+    others = [t for t in all_t if t not in basket]
+    nb = len(basket)
+    palette = pcolors.qualitative.D3
+    sec_of = {t: (uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"])
+                  else UNASSIGNED) for t in all_t}
+    color_of = {s: palette[i % len(palette)] for i, s in enumerate(sorted(set(sec_of.values())))}
+
+    def hover(t):
+        ov = _num(uni.loc[t, "overall_puani"]) if t in uni.index else np.nan
+        return f"<b>{t}</b><br>{sec_of[t]}" + ("" if np.isnan(ov) else f"<br>Overall {ov:.1f}/5")
+
+    def xyz(i, tickers):
+        p = pos[i].reindex(tickers)
+        return p["F1"].values, p["F2"].values, p["F3"].values
+
+    def port_vec(i):
+        w = W.iloc[i]
+        held = [t for t in basket if t in w.index and w[t] > 1e-9 and t in pos[i].index]
+        if not held:
+            return (np.nan, np.nan, np.nan)
+        wv = w[held].values / w[held].sum()
+        v = (pos[i].loc[held].values * wv[:, None]).sum(axis=0)
+        return tuple(v)
+
+    pvecs = [port_vec(i) for i in range(n)]
+    lo, hi = float(np.nanmin(health["avg_corr"].tolist() + tf["avg_corr"])), \
+        float(np.nanmax(health["avg_corr"].tolist() + tf["avg_corr"]))
+    pad = 0.05 * max(hi - lo, 0.1)
+    c_lo, c_hi = lo - pad, hi + pad
+
+    def dyn(i):
+        """Karenin dinamik izleri (fig.data'daki ilk 4+nb+1 iz + 2 imleç) için veri."""
+        out = []
+        ox, oy, oz = xyz(i, others)
+        out.append(dict(x=ox, y=oy, z=oz))
+        bx, by, bz = xyz(i, basket)
+        vx, vy, vz = [], [], []
+        for k in range(nb):
+            vx += [0, bx[k], None]
+            vy += [0, by[k], None]
+            vz += [0, bz[k], None]
+        out.append(dict(x=vx, y=vy, z=vz))
+        w = W.iloc[i]
+        out.append(dict(x=bx, y=by, z=bz,
+                        marker=dict(size=[min(18, 7 + 40 * float(w.get(t, 0.0))) for t in basket])))
+        p = pvecs[i]
+        out.append(dict(x=[0, p[0]], y=[0, p[1]], z=[0, p[2]]))
+        rng_i = range(max(0, i - trail), i + 1)
+        for t in basket:
+            tx, ty, tz = [], [], []
+            for r in rng_i:
+                if t in pos[r].index:
+                    tx.append(pos[r].loc[t, "F1"]); ty.append(pos[r].loc[t, "F2"]); tz.append(pos[r].loc[t, "F3"])
+            out.append(dict(x=tx, y=ty, z=tz))
+        out.append(dict(x=[pvecs[r][0] for r in rng_i], y=[pvecs[r][1] for r in rng_i],
+                        z=[pvecs[r][2] for r in rng_i]))
+        d = dates[i]
+        out.append(dict(x=[d, d], y=[c_lo, c_hi]))
+        out.append(dict(x=[d, d], y=[0, 100]))
+        return out
+
+    # eksen aralıkları: tüm karelerdeki konumlardan (başlangıç noktası dahil); aspectmode="data"
+    # ile birim uzunluk her eksende aynı kalır, böylece vektörler arası açı bozulmaz
+    allpos = pd.concat([p for p in pos if len(p)] + [pd.DataFrame([[0.0, 0.0, 0.0]],
+                                                                   columns=["F1", "F2", "F3"])])
+    rngs = {c: [float(allpos[c].min()) - 0.08, float(allpos[c].max()) + 0.08] for c in ("F1", "F2", "F3")}
+    fig = make_subplots(rows=3, cols=1, row_heights=[0.7, 0.15, 0.15], vertical_spacing=0.06,
+                        specs=[[{"type": "scene"}], [{"type": "xy", "secondary_y": True}],
+                               [{"type": "xy"}]])
+    d0 = dyn(n - 1)
+    # 3D izler (sıra önemli: dyn() ile aynı)
+    fig.add_trace(go.Scatter3d(mode="markers", name="Evren", hoverinfo="text",
+                               hovertext=[hover(t) for t in others],
+                               marker=dict(size=3.5, opacity=0.4,
+                                           color=[color_of[sec_of[t]] for t in others]), **d0[0]),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter3d(mode="lines", name="Vektörler", hoverinfo="skip",
+                               line=dict(width=4, color="rgba(200,200,200,0.6)"), **d0[1]),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter3d(mode="markers+text", name="Seçili", text=basket,
+                               textposition="top center", hoverinfo="text",
+                               hovertext=[hover(t) for t in basket],
+                               marker=dict(color=[color_of[sec_of[t]] for t in basket], opacity=1.0,
+                                           line=dict(width=2, color="white"),
+                                           size=d0[2]["marker"]["size"]),
+                               x=d0[2]["x"], y=d0[2]["y"], z=d0[2]["z"]), row=1, col=1)
+    fig.add_trace(go.Scatter3d(mode="lines+markers", name="Portföy", hoverinfo="skip",
+                               line=dict(width=9, color="gold"),
+                               marker=dict(size=[1, 10], color="gold", symbol="diamond"), **d0[3]),
+                  row=1, col=1)
+    for k, t in enumerate(basket):
+        fig.add_trace(go.Scatter3d(mode="lines", name=f"İz {t}", hoverinfo="skip",
+                                   line=dict(width=4, color=color_of[sec_of[t]]), opacity=0.6,
+                                   **d0[4 + k]), row=1, col=1)
+    fig.add_trace(go.Scatter3d(mode="lines", name="Portföy izi", hoverinfo="skip", opacity=0.6,
+                               line=dict(width=6, color="gold"), **d0[4 + nb]), row=1, col=1)
+    n_dyn3d = 5 + nb
+    # statik şerit izleri
+    fig.add_trace(go.Scatter(x=dates, y=tf["avg_corr"], name="Evren ort. korelasyon",
+                             line=dict(color="#4C9BE8", width=2)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=list(health.index), y=health["avg_corr"], name="Portföy ort. korelasyon",
+                             line=dict(color="gold", width=2)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=bench_dd, name="XU100 tepeden düşüş %", fill="tozeroy",
+                             line=dict(color="rgba(230,80,80,0.6)", width=1),
+                             fillcolor="rgba(230,80,80,0.18)"), row=2, col=1, secondary_y=True)
+    fig.add_trace(go.Scatter(x=list(health.index), y=health["total"], name="Sağlık skoru",
+                             line=dict(color="#6FCF97", width=2.5)), row=3, col=1)
+    cur2 = len(fig.data)
+    fig.add_trace(go.Scatter(x=d0[n_dyn3d]["x"], y=d0[n_dyn3d]["y"], mode="lines", showlegend=False,
+                             hoverinfo="skip", line=dict(color="white", width=1.5, dash="dot")),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(x=d0[n_dyn3d + 1]["x"], y=d0[n_dyn3d + 1]["y"], mode="lines",
+                             showlegend=False, hoverinfo="skip",
+                             line=dict(color="white", width=1.5, dash="dot")), row=3, col=1)
+    for tr in fig.data[:n_dyn3d]:
+        tr.showlegend = False
+    dyn_idx = list(range(n_dyn3d)) + [cur2, cur2 + 1]
+    fig.frames = [go.Frame(name=str(i), data=[go.Scatter3d(**d) if j < n_dyn3d else go.Scatter(**d)
+                                              for j, d in enumerate(dyn(i))], traces=dyn_idx)
+                  for i in range(n)]
+    anim = dict(frame=dict(duration=550, redraw=True), transition=dict(duration=0), fromcurrent=True)
+    fig.update_layout(
+        height=height, margin=dict(l=0, r=0, t=80, b=70), uirevision="pf3d_time",
+        legend=dict(orientation="h", y=-0.07, x=0.0, font=dict(size=10)),
+        scene=dict(xaxis=dict(title="Faktör 1 · piyasa", range=rngs["F1"]),
+                   yaxis=dict(title="Faktör 2", range=rngs["F2"]),
+                   zaxis=dict(title="Faktör 3", range=rngs["F3"]), aspectmode="data",
+                   camera=dict(eye=dict(x=1.0, y=1.0, z=0.7))),
+        updatemenus=[dict(type="buttons", direction="left", x=0.0, y=1.11, xanchor="left",
+                          yanchor="top", showactive=False,
+                          buttons=[dict(label="▶ Oynat", method="animate", args=[None, anim]),
+                                   dict(label="⏸ Durdur", method="animate",
+                                        args=[[None], dict(mode="immediate", frame=dict(duration=0, redraw=False),
+                                                           transition=dict(duration=0))])])],
+        sliders=[dict(active=n - 1, x=0.2, len=0.8, y=1.12, yanchor="top", pad=dict(t=0, b=0),
+                      currentvalue=dict(prefix="Tarih: ", xanchor="left"),
+                      steps=[dict(method="animate", label=pd.Timestamp(d).strftime("%Y-%m"),
+                                  args=[[str(i)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
+                                                       transition=dict(duration=0))])
+                             for i, d in enumerate(dates)])])
+    fig.update_yaxes(title_text="Ort. korelasyon", range=[c_lo, c_hi], row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="XU100 düşüş %", row=2, col=1, secondary_y=True, showgrid=False,
+                     rangemode="tozero", autorange="reversed")
+    fig.update_yaxes(title_text="Sağlık", range=[0, 100], row=3, col=1)
+    return fig
+
+
+def _render_time_section(a, uni, universe_tickers, fetch_fn):
+    st.markdown("---")
+    st.markdown('<div id="pf-time"></div>', unsafe_allow_html=True)
+    st.markdown("### ⏳ Zaman yolculuğu ve geriye dönük test")
+    if not st.toggle("Zaman bölümünü aç", key="pf_time_on",
+                     help="Daha uzun fiyat geçmişi yükler (ilk açılışta 1-2 dk; sonra 1 saat önbellekte)."):
+        st.caption("Korelasyon haritasını zamanda oynatır, portföy sağlığının geçmişini gösterir ve "
+                   "ağırlık yöntemlerini aylık yeniden dengeleme ile geriye dönük karşılaştırır.")
+        return
+    s, window = a["s"], a["lookback"]
+    c1, c2, c3 = st.columns(3)
+    step_label = c1.selectbox("Adım / yeniden dengeleme", list(TIME_STEPS), key="pf_time_step")
+    years_label = c2.selectbox("Test süresi", list(TIME_YEARS), index=1, key="pf_time_years")
+    cost_bp = c3.number_input("İşlem maliyeti (bp, taraf başı)", 0, 200, 10, 5, key="pf_time_cost",
+                              help="Her yeniden dengelemede alınıp satılan tutar × bu oran kesilir "
+                                   "(10 bp = %0.1).")
+    step, years = TIME_STEPS[step_label], TIME_YEARS[years_label]
+    with st.spinner("Uzun fiyat geçmişi yükleniyor (ilk seferde 1-2 dk)..."):
+        data = _time_data(universe_tickers, window, years, fetch_fn)
+    if data is None:
+        st.warning("Evren fiyatları alınamadı.")
+        return
+    urets, bench_ret = data
+    basket = [t for t in _basket() if t in urets.columns]
+    ends = pa.time_grid(len(urets), window, step)
+    if len(ends) < 3:
+        st.warning("Bu geriye bakış ve adım için yeterli geçmiş yok; test süresini artır veya "
+                   "geriye bakışı kısalt.")
+        return
+    if len(basket) < 2:
+        st.info("Zaman analizi için sepette, geçmişi yeterli en az 2 hisse olmalı.")
+        return
+    skipped = [t for t in _basket() if t not in urets.columns]
+    if skipped:
+        st.caption("Geçmişi yetersiz, testte olmayan hisseler: " + ", ".join(skipped))
+    st.caption(f"Pencere = ayarlardaki geriye bakış ({window} gün) · {len(ends)} kare "
+               f"({pd.Timestamp(urets.index[ends[0]]).date()} → {pd.Timestamp(urets.index[ends[-1]]).date()}) · "
+               "her karedeki ağırlık yalnızca o güne kadarki veriyle hesaplanır.")
+
+    # ── yöntem karşılaştırması ──
+    primary, presets = _method_specs(s, a.get("manual"))
+    chosen = st.multiselect("Karşılaştırılacak yöntemler (ayardaki yöntem her zaman dahil)",
+                            PRESET_LABELS, default=PRESET_DEFAULT, key="pf_time_methods")
+    specs: dict = {primary[0]: primary[1]}
+    seen = {_spec_key(primary[1])}
+    for lab in chosen:
+        k = _spec_key(presets[lab])
+        if k not in seen:
+            seen.add(k)
+            specs[lab] = presets[lab]
+
+    sub = urets[basket]
+    sig = _df_sig(sub)
+    overall = tuple(_num(uni.loc[t, "overall_puani"]) if t in uni.index else np.nan for t in basket)
+    results, errs = {}, []
+    with st.spinner(f"Geriye dönük test hesaplanıyor ({len(specs)} yöntem)..."):
+        for lab, sp in specs.items():
+            try:
+                results[lab] = _cached_walk(
+                    sub, sig, window, step, sp["method"], s["max_w"], s["rf"], overall,
+                    sp.get("tilt", 2.0), sp.get("mom_tilt", 0.0),
+                    tuple(sorted(sp["manual"].items())) if sp.get("manual") else None, cost_bp / 1e4)
+            except Exception as e:                              # tek yöntem hatası diğerlerini bozmasın
+                errs.append(f"{lab}: {e}")
+    for e in errs:
+        st.warning("Hesaplanamadı — " + e)
+    if not results:
+        return
+    first_label = next(iter(results))
+    res0 = results[first_label]
+
+    # ── getiri eğrileri + tablo ──
+    t0, t1 = res0["port"].index[0], res0["port"].index[-1]
+    st.markdown(f"#### 📈 Geriye dönük sonuç ({t0.date()} → {t1.date()})")
+    eq = go.Figure()
+    palette = pcolors.qualitative.Safe
+    for i, (lab, r) in enumerate(results.items()):
+        cum = 100.0 * (1.0 + r["port"]).cumprod()
+        eq.add_trace(go.Scatter(x=cum.index, y=cum.values, name=lab, mode="lines",
+                                line=dict(width=3.5 if i == 0 else 1.8, color=palette[i % len(palette)])))
+    bser = None
+    if bench_ret is not None:
+        bser = bench_ret.reindex(res0["port"].index).fillna(0.0)
+        bc = 100.0 * (1.0 + bser).cumprod()
+        eq.add_trace(go.Scatter(x=bc.index, y=bc.values, name="XU100", mode="lines",
+                                line=dict(width=2, color="gray", dash="dot")))
+    eq.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="Değer (başlangıç=100)",
+                     legend=dict(orientation="h", y=-0.2))
+    st.plotly_chart(eq, use_container_width=True, config=PLOTLY_CFG, key="pf_time_equity")
+
+    rows = []
+    for lab, r in results.items():
+        m = pa.portfolio_metrics(r["port"], bench_ret, s["rf"])
+        ann_turn = (r["turnover"].iloc[1:].mean() * 252.0 / step) if len(r["turnover"]) > 1 else np.nan
+        sp = specs[lab]
+        look = sp["method"] == "quality_rp" and sp.get("tilt", 0.0) > 0
+        rows.append({"Yöntem": lab, "Yıllık getiri % (bileşik)": m["cagr"] * 100, "Volatilite %": m["vol"] * 100,
+                     "Sharpe": m["sharpe"], "Sortino": m["sortino"], "Max DD %": m["max_dd"] * 100,
+                     "Beta": m["beta"], "Yıllık devir %": ann_turn * 100,
+                     "Toplam maliyet %": float(r["cost_paid"].iloc[:-1].sum()) * 100,
+                     "Bitiş (100 →)": 100.0 * (1 + m["total_return"]),
+                     "Not": "⚠️ ileriye bakış" if look else ""})
+    if bser is not None:
+        mb = pa.portfolio_metrics(bser, None, s["rf"])
+        rows.append({"Yöntem": "XU100 (endeks)", "Yıllık getiri % (bileşik)": mb["cagr"] * 100,
+                     "Volatilite %": mb["vol"] * 100, "Sharpe": mb["sharpe"], "Sortino": mb["sortino"],
+                     "Max DD %": mb["max_dd"] * 100, "Beta": 1.0, "Yıllık devir %": np.nan,
+                     "Toplam maliyet %": np.nan, "Bitiş (100 →)": 100.0 * (1 + mb["total_return"]), "Not": ""})
+    st.dataframe(pd.DataFrame(rows).set_index("Yöntem").round(2), use_container_width=True)
+    warns = ["Sepeti **bugün** seçtin: geçmişte iyi görünmesi seçim yanlılığıdır, geleceği garanti etmez.",
+             f"Maliyet: taraf başı {cost_bp} bp uygulandı; vergi/kayma yok. Sharpe/Sortino risksiz faiz "
+             f"%{s['rf'] * 100:.1f} ile hesaplandı."]
+    if any(sp["method"] == "quality_rp" and sp.get("tilt", 0.0) > 0 for sp in specs.values()):
+        warns.append("⚠️ **Kalite eğimi ileriye bakış yanlılığı taşır:** veritabanında tek rapor dönemi "
+                     "olduğundan güncel Overall puanları tüm geçmişe uygulanıyor; o dönemde bu puanlar "
+                     "bilinmiyordu. Momentum ve risk parity için bu sorun yok.")
+    for w_ in warns:
+        st.caption("• " + w_)
+
+    # ── ağırlıkların zamanla değişimi (ayardaki yöntem) ──
+    st.markdown(f"#### ⚖️ Ağırlıklar zamanla — {first_label.lstrip('▶ ')}")
+    W = res0["weights"]
+    sec_of = {t: (uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"]) else UNASSIGNED)
+              for t in basket}
+    wf = go.Figure()
+    for i, t in enumerate(basket):
+        wf.add_trace(go.Scatter(x=W.index, y=W[t] * 100, name=t, mode="lines", stackgroup="w",
+                                line=dict(width=0.5, shape="hv"),
+                                hovertemplate=f"{t} ({sec_of[t]}): %{{y:.1f}}%<extra></extra>"))
+    wf.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="Ağırlık %",
+                     yaxis_range=[0, 100], legend=dict(orientation="h", y=-0.25))
+    st.plotly_chart(wf, use_container_width=True, config=PLOTLY_CFG, key="pf_time_weights")
+    st.caption(f"Yıllık ortalama devir: %{res0['turnover'].iloc[1:].mean() * 252.0 / step * 100:.0f} "
+               "(tek yön). Ağırlıkların sıçraması yöntemin kararsızlığını, yumuşak akışı kararlılığını gösterir.")
+    for note in res0["notes"]:
+        st.caption("• " + note)
+
+    # ── animasyon + nabız şeridi ──
+    st.markdown("#### 🎞️ Korelasyon haritası zamanda")
+    with st.spinner("Kayan pencere haritası hesaplanıyor..."):
+        tf = _cached_embedding(urets, _df_sig(urets, window, step), window, step)
+        sector_of = {t: (uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"])
+                         else UNASSIGNED) for t in basket}
+        overall_of = {t: (None if np.isnan(v) else v) for t, v in zip(basket, overall)}
+        health = pa.health_over_time(sub, ends, window, W, sector_of, overall_of)
+        if bench_ret is not None:
+            bcum = (1.0 + bench_ret.fillna(0.0)).cumprod()
+            bench_dd = ((bcum / bcum.cummax() - 1.0) * 100.0).iloc[ends].values
+        else:
+            bench_dd = np.full(len(ends), np.nan)
+    if health.empty:
+        st.info("Portföy sağlığı hesaplanamadı (uygun pencere yok).")
+        return
+    health = health.reindex(tf["dates"])
+    fig = _time_figure(tf, basket, W, health, bench_dd, uni)
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG, key="pf_time_chart")
+    st.caption("▶ ile oynat ya da çubuğu sürükle. Altın vektör o tarihteki walk-forward portföyüdür; "
+               "kuyruklu izler son birkaç karenin yolunu gösterir. Stres dönemlerinde (kırmızı alan: "
+               "XU100 düşüşü) ortalama korelasyon yükselir ve bulut tek faktöre doğru büzülür. "
+               "Eksenler kareler arası hizalanmıştır (Procrustes), bu yüzden hareket gerçek "
+               "korelasyon değişimidir.")
+
+
 # ───────────────────────── ana giriş ─────────────────────────
 
 def display_portfolio_builder(fetch_fn):
@@ -691,6 +1297,7 @@ def display_portfolio_builder(fetch_fn):
             msg += " Yeni eklenen hisse yok."
         st.success(msg)
     known[(yil, donem)] = current
+    _autoload_default()
 
     ver = st.session_state.get("pf_ver", 0)
     basket = list(_basket())
@@ -734,9 +1341,11 @@ def display_portfolio_builder(fetch_fn):
     with right:
         _render_map(analysis if analysis and "names" in analysis else None, uni, sector_score,
                     list(uni.index), fetch_fn)
+        _render_saved_portfolio()
         _render_basket_panel(uni)
 
     # 4) portföy sonuçları
     if analysis and "names" in analysis:
         with box:
             _render_results(analysis, uni, list(uni.index), fetch_fn)
+            _render_time_section(analysis, uni, list(uni.index), fetch_fn)
