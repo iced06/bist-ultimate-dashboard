@@ -17,7 +17,7 @@ TRADING_DAYS = 252
 
 METHODS = {
     "risk_parity": "Risk parity (eşit risk katkısı)",
-    "quality_rp": "Kalite eğimli risk parity (Overall puanına göre risk bütçesi)",
+    "quality_rp": "Eğimli risk parity (kalite + momentum)",
     "min_var": "Minimum varyans",
     "max_sharpe": "Maksimum Sharpe",
     "inv_vol": "Ters volatilite",
@@ -189,13 +189,34 @@ def quality_budget(quality, tilt: float = 2.0) -> np.ndarray | None:
     return b / b.sum()
 
 
+def momentum_scores(rets: pd.DataFrame, skip: int = 21, min_window: int = 126) -> pd.Series:
+    """Hisse başına momentum: penceredeki kümülatif getiri; pencere min_window'dan
+    uzunsa son `skip` gün atlanır (12-1 mantığı, kısa vadeli geri dönüş etkisini yok sayar)."""
+    r = rets.iloc[:-skip] if len(rets) >= min_window + skip else rets
+    return (1.0 + r).prod() - 1.0
+
+
+def momentum_budget(momentum, tilt: float = 1.0) -> np.ndarray | None:
+    """Momentum sırasından risk çarpanı: (0.5 + yüzdelik sıra)^tilt, yüzdelik sıra 0-1
+    (en zayıf 0, en güçlü 1). Sıra kullanıldığı için aykırı getirilere dayanıklıdır.
+    Verisi olmayan hisse orta sırayı alır. Hiç veri yoksa None."""
+    m = pd.Series([np.nan if v is None else v for v in momentum], dtype=float)
+    if not m.notna().any():
+        return None
+    n = len(m)
+    p = m.rank(method="average").sub(1.0).div(max(n - 1, 1)).fillna(0.5).values
+    return (0.5 + p) ** float(tilt)
+
+
 def optimize_weights(method: str, mu: np.ndarray, cov: np.ndarray,
                      max_weight: float = 1.0, rf: float = 0.0,
-                     quality=None, tilt: float = 2.0):
+                     quality=None, tilt: float = 2.0,
+                     momentum=None, mom_tilt: float = 0.0):
     """Long-only ağırlıklar. mu/cov YILLIK. Dönüş: (weights, not).
 
-    quality_rp: risk bütçesi Overall puanıyla orantılı (puan^tilt); quality (hisse
-    başına puan listesi) verilmezse düz risk parity'ye düşülür.
+    quality_rp (eğimli risk parity): risk bütçesi Overall puanı^tilt ile momentum
+    sırası^mom_tilt çarpımıyla orantılı. Hiçbir eğim uygulanamazsa (puan/momentum
+    yok ya da eğimler 0) düz risk parity'ye düşülür.
 
     Maksimum Sharpe için tarihsel ortalama getiri çok gürültülü olduğundan mu,
     kesit ortalamasına %50 çekilir (shrinkage). Hiçbir portföyün fazla getirisi
@@ -225,18 +246,35 @@ def optimize_weights(method: str, mu: np.ndarray, cov: np.ndarray,
                 "Üst sınır bağlayıcı oldu; risk katkıları tam eşit değil.")
         return w, note
     if method == "quality_rp":
-        b = quality_budget(quality, tilt) if quality is not None else None
         pre = (note + " ") if note else ""
-        if b is None:
-            return _risk_parity(cov, cap), pre + (
-                "Overall puanı bulunamadı; düz Risk parity kullanıldı.")
+        b = np.ones(n)
+        parts = []
+        missing = []
+        if tilt > 0:
+            qb = quality_budget(quality, tilt) if quality is not None else None
+            if qb is None:
+                missing.append("Overall puanı")
+            else:
+                b = b * qb * n
+                parts.append(f"Overall puanının {tilt:g}. kuvveti")
+        if mom_tilt > 0:
+            mb = momentum_budget(momentum, mom_tilt) if momentum is not None else None
+            if mb is None:
+                missing.append("momentum")
+            else:
+                b = b * mb
+                parts.append(f"momentum sırasının {mom_tilt:g}. kuvveti")
+        if missing:
+            pre += f"{' ve '.join(missing).capitalize()} bulunamadı; o eğim uygulanmadı. "
+        if not parts:
+            return _risk_parity(cov, cap), pre + "Eğim uygulanamadı; düz Risk parity kullanıldı."
         w = _risk_parity(cov, cap, b)
         if abs(w.max() - cap) < 1e-9:
             pre += "Üst sınır bağlayıcı oldu; risk bütçesi tam uygulanamadı. "
-        return w, pre + (f"Risk bütçesi Overall puanının {tilt:g}. kuvvetiyle orantılı; "
-                         "yüksek puanlı hisse daha fazla risk payı alır.")
+        return w, pre + ("Risk bütçesi " + " × ".join(parts) + " ile orantılı; yüksek puanlı / "
+                         "güçlü momentumlu hisse daha fazla risk payı alır.")
     if method == "max_sharpe":
-        mu_s =0.5 * mu + 0.5 * mu.mean()
+        mu_s = 0.5 * mu + 0.5 * mu.mean()
         w, sharpe = _max_sharpe(mu_s, cov, rf, cap)
         pre = (note + " ") if note else ""
         if sharpe <= 0:

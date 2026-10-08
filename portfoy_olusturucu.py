@@ -235,15 +235,20 @@ def _render_settings() -> dict:
                              round((rf_def or 0.35) * 100, 1), 0.5, key="pf_rf",
                              help="Varsayılan: TR 2 yıllık tahvil faizi (alınamazsa %35). "
                                   "Sharpe/Sortino bu değere çok duyarlıdır.") / 100.0
-        tilt = 2.0
+        tilt, mom_tilt = 2.0, 0.0
         if method == "quality_rp":
-            tilt = st.slider("Kalite eğimi", 0.5, 4.0, 2.0, 0.5, key="pf_tilt",
-                             help="Risk bütçesi ∝ Overall puanı^eğim. 0'a yakın düz risk parity'ye "
-                                  "yaklaşır; yüksek değer iyi puanlı hisselere daha çok risk payı verir.")
+            t1, t2 = st.columns(2)
+            tilt = t1.slider("Kalite eğimi", 0.0, 4.0, 2.0, 0.5, key="pf_tilt",
+                             help="Risk bütçesi ∝ Overall puanı^eğim. 0 = kalite etkisiz; "
+                                  "yüksek değer iyi puanlı hisselere daha çok risk payı verir.")
+            mom_tilt = t2.slider("Momentum eğimi", 0.0, 3.0, 1.0, 0.5, key="pf_mom_tilt",
+                                 help="Geriye bakış penceresindeki getiriye göre (son 1 ay hariç) "
+                                      "sıralanır; risk bütçesi ∝ (0.5 + yüzdelik sıra)^eğim. "
+                                      "0 = momentum etkisiz. Geçmiş getiri geleceği garanti etmez.")
         source = st.radio("Ağırlık kaynağı", ["Optimizasyon", "Elle"], horizontal=True,
                           key="pf_wsource")
     return dict(method=method, lookback=LOOKBACKS[lb_label], max_w=max_w, rf=rf, source=source,
-                tilt=tilt)
+                tilt=tilt, mom_tilt=mom_tilt)
 
 
 def _render_manual(tickers) -> dict:
@@ -305,7 +310,9 @@ def _analyze(tickers, uni, fetch_fn, s, manual):
     else:
         w, opt_note = pa.optimize_weights(s["method"], mu, cov, s["max_w"], s["rf"],
                                           quality=[overall_of[t] for t in names],
-                                          tilt=s.get("tilt", 2.0))
+                                          tilt=s.get("tilt", 2.0),
+                                          momentum=pa.momentum_scores(returns).reindex(names).values,
+                                          mom_tilt=s.get("mom_tilt", 0.0))
         method_label = pa.METHODS[s["method"]]
 
     pr = pa.portfolio_return_series(w, returns)
