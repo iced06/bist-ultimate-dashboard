@@ -2387,6 +2387,115 @@ def _cumulate_forecasts(standalone_forecasts):
     return sum(vals) if vals else None
 
 
+def _build_valuation_df(raw_data):
+    """Ham Is Yatirim verisinden degerleme icin df_full (+ EBITDA satiri); yoksa None.
+    compute_stock_valuations ve compute_valuation_history AYNI df'i kullanir."""
+    all_key_items = {**KEY_ITEMS_BY_DESC, **KEY_INCOME_BY_DESC}
+    df_full = parse_balance_sheet_to_df(raw_data, item_filter=all_key_items)
+    if df_full is None or df_full.empty:
+        return None
+
+    # Add EBITDA row
+    period_cols = [c for c in df_full.columns if "/" in c]
+    op_row = df_full[df_full["LogicalKey"] == "operating_profit"] if "LogicalKey" in df_full.columns else pd.DataFrame()
+    da_row = df_full[df_full["LogicalKey"] == "depreciation"] if "LogicalKey" in df_full.columns else pd.DataFrame()
+    if not op_row.empty:
+        ebitda_row_data = {"Code": "EBITDA_CALC", "LogicalKey": "ebitda", "Item (TR)": "EBITDA", "Item (EN)": "EBITDA"}
+        for p in period_cols:
+            op_val = pd.to_numeric(op_row.iloc[0].get(p), errors='coerce')
+            da_val = pd.to_numeric(da_row.iloc[0].get(p), errors='coerce') if not da_row.empty else 0
+            ebitda_row_data[p] = (op_val + (abs(da_val) if pd.notna(da_val) else 0)) if pd.notna(op_val) else None
+        df_full = pd.concat([df_full, pd.DataFrame([ebitda_row_data])], ignore_index=True)
+    return df_full
+
+
+def compute_valuation_history(symbol, price_series, raw_data, lag_days=60, max_periods=16):
+    """Hissenin GECMIS donemlerdeki F/K, FD/FAVOK (trailing) ve ILERI F/K, ILERI FD/FAVOK
+    carpanlarini yeniden kurar: her gecmis donem sonu icin (rapor gecikmesi lag_days kadar
+    sonraki fiyatla - o gun bilinen veriyle) finansal tablolar O DONEME KADAR kesilir,
+    ayni forecast_financials/calculate_forward_valuations ile ileri carpanlar hesaplanir.
+    Boylece "bugunku ileri F/K, kendi gecmis ileri F/K'lari yanina konur" (elma-elmaya).
+
+    price_series: tz'siz, gune normalize, SPLIT-DUZELTILMIS kapanis (borsapy varsayilani) -
+    bu yuzden piyasa degeri = duzeltilmis fiyat x GUNCEL hisse sayisi (donem sermayesi x
+    DEGIL; yoksa bedelsiz bolunmeler carpani bozardi). Net borc o donemin bilancosundan.
+    Donus: DataFrame (index=fiyat tarihi) kolonlar: period, price, pe, ev_ebitda, fwd_pe,
+    fwd_ev_ebitda - hesaplanamayanlar NaN; veri yoksa bos DataFrame."""
+    cols = ["period", "price", "pe", "ev_ebitda", "fwd_pe", "fwd_ev_ebitda"]
+    try:
+        df_full = _build_valuation_df(raw_data)
+        if df_full is None or price_series is None or len(price_series) == 0:
+            return pd.DataFrame(columns=cols)
+        periods = [c for c in df_full.columns if "/" in c]            # yeniden eskiye
+        now = calculate_valuation_metrics(df_full, 1.0)
+        shares_now = now.get("shares") if now else None
+        if not shares_now:
+            return pd.DataFrame(columns=cols)
+
+        def key(c):
+            y, m = c.split("/")
+            return int(y), int(m)
+
+        ps = price_series.dropna().sort_index()
+        last_px_date = ps.index[-1]
+        rows = {}
+        for p in sorted(periods, key=key)[-max_periods:]:
+            y, m = key(p)
+            qend = pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(0)
+            pdate = qend + pd.Timedelta(days=lag_days)
+            if pdate > last_px_date:
+                continue
+            px = ps.loc[:pdate]
+            if px.empty:
+                continue
+            price = float(px.iloc[-1])
+            keep = [c for c in df_full.columns if "/" not in c or key(c) <= (y, m)]
+            df_t = df_full[keep]
+            val = calculate_valuation_metrics(df_t, price)
+            if not val or not val.get("market_cap") or val.get("enterprise_value") is None:
+                continue
+            net_debt = val["enterprise_value"] - val["market_cap"]
+            mcap = price * shares_now
+            ev = mcap + net_debt
+            row = {"period": p, "price": price, "pe": np.nan, "ev_ebitda": np.nan,
+                   "fwd_pe": np.nan, "fwd_ev_ebitda": np.nan}
+            if val.get("ttm_net_profit") and val["ttm_net_profit"] > 0:
+                row["pe"] = mcap / val["ttm_net_profit"]
+            if val.get("ttm_ebitda") and val["ttm_ebitda"] > 0:
+                row["ev_ebitda"] = ev / val["ttm_ebitda"]
+            forecasts = forecast_financials(df_t)
+            if forecasts:
+                fwd = calculate_forward_valuations(price, {**val, "market_cap": mcap, "enterprise_value": ev},
+                                                   forecasts)
+                row["fwd_pe"] = fwd.get("forward_pe", np.nan)
+                row["fwd_ev_ebitda"] = fwd.get("forward_ev_ebitda", np.nan)
+            rows[px.index[-1]] = row
+        return pd.DataFrame.from_dict(rows, orient="index", columns=cols) if rows else pd.DataFrame(columns=cols)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_financial_store_for(tickers):
+    """Sadece ISTENEN hisselerin finansal verisi (DB'den) - TUM store'u (566 hisse) session'a
+    yuklemeden (bkz. yukaridaki 'otomatik yukleme yok' notu: bellek sorunu). Donus:
+    {ticker: {yil: veri}}; DB yok/hata -> {}."""
+    conn = _get_live_financial_db_connection()
+    if conn is None or not tickers:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticker, yil, veri FROM financial_statements WHERE ticker = ANY(%s)",
+                        (list(tickers),))
+            rows = cur.fetchall()
+    except Exception:
+        return {}
+    store = {}
+    for ticker, yil, veri in rows:
+        store.setdefault(ticker, {})[int(yil)] = veri
+    return store
+
+
 def compute_stock_valuations(symbol, current_price, financial_store=None):
     """
     Compute current and forward valuations for a single stock.
@@ -2415,22 +2524,9 @@ def compute_stock_valuations(symbol, current_price, financial_store=None):
         return result
     
     try:
-        all_key_items = {**KEY_ITEMS_BY_DESC, **KEY_INCOME_BY_DESC}
-        df_full = parse_balance_sheet_to_df(raw_data, item_filter=all_key_items)
-        if df_full is None or df_full.empty:
+        df_full = _build_valuation_df(raw_data)
+        if df_full is None:
             return result
-        
-        # Add EBITDA row
-        period_cols = [c for c in df_full.columns if "/" in c]
-        op_row = df_full[df_full["LogicalKey"] == "operating_profit"] if "LogicalKey" in df_full.columns else pd.DataFrame()
-        da_row = df_full[df_full["LogicalKey"] == "depreciation"] if "LogicalKey" in df_full.columns else pd.DataFrame()
-        if not op_row.empty:
-            ebitda_row_data = {"Code": "EBITDA_CALC", "LogicalKey": "ebitda", "Item (TR)": "EBITDA", "Item (EN)": "EBITDA"}
-            for p in period_cols:
-                op_val = pd.to_numeric(op_row.iloc[0].get(p), errors='coerce')
-                da_val = pd.to_numeric(da_row.iloc[0].get(p), errors='coerce') if not da_row.empty else 0
-                ebitda_row_data[p] = (op_val + (abs(da_val) if pd.notna(da_val) else 0)) if pd.notna(op_val) else None
-            df_full = pd.concat([df_full, pd.DataFrame([ebitda_row_data])], ignore_index=True)
         
         # Current valuations
         valuation = calculate_valuation_metrics(df_full, current_price)
@@ -2439,6 +2535,8 @@ def compute_stock_valuations(symbol, current_price, financial_store=None):
             result["pb"] = valuation.get("pb_ratio")
             result["ev_ebitda"] = valuation.get("ev_ebitda")
             result["market_cap"] = valuation.get("market_cap")
+            result["ev"] = valuation.get("enterprise_value")
+            result["shares"] = valuation.get("shares")
         
         # Forward valuations
         forecasts = forecast_financials(df_full)
@@ -2447,6 +2545,8 @@ def compute_stock_valuations(symbol, current_price, financial_store=None):
             result["fwd_pe"] = fwd.get("forward_pe")
             result["fwd_pb"] = fwd.get("forward_pb")
             result["fwd_ev_ebitda"] = fwd.get("forward_ev_ebitda")
+            result["fwd_np"] = fwd.get("forecast_net_profit")        # bin TL (TTM tahmini)
+            result["fwd_ebitda"] = fwd.get("forecast_ebitda")        # bin TL (TTM tahmini)
             result["roe"] = valuation.get("roe")
         
         # Deltas (positive = current is higher = stock getting cheaper on forward basis)
@@ -5276,7 +5376,10 @@ def main():
                 st.info("Database connection may be temporarily unavailable.")
         elif mode == "📐 Portfolio":
             try:
-                display_portfolio_builder(fetch_stock_data)
+                display_portfolio_builder(
+                    fetch_stock_data, valuation_fn=compute_stock_valuations,
+                    valuation_history_fn=compute_valuation_history,
+                    financial_loader=_load_financial_store_for)
             except Exception as e:
                 st.error(f"Portfolio error: {str(e)}")
                 st.info("Database or price data source may be temporarily unavailable.")

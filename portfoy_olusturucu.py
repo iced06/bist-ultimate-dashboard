@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import portfolio_analytics as pa
+import portfolio_valuation as pv
 import portfoy_store as store
 from sirket_raporlari import (
     DONEM_LABELS,
@@ -544,10 +545,12 @@ def _analyze(tickers, uni, fetch_fn, s, manual):
                 w=w, method_label=method_label, opt_note=opt_note, stats=stats, pr=pr, m=m,
                 corr=corr, ds=ds, rc=rc, sector_of=sector_of, overall_of=overall_of, health=health,
                 dropped=dropped, failed=failed, lookback=lookback, start=start, cal=cal, s=s,
-                manual=manual)
+                manual=manual,
+                last_price={t: float(prices[t].dropna().iloc[-1]) for t in names
+                            if t in prices.columns and prices[t].notna().any()})
 
 
-def _render_results(a, uni, universe_tickers, fetch_fn):
+def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
     names, w, rc, m, ds, health = a["names"], a["w"], a["rc"], a["m"], a["ds"], a["health"]
     mu, cov, rf, max_w = a["mu"], a["cov"], a["s"]["rf"], a["s"]["max_w"]
     stats, sector_of, overall_of = a["stats"], a["sector_of"], a["overall_of"]
@@ -584,13 +587,24 @@ def _render_results(a, uni, universe_tickers, fetch_fn):
             "- Toplam = ağırlıklı ortalama; ≥75 Sağlam, ≥60 İyi, ≥45 Orta, altı Zayıf.")
 
     # ── hisse tablosu ──
+    # Markowitz (ortalama-varyans) girdileri: beklenen getiri = tarihsel yıllık ortalama getirinin
+    # kesit ortalamasına %50 çekilmiş hali (Maks. Sharpe'taki ile aynı); risk ve kovaryans =
+    # Ledoit-Wolf shrinkage'lı kovaryans (cov) - ham örneklem volatilitesinden daha kararlı.
+    mu_s = 0.5 * mu + 0.5 * mu.mean()
+    sig = np.sqrt(np.diag(cov))
+    w_gmv = pa.optimize_weights("min_var", mu, cov, max_w, rf)[0]
+    w_tan = pa.optimize_weights("max_sharpe", mu, cov, max_w, rf)[0]
     table = pd.DataFrame({
         "Hisse": names,
         "Sektör": [sector_of[t] for t in names],
         "Ağırlık %": w * 100,
         "Risk katkısı %": rc * 100,
+        "Beklenen getiri % (Markowitz)": mu_s * 100,
+        "Risk σ % (Markowitz)": sig * 100,
+        "Getiri/Risk": (mu_s - rf) / sig,
+        "Min-varyans ağırlığı %": w_gmv * 100,
+        "Maks-Sharpe ağırlığı %": w_tan * 100,
         "Beta": stats["beta"].reindex(names).values,
-        "Volatilite %": stats["vol"].reindex(names).values * 100,
         "Yıllık getiri % (bileşik)": stats["cagr"].reindex(names).values * 100,
         "Max DD %": stats["max_dd"].reindex(names).values * 100,
         "Overall": [overall_of[t] for t in names],
@@ -602,12 +616,85 @@ def _render_results(a, uni, universe_tickers, fetch_fn):
                                                           format="%.1f"),
             "Risk katkısı %": st.column_config.ProgressColumn("Risk katkısı %", min_value=0,
                                                                max_value=100, format="%.1f"),
+            "Beklenen getiri % (Markowitz)": st.column_config.NumberColumn(
+                format="%.1f", help="Tarihsel yıllık ortalama getirinin kesit ortalamasına %50 çekilmiş "
+                                    "hali (Markowitz girdisi). Tarihsel ortalamalar gürültülüdür; tahmin "
+                                    "değil, geçmişe dayalı bir referanstır."),
+            "Risk σ % (Markowitz)": st.column_config.NumberColumn(
+                format="%.1f", help="Ledoit-Wolf shrinkage'lı kovaryanstan yıllık standart sapma."),
+            "Getiri/Risk": st.column_config.NumberColumn(
+                format="%.2f", help="(Beklenen getiri − risksiz faiz) / σ. Risksiz faiz yüksek olduğunda "
+                                    "(TL) çoğu hisse için negatif çıkar."),
+            "Min-varyans ağırlığı %": st.column_config.NumberColumn(format="%.1f"),
+            "Maks-Sharpe ağırlığı %": st.column_config.NumberColumn(format="%.1f"),
             "Beta": st.column_config.NumberColumn(format="%.2f"),
-            "Volatilite %": st.column_config.NumberColumn(format="%.1f"),
             "Yıllık getiri % (bileşik)": st.column_config.NumberColumn(format="%.1f"),
             "Max DD %": st.column_config.NumberColumn(format="%.1f"),
             "Overall": st.column_config.NumberColumn(format="%.1f"),
         })
+
+    def _mv(wv):
+        r_, s_ = float(wv @ mu_s), float(np.sqrt(wv @ cov @ wv))
+        return r_ * 100, s_ * 100, (r_ - rf) / s_ if s_ > 0 else np.nan
+    mv_rows = []
+    for lab, wv in (("Mevcut ağırlıklar", w), ("Min varyans (Markowitz)", w_gmv),
+                    ("Maks. Sharpe (Markowitz)", w_tan), ("Eşit ağırlık", np.full(len(names), 1.0 / len(names)))):
+        r_, s_, sh_ = _mv(wv)
+        mv_rows.append({"Portföy": lab, "Beklenen getiri %": r_, "Risk σ %": s_, "Sharpe": sh_,
+                        "Efektif hisse": 1.0 / float(np.sum(wv ** 2))})
+    st.markdown("**Markowitz özeti — portföy düzeyi**")
+    st.dataframe(pd.DataFrame(mv_rows), hide_index=True, use_container_width=True,
+                 column_config={"Beklenen getiri %": st.column_config.NumberColumn(format="%.1f"),
+                                "Risk σ %": st.column_config.NumberColumn(format="%.1f"),
+                                "Sharpe": st.column_config.NumberColumn(format="%.2f"),
+                                "Efektif hisse": st.column_config.NumberColumn(format="%.1f")})
+    st.caption(f"Ortalama-varyans: beklenen getiri = tarihsel ortalamanın %50 shrinkage'ı, risk = Ledoit-Wolf "
+               f"kovaryans (shrinkage %{a['shrink'] * 100:.0f}), risksiz faiz %{rf * 100:.1f}. Ağırlık üst sınırı "
+               f"%{max_w * 100:.0f}. Maks-Sharpe, hiçbir hisse risksiz faizi aşmıyorsa Min varyansa düşer.")
+
+    # ── hisse bazında beklenen getiri – risk dağılımı; "yüksek getiri / düşük risk" bölgesi vurgulu ──
+    med_s, med_r = float(np.median(sig)), float(np.median(mu_s))
+    in_zone = [bool(s_ <= med_s and r_ >= med_r) for s_, r_ in zip(sig, mu_s)]
+    xs_, ys_ = sig * 100, mu_s * 100
+    port_pts = [("Mevcut", w, "red", "star", 18), ("Min varyans", w_gmv, "white", "diamond", 12),
+                ("Maks. Sharpe", w_tan, "orange", "diamond", 12)]
+    px_ = [float(np.sqrt(wv @ cov @ wv) * 100) for _, wv, *_ in port_pts]
+    py_ = [float(wv @ mu_s * 100) for _, wv, *_ in port_pts]
+    x_lo, x_hi = min(xs_.min(), *px_) * 0.92, max(xs_.max(), *px_) * 1.06
+    y_lo, y_hi = min(ys_.min(), *py_, rf * 100) - 4, max(ys_.max(), *py_, rf * 100) + 4
+    fz = go.Figure()
+    fz.add_shape(type="rect", x0=x_lo, x1=med_s * 100, y0=med_r * 100, y1=y_hi, layer="below",
+                 fillcolor="rgba(46,160,67,0.16)", line=dict(width=1, color="rgba(46,160,67,0.6)", dash="dot"))
+    fz.add_annotation(x=(x_lo + med_s * 100) / 2, y=y_hi, yanchor="top", showarrow=False,
+                      text="<b>Yüksek getiri · düşük risk</b>", font=dict(color="rgb(46,160,67)", size=12))
+    fz.add_vline(x=med_s * 100, line_dash="dot", line_color="gray")
+    fz.add_hline(y=med_r * 100, line_dash="dot", line_color="gray")
+    fz.add_hline(y=rf * 100, line_dash="dash", line_color="orange",
+                 annotation_text=f"Risksiz faiz %{rf * 100:.1f}", annotation_position="bottom right")
+    fz.add_trace(go.Scatter(
+        x=xs_, y=ys_, mode="markers+text", name="Hisseler", text=names, textposition="top center",
+        marker=dict(size=[10 + 60 * float(wi) for wi in w],
+                    color=["rgb(46,160,67)" if z else "rgb(120,140,170)" for z in in_zone],
+                    line=dict(width=[2 if z else 0.5 for z in in_zone], color="white"), opacity=0.9),
+        customdata=np.column_stack([w * 100, (mu_s - rf) / sig]),
+        hovertemplate="<b>%{text}</b><br>Risk σ %{x:.1f}%<br>Beklenen getiri %{y:.1f}%<br>"
+                      "Ağırlık %{customdata[0]:.1f}%<br>Getiri/Risk %{customdata[1]:.2f}<extra></extra>"))
+    for (lab, _, color, sym, size), x_, y_ in zip(port_pts, px_, py_):
+        fz.add_trace(go.Scatter(x=[x_], y=[y_], mode="markers", name=lab,
+                                marker=dict(size=size, color=color, symbol=sym, line=dict(width=1, color="black"))))
+    fz.update_layout(title="Hisse bazında beklenen getiri – risk (nokta büyüklüğü = ağırlık)", height=420,
+                     xaxis=dict(title="Risk: yıllık standart sapma σ %", range=[x_lo, x_hi]),
+                     yaxis=dict(title="Beklenen getiri % (Markowitz)", range=[y_lo, y_hi]),
+                     margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
+    st.plotly_chart(fz, use_container_width=True, config=PLOTLY_CFG, key="pf_ret_risk_scatter")
+    zone = sorted((t for t, z in zip(names, in_zone) if z),
+                  key=lambda t: -((mu_s[names.index(t)] - rf) / sig[names.index(t)]))
+    st.caption("🟩 Yeşil bölge: risk (σ) seçili hisselerin medyanının altında, beklenen getiri medyanının üstünde "
+               "— göreli bir ayrım, mutlak 'iyi' demek değildir. "
+               + ("Bölgedeki hisseler (getiri/risk sırasıyla): " + ", ".join(zone) + "." if zone
+                  else "Bölgede hisse yok."))
+
+    _render_valuation(a, uni, universe_tickers, fetch_fn, deps)
 
     # ── grafikler ──
     g1, g2 = st.columns(2)
@@ -626,8 +713,8 @@ def _render_results(a, uni, universe_tickers, fetch_fn):
             marker=dict(size=4, color=shp, colorscale="Viridis", opacity=0.55,
                         colorbar=dict(title="Sharpe", thickness=10))))
         specials = [("Mevcut", w, "red", "star", 16),
-                    ("Min varyans", pa.optimize_weights("min_var", mu, cov, max_w, rf)[0], "white", "diamond", 11),
-                    ("Maks. Sharpe", pa.optimize_weights("max_sharpe", mu, cov, max_w, rf)[0], "orange", "diamond", 11),
+                    ("Min varyans", w_gmv, "white", "diamond", 11),
+                    ("Maks. Sharpe", w_tan, "orange", "diamond", 11),
                     ("Eşit ağırlık", np.full(len(names), 1.0 / len(names)), "cyan", "square", 9)]
         for label, wv, color, sym, size in specials:
             fig.add_trace(go.Scatter(
@@ -715,6 +802,249 @@ def _render_results(a, uni, universe_tickers, fetch_fn):
                                         "Volatilite": st.column_config.NumberColumn("Volatilite %", format="%.1f")})
             st.button("➕ Önerilenleri sepete ekle", key="pf_add_suggested",
                       on_click=_add_tickers, args=(list(sg["ticker"]),))
+
+
+# ───────────────────────── değerleme: hedef fiyat & ucuzluk ─────────────────────────
+
+LABEL_ICON = {"Çok ucuz": "🟢🟢", "Ucuz": "🟢", "Makul": "⚪", "Pahalı": "🟠", "Çok pahalı": "🔴", "—": ""}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _peer_valuations(_val_fn, _fin, sig, items):
+    """items: ((ticker, fiyat), ...) - her hisse için güncel + ileri çarpanlar (finansal verisi olanlar)."""
+    out = {}
+    for t, price in items:
+        if not _fin.get(t):
+            continue
+        try:
+            v = _val_fn(t, price, financial_store=_fin)
+        except Exception:
+            v = {}
+        if v:
+            out[t] = v
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _val_history(_hist_fn, symbol, _raw, _px, sig):
+    return _hist_fn(symbol, _px, _raw)
+
+
+def _fnum(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return np.nan
+    return v if np.isfinite(v) else np.nan
+
+
+def _render_valuation(a, uni, universe_tickers, fetch_fn, deps):
+    st.markdown("---")
+    st.markdown("### 🎯 Hedef fiyat ve ucuzluk önceliği")
+    if not deps or not deps.get("valuation") or not deps.get("loader"):
+        st.caption("Değerleme fonksiyonları bu ortamda yüklenemedi.")
+        return
+    if not st.toggle("Hedef fiyat analizini aç", key="pf_val_on",
+                     help="Rapor evreninin finansallarını ve fiyatlarını yükler (ilk açılışta ~1 dk, sonra "
+                          "30 dk önbellekte)."):
+        st.caption("Seçili hisselerin ileri F/K ve FD/FAVÖK çarpanlarını kendi geçmişleri ve sektör "
+                   "medyanlarıyla karşılaştırır; Overall ve Görünüm puanlarıyla ayarlanmış bir hedef fiyat ve "
+                   "ucuzluk sırası çıkarır.")
+        return
+
+    st.session_state.setdefault("pf_val_whist", 50)
+    st.session_state.setdefault("pf_val_kq", 10)
+    st.session_state.setdefault("pf_val_ko", 5)
+    with st.expander("⚙️ Varsayımlar", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        w_hist = c1.slider("Geçmiş medyanın ağırlığı %", 0, 100, step=10, key="pf_val_whist",
+                           help="Hedef çarpan = bu ağırlık × kendi geçmiş medyanı + kalan × sektör medyanı.")
+        k_q = c2.slider("Kalite primi (Overall, puan başına %)", 0, 25, key="pf_val_kq",
+                        help="Overall puanı sektör ortalamasının her +1 puanı için hedef çarpan bu kadar "
+                             "yükselir (aşağıda ise düşer).")
+        k_o = c3.slider("Görünüm primi (puan başına %)", 0, 15, key="pf_val_ko",
+                        help="Görünüm puanının nötr 3'ün üstündeki her puanı için hedef çarpan bu kadar "
+                             "yükselir.")
+    params = dict(w_hist=w_hist / 100.0, k_quality=k_q / 100.0, k_outlook=k_o / 100.0)
+
+    names = a["names"]
+    in_uni = [t for t in names if t in uni.index]
+    uni_t = tuple(sorted(universe_tickers))
+    with st.spinner("Finansallar, çarpanlar ve geçmiş çarpanlar hesaplanıyor (ilk seferde ~1 dk)..."):
+        fin = deps["loader"](uni_t)
+        uprices, _ = _load_close_prices(uni_t, a["start"], fetch_fn)
+        last = {t: float(uprices[t].dropna().iloc[-1]) for t in uprices.columns if uprices[t].notna().any()}
+        last.update({t: p for t, p in a.get("last_price", {}).items() if t not in last})
+        items = tuple((t, round(last[t], 4)) for t in uni_t if t in fin and t in last)
+        sig = hashlib.md5("|".join(f"{t}:{p}" for t, p in items).encode()).hexdigest()[:12]
+        peers = _peer_valuations(deps["valuation"], fin, sig, items)
+        hists = {}
+        if deps.get("history") and in_uni:
+            long_start = (date.today() - timedelta(days=6 * 366)).isoformat()
+            hist_px, _ = _load_close_prices(tuple(sorted(in_uni)), long_start, fetch_fn)
+            for t in in_uni:
+                if t in fin and t in hist_px.columns and hist_px[t].notna().any():
+                    s_ = hist_px[t].dropna()
+                    hists[t] = _val_history(deps["history"], t, fin[t], s_,
+                                            f"{t}:{s_.index[-1]}:{len(s_)}")
+    if not peers:
+        st.info("Finansal veri bulunamadı (Financial Data içe aktarılmamış olabilir).")
+        return
+
+    mult_cols = ("pe", "fwd_pe", "ev_ebitda", "fwd_ev_ebitda")
+    rows = pd.DataFrame({t: {k: _fnum(v.get(k)) for k in mult_cols} for t, v in peers.items()}).T
+    sector_all = {t: (uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"]) else None)
+                  for t in rows.index}
+    sref_all = pv.sector_reference(rows, sector_all)
+    ov_by_sector = pd.to_numeric(uni["overall_puani"], errors="coerce").groupby(uni["sektor"]).mean()
+
+    results = {}
+    for t in in_uni:
+        v = peers.get(t)
+        price = last.get(t)
+        if not v or not price:
+            continue
+        sek = sector_all.get(t)
+        sref, fallback = {}, []
+        for k in mult_cols:
+            sv = sref_all.get(sek, {}).get(k, (np.nan, 0))
+            if not np.isfinite(sv[0]):
+                sv = sref_all[pv.ALL_KEY].get(k, (np.nan, 0))
+                if np.isfinite(sv[0]):
+                    fallback.append(k)
+            sref[k] = sv
+        href = pv.history_reference(hists.get(t), v, pv.DEFAULTS["min_hist"], params)
+        ov, go_ = _num(uni.loc[t, "overall_puani"]), _num(uni.loc[t, "gorunum_puani"])
+        res = pv.target_for_stock(price, v, href, sref, None if np.isnan(ov) else ov,
+                                  _fnum(ov_by_sector.get(sek)), None if np.isnan(go_) else go_, sek, params)
+        res.update(overall=None if np.isnan(ov) else ov, gorunum=None if np.isnan(go_) else go_, val=v,
+                   href=href, sref=sref, sector=sek or UNASSIGNED, sector_fallback=bool(fallback))
+        results[t] = res
+    if not results:
+        st.info("Seçili hisselerin hiçbiri için değerleme hesaplanamadı (finansal verisi yok).")
+        return
+
+    pr_df = pv.prioritize(results)
+    w_of = dict(zip(names, a["w"]))
+    ok = pr_df[pr_df["upside"].notna()]
+    k1, k2, k3, k4 = st.columns(4)
+    if len(ok):
+        wsum = sum(w_of.get(t, 0.0) for t in ok["ticker"])
+        wup = (sum(w_of.get(t, 0.0) * u for t, u in zip(ok["ticker"], ok["upside"])) / wsum) if wsum > 0 else np.nan
+        _metric(k1, "Ağırlıklı potansiyel", f"%{wup * 100:+.1f}", f"portföyün %{wsum * 100:.0f}'i kapsanıyor")
+        _metric(k2, "En ucuz", ok.iloc[0]["ticker"], f"%{ok.iloc[0]['upside'] * 100:+.0f} potansiyel")
+        _metric(k3, "En pahalı", ok.iloc[-1]["ticker"], f"%{ok.iloc[-1]['upside'] * 100:+.0f} potansiyel")
+        _metric(k4, "Ucuz/pahalı", f"{int((ok['upside'] >= 0.10).sum())} / {int((ok['upside'] <= -0.10).sum())}",
+                "≥%10 / ≤−%10 potansiyel")
+    show = pd.DataFrame({
+        "Öncelik": pr_df["rank"],
+        "Hisse": pr_df["ticker"],
+        "Sektör": [results[t]["sector"] for t in pr_df["ticker"]],
+        "Fiyat ₺": pr_df["price"],
+        "Hedef fiyat ₺": pr_df["target"],
+        "Potansiyel %": pr_df["upside"] * 100,
+        "Ucuzluk": [(LABEL_ICON.get(l, "") + " " + l).strip() for l in pr_df["label"]],
+        "Güven": pr_df["confidence"],
+        "Overall": pr_df["overall"],
+        "Görünüm": pr_df["gorunum"],
+        "Kalite çarpanı": pr_df["adj"],
+        "Not": ["; ".join(f"{pv.MULT_LABELS[k]}: {why}" for k, why in results[t]["rejected"].items())
+                for t in pr_df["ticker"]],
+    })
+    st.dataframe(show, hide_index=True, use_container_width=True, column_config={
+        "Öncelik": st.column_config.NumberColumn(format="%d", help="1 = en ucuz (potansiyele göre)."),
+        "Fiyat ₺": st.column_config.NumberColumn(format="%.2f"),
+        "Hedef fiyat ₺": st.column_config.NumberColumn(format="%.2f"),
+        "Potansiyel %": st.column_config.NumberColumn(format="%+.1f"),
+        "Overall": st.column_config.NumberColumn(format="%.1f"),
+        "Görünüm": st.column_config.NumberColumn(format="%.1f"),
+        "Kalite çarpanı": st.column_config.NumberColumn(
+            format="%.2f", help="Hedef çarpana uygulanan Overall/Görünüm düzeltmesi (1.00 = etkisiz)."),
+    })
+    n_rej = [t for t in results if results[t]["rejected"]]
+    if n_rej:
+        st.caption("ℹ️ Uygulamanın mekanik kâr tahmini, kâr dalgalanan/zarar eden şirketlerde uç değerler "
+                   "üretebiliyor; tahmini son 12 aya göre makul bandın (0.4x–2.5x) dışında kalan çarpanlar "
+                   "hedefe katılmadı (Not sütunu): " + ", ".join(n_rej))
+    missing = [t for t in names if t not in results]
+    if missing:
+        st.caption("Değerleme hesaplanamayan hisseler (finansal veri yok / bu dönemde rapor yok): "
+                   + ", ".join(missing))
+    if any(r["clipped"] for r in results.values()):
+        st.caption("⚠️ Bazı hedef fiyatlar uç değer koruması nedeniyle fiyatın 0.5x–2x'i ile sınırlandı.")
+
+    with st.expander("🔬 Çarpan karşılaştırması: güncel · geçmiş · sektör"):
+        for key, title, cur_key in (("fwd_pe", "İleri F/K", "pe"), ("fwd_ev_ebitda", "İleri FD/FAVÖK", "ev_ebitda")):
+            rws = []
+            for t in pr_df["ticker"]:
+                r = results[t]
+                if key not in r["methods"] and key not in r["rejected"] and not np.isfinite(_fnum(r["val"].get(key))):
+                    continue
+                cur = _fnum(r["val"].get(key))
+                hr = r["href"].get(key, {})
+                hmed, sv = hr.get("median", np.nan), r["sref"][key]
+                rws.append({
+                    "Hisse": t, "Güncel (trailing)": _fnum(r["val"].get(cur_key)), title: cur,
+                    "Geçmiş medyan": hmed, "Geçmiş n": hr.get("n", 0),
+                    "Geçmişe göre %": (cur / hmed - 1) * 100 if np.isfinite(hmed) and np.isfinite(cur) else np.nan,
+                    "Geçmişte bugünden düşük %": hr.get("pct_below", np.nan) * 100,
+                    "Sektör medyan": sv[0], "Sektör n": sv[1],
+                    "Sektöre göre %": (cur / sv[0] - 1) * 100 if np.isfinite(sv[0]) and np.isfinite(cur) else np.nan,
+                    "Hedef çarpan": r["methods"].get(key, {}).get("target_multiple", np.nan),
+                    "Hedef fiyat ₺": r["methods"].get(key, {}).get("target_price", np.nan),
+                    "Not": r["rejected"].get(key, ""),
+                })
+            st.markdown(f"**{title}**" + (" — bankacılık/sigorta/finansta FD/FAVÖK kullanılmaz" if key == "fwd_ev_ebitda" else ""))
+            if not rws:
+                st.caption("Hesaplanabilen hisse yok.")
+                continue
+            st.dataframe(pd.DataFrame(rws), hide_index=True, use_container_width=True, column_config={
+                c: st.column_config.NumberColumn(format="%.1f" if "%" in c else "%.2f")
+                for c in ("Güncel (trailing)", title, "Geçmiş medyan", "Geçmişe göre %", "Geçmişte bugünden düşük %",
+                          "Sektör medyan", "Sektöre göre %", "Hedef çarpan", "Hedef fiyat ₺")
+                if c != "Not"})
+        fb = [t for t in results if results[t]["sector_fallback"]]
+        if fb:
+            st.caption("Sektörde yeterli hisse (≥3) olmadığı için tüm rapor evreni medyanı kullanılan hisseler: "
+                       + ", ".join(fb))
+
+    fig = go.Figure()
+    for t in ok["ticker"]:
+        r = results[t]
+        if r["overall"] is None:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[r["overall"]], y=[r["upside"] * 100], mode="markers+text", text=[t], textposition="top center",
+            name=t, showlegend=False,
+            marker=dict(size=10 + 60 * w_of.get(t, 0.0), opacity=0.8),
+            hovertemplate=f"<b>{t}</b><br>Overall %{{x:.1f}}<br>Potansiyel %{{y:+.0f}}%<extra></extra>"))
+    fig.add_hline(y=0, line_dash="dot", line_color="gray")
+    fig.update_layout(title="Kalite – ucuzluk haritası (sağ üst: yüksek puanlı ve ucuz)", height=340,
+                      xaxis_title="Overall puanı", yaxis_title="Potansiyel %",
+                      margin=dict(l=10, r=10, t=40, b=10))
+    if len(fig.data):
+        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
+
+    with st.expander("ℹ️ Hedef fiyat nasıl hesaplanıyor? Sınırlar nelerdir?"):
+        st.markdown(
+            "1. **Çarpanlar:** her hisse için *ileri F/K* (piyasa değeri ÷ tahmini 4 çeyreklik net kâr) ve "
+            "*ileri FD/FAVÖK* (firma değeri ÷ tahmini FAVÖK). İleri değerler uygulamanın mekanik tahmininden "
+            "(mevsimsellik + momentum + ortalamaya dönüş) gelir; analist konsensüsü değildir.\n"
+            "2. **Geçmiş:** hissenin kendi geçmiş çeyrekleri için, o güne kadarki finansallarla ayni tahmin "
+            "yöntemi yeniden çalıştırılıp ileri çarpanlar yeniden kurulur (rapor gecikmesi 60 gün, fiyatlar "
+            "bölünme düzeltmeli). Medyan için en az 6 gözlem gerekir.\n"
+            "3. **Sektör:** aynı sektördeki rapor evreni hisselerinin güncel ileri çarpan medyanı (≥3 hisse; "
+            "yoksa tüm evren medyanı).\n"
+            f"4. **Hedef çarpan** = %{w_hist} geçmiş + %{100 - w_hist} sektör; sonra *Overall* (sektör ortalamasına "
+            f"göre puan başına %{k_q}) ve *Görünüm* (3'e göre puan başına %{k_o}) ile ölçeklenir, "
+            "0.75–1.25 aralığına kırpılır.\n"
+            "5. **Hedef fiyat:** F/K için fiyat × hedef/güncel çarpan; FD/FAVÖK için (hedef FD/FAVÖK × tahmini "
+            "FAVÖK − net borç) ÷ hisse sayısı. Mevcut yöntemlerin ortalaması alınır; fiyatın 0.5x–2x'i ile sınırlıdır.\n"
+            "6. **Potansiyel** = hedef/fiyat − 1; **Öncelik** 1 = en yüksek potansiyel. Güven: iki yöntem + hem geçmiş "
+            "hem sektör referansı varsa Yüksek.\n\n"
+            "**Sınırlar:** hedef fiyat, çarpanların ortalamaya döneceği varsayımıdır (zaman ufku belirsiz); "
+            "tahmin gürültülüdür (özellikle kâr dalgalanan/enflasyon muhasebesi etkili şirketlerde); "
+            "finansal verisi olmayan hisseler (ör. bazı bankalar) hesaplanamaz. **Yatırım tavsiyesi değildir.**")
 
 
 # ───────────────────────── 3D harita ─────────────────────────
@@ -853,6 +1183,60 @@ def _render_map(a, uni, sector_score, universe_tickers, fetch_fn):
         st.caption("Haritada olmayan seçili hisseler (geçmiş/veri yetersiz): " + ", ".join(missing))
     fig = _map_figure(pos, uni, ustats, basket, weights, titles, vectors, port_vec)
     st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG, key="pf_map_chart")
+    if mode == "Korelasyon uzayı":
+        _render_cosine(coords, urets, [t for t in basket if t in coords.index], min_obs)
+
+
+def _cosine(u, v) -> float:
+    nu, nv = float(np.linalg.norm(u)), float(np.linalg.norm(v))
+    return float(np.dot(u, v) / (nu * nv)) if nu > 0 and nv > 0 else float("nan")
+
+
+def _render_cosine(coords, urets, in_map, min_obs):
+    """İki seçili hissenin 3B vektörleri arasındaki kosinüs benzerliği (ve gerçek korelasyon)."""
+    st.markdown("**📐 İki vektörün kosinüs benzerliği**")
+    if len(in_map) < 2:
+        st.caption("Sepette (haritada olan) en az 2 hisse olunca iki vektör arasındaki kosinüs benzerliği "
+                   "burada görünür.")
+        return
+    ss = st.session_state
+    if ss.get("pf_cos_a") not in in_map:
+        ss["pf_cos_a"] = in_map[0]
+    if ss.get("pf_cos_b") not in in_map or ss.get("pf_cos_b") == ss["pf_cos_a"]:
+        ss["pf_cos_b"] = next(t for t in in_map if t != ss["pf_cos_a"])
+    c1, c2 = st.columns(2)
+    A = c1.selectbox("Vektör A", in_map, key="pf_cos_a")
+    B = c2.selectbox("Vektör B", in_map, key="pf_cos_b")
+    va, vb = coords.loc[A].values, coords.loc[B].values
+    cos = _cosine(va, vb)
+    rho = float(urets[[A, B]].corr(min_periods=min_obs).iloc[0, 1]) if A != B else 1.0
+    dot = float(np.dot(va, vb))
+    m1, m2 = st.columns(2)
+    _metric(m1, "Kosinüs (3B)", _fmt(cos), "1 = aynı yön, 0 = bağımsız, −1 = ters")
+    _metric(m2, "Açı", "—" if np.isnan(cos) else f"{np.degrees(np.arccos(np.clip(cos, -1, 1))):.0f}°")
+    m3, m4 = st.columns(2)
+    _metric(m3, "x·y (≈ korelasyon)", _fmt(dot), "vektörlerin nokta çarpımı")
+    _metric(m4, "Gerçek korelasyon", _fmt(rho), "tüm geçmişten, 3B'ye indirgemeden")
+    st.caption(f"Vektör boyları: {A} {np.linalg.norm(va):.2f} · {B} {np.linalg.norm(vb):.2f}. Kosinüs yalnızca "
+               "YÖNÜ ölçer (boylara bölünür), bu yüzden vektörler 1'den kısaysa (3 faktör hisseyi tam "
+               "açıklamıyorsa) korelasyondan YÜKSEK çıkar; korelasyonu en iyi nokta çarpım (x·y) yaklaşıklar. "
+               "Gerçek korelasyon her zaman kesin değerdir.")
+    if len(in_map) > 2:
+        with st.expander("Tüm seçili çiftler"):
+            rws = []
+            for i, x in enumerate(in_map):
+                for y in in_map[i + 1:]:
+                    c_ = _cosine(coords.loc[x].values, coords.loc[y].values)
+                    rws.append({"Hisse A": x, "Hisse B": y, "Kosinüs (3B)": c_,
+                                "x·y": float(np.dot(coords.loc[x].values, coords.loc[y].values)),
+                                "Açı °": float(np.degrees(np.arccos(np.clip(c_, -1, 1)))) if np.isfinite(c_) else np.nan,
+                                "Gerçek korelasyon": float(urets[[x, y]].corr(min_periods=min_obs).iloc[0, 1])})
+            st.dataframe(pd.DataFrame(rws).sort_values("Kosinüs (3B)", ascending=False), hide_index=True,
+                         use_container_width=True,
+                         column_config={"Kosinüs (3B)": st.column_config.NumberColumn(format="%.2f"),
+                                        "x·y": st.column_config.NumberColumn(format="%.2f"),
+                                        "Açı °": st.column_config.NumberColumn(format="%.0f"),
+                                        "Gerçek korelasyon": st.column_config.NumberColumn(format="%.2f")})
 
 
 # ───────────────────────── zaman yolculuğu & walk-forward ─────────────────────────
@@ -1253,8 +1637,13 @@ def _render_time_section(a, uni, universe_tickers, fetch_fn):
 
 # ───────────────────────── ana giriş ─────────────────────────
 
-def display_portfolio_builder(fetch_fn):
-    """fetch_fn: streamlit_app.fetch_stock_data (symbol, start_date=, interval=)."""
+def display_portfolio_builder(fetch_fn, valuation_fn=None, valuation_history_fn=None,
+                              financial_loader=None):
+    """fetch_fn: streamlit_app.fetch_stock_data (symbol, start_date=, interval=).
+    valuation_fn / valuation_history_fn / financial_loader: streamlit_app'teki değerleme
+    fonksiyonları (compute_stock_valuations, compute_valuation_history, _load_financial_store_for);
+    verilmezse hedef fiyat bölümü devre dışı kalır."""
+    deps = dict(valuation=valuation_fn, history=valuation_history_fn, loader=financial_loader)
     st.markdown("### 📐 Portföy Çalışma Alanı")
     st.caption("En iyi sektörlere bak, her sektörden beğendiğin hisseleri seç; portföy kutusu "
                "risk bazlı ağırlıkları, riski ve sağlık skorunu canlı hesaplasın. "
@@ -1347,5 +1736,5 @@ def display_portfolio_builder(fetch_fn):
     # 4) portföy sonuçları
     if analysis and "names" in analysis:
         with box:
-            _render_results(analysis, uni, list(uni.index), fetch_fn)
+            _render_results(analysis, uni, list(uni.index), fetch_fn, deps)
             _render_time_section(analysis, uni, list(uni.index), fetch_fn)
