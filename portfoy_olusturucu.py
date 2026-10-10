@@ -1065,7 +1065,7 @@ def _feature_frame(urets, bench_ret, uni, sector_score) -> pd.DataFrame:
     return feat.apply(pd.to_numeric, errors="coerce")
 
 
-def _map_figure(pos, uni, ustats, basket, weights, axis_titles, vectors, port_vec):
+def _map_figure(pos, uni, ustats, basket, weights, axis_titles, vectors, port_vec, origin=(0.0, 0.0, 0.0)):
     palette = pcolors.qualitative.D3
     sectors = sorted({(uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"])
                        else UNASSIGNED) for t in pos.index})
@@ -1099,9 +1099,9 @@ def _map_figure(pos, uni, ustats, basket, weights, axis_titles, vectors, port_ve
         if vectors:
             xs, ys, zs = [], [], []
             for t in in_basket:
-                xs += [0, pos.loc[t].iloc[0], None]
-                ys += [0, pos.loc[t].iloc[1], None]
-                zs += [0, pos.loc[t].iloc[2], None]
+                xs += [origin[0], pos.loc[t].iloc[0], None]
+                ys += [origin[1], pos.loc[t].iloc[1], None]
+                zs += [origin[2], pos.loc[t].iloc[2], None]
             fig.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode="lines", name="Vektörler",
                                        hoverinfo="skip", line=dict(width=4, color="rgba(200,200,200,0.7)")))
         fig.add_trace(go.Scatter3d(
@@ -1147,6 +1147,7 @@ def _render_map(a, uni, sector_score, universe_tickers, fetch_fn):
     bench_ret = (bench_px / bench_px.shift(1) - 1.0).reindex(urets.index) if bench_px is not None else None
     ustats = pa.universe_stats(urets, bench_ret)
 
+    origin_pt = (0.0, 0.0, 0.0)
     mode = st.radio("Eksenler", ["Korelasyon uzayı", "Parametre uzayı"], horizontal=True,
                     key="pf_map_mode",
                     help="Korelasyon uzayı: noktalar getiri korelasyon yapısından (PCA) çıkar; iki "
@@ -1177,11 +1178,20 @@ def _render_map(a, uni, sector_score, universe_tickers, fetch_fn):
             return
         pos = feat[axes].dropna()
         vectors, port_vec, titles = False, None, axes
+        if st.checkbox("Vektör göster (evren ortalamasından)", key="pf_map_param_vec",
+                       help="Korelasyon uzayında vektörler orijinden çıkar çünkü orijin anlamlıdır (açı = "
+                            "korelasyon). Parametre uzayında eksenler gerçek değerlerdir (volatilite, beta, puan), "
+                            "'sıfır noktası' anlamsızdır; bu yüzden varsayılan olarak yalnızca nokta çizilir. Bu "
+                            "seçenek, seçili hisselere evrenin ORTALAMASINDAN (merkez) çıkan sapma vektörleri çizer: "
+                            "yön ve uzunluk, hissenin evren ortalamasından hangi parametrelerde ne kadar saptığını "
+                            "gösterir."):
+            vectors = True
+            origin_pt = tuple(float(v) for v in pos.mean().values)
 
     missing = [t for t in basket if t not in pos.index]
     if missing:
         st.caption("Haritada olmayan seçili hisseler (geçmiş/veri yetersiz): " + ", ".join(missing))
-    fig = _map_figure(pos, uni, ustats, basket, weights, titles, vectors, port_vec)
+    fig = _map_figure(pos, uni, ustats, basket, weights, titles, vectors, port_vec, origin_pt)
     st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG, key="pf_map_chart")
     if mode == "Korelasyon uzayı":
         _render_cosine(coords, urets, [t for t in basket if t in coords.index], min_obs)
@@ -1190,6 +1200,56 @@ def _render_map(a, uni, sector_score, universe_tickers, fetch_fn):
 def _cosine(u, v) -> float:
     nu, nv = float(np.linalg.norm(u)), float(np.linalg.norm(v))
     return float(np.dot(u, v) / (nu * nv)) if nu > 0 and nv > 0 else float("nan")
+
+
+def _pair_plots(A, B, va, vb, cos, rho, urets):
+    """Seçili iki hisse için: (1) iki vektörün içinde bulunduğu DÜZLEMDE vektörler ve aradaki açı,
+    (2) günlük getirilerin dağılımı + doğrusal uyum (korelasyonun görsel karşılığı)."""
+    na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+    if not np.isfinite(cos) or na == 0 or nb == 0:
+        return
+    th = float(np.arccos(np.clip(cos, -1, 1)))
+    deg = np.degrees(th)
+    colA, colB = "#4C9BE8", "#F2994A"
+    ends = {A: (na, 0.0, colA), B: (nb * np.cos(th), nb * np.sin(th), colB)}
+    fig = go.Figure()
+    for lab, (x_, y_, col) in ends.items():
+        fig.add_trace(go.Scatter(x=[0, x_], y=[0, y_], mode="lines+markers+text", text=["", lab],
+                                 textposition="top center", name=lab, hoverinfo="skip",
+                                 line=dict(width=4, color=col), marker=dict(size=[1, 11], color=col)))
+    r = 0.45 * min(na, nb)
+    t = np.linspace(0, th, 40)
+    fig.add_trace(go.Scatter(x=r * np.cos(t), y=r * np.sin(t), mode="lines", hoverinfo="skip",
+                             line=dict(width=2, color="gray", dash="dot"), showlegend=False))
+    fig.add_annotation(x=1.35 * r * np.cos(th / 2), y=1.35 * r * np.sin(th / 2), text=f"<b>{deg:.0f}°</b>",
+                       showarrow=False, font=dict(size=14))
+    lim = max(na, nb) * 1.15
+    fig.update_layout(
+        height=260, margin=dict(l=5, r=5, t=45, b=5), showlegend=False,
+        title=dict(text=f"{A} ↔ {B}: açı {deg:.0f}° · kosinüs {cos:.2f} · korelasyon {rho:.2f}", font=dict(size=13)),
+        xaxis=dict(range=[-0.1 * lim, lim], zeroline=True, showgrid=False, visible=False),
+        yaxis=dict(range=[-0.1 * lim, lim], scaleanchor="x", scaleratio=1, zeroline=True, showgrid=False,
+                   visible=False))
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG, key="pf_pair_plane")
+    st.caption("Vektörler, iki hissenin 3B vektörlerinin içinde bulunduğu düzleme açılmış hâlidir; boylar ve "
+               "aradaki açı gerçektir.")
+
+    d = urets[[A, B]].dropna() * 100.0
+    if len(d) > 5:
+        slope, icpt = np.polyfit(d[A].values, d[B].values, 1)
+        xs_ = np.array([d[A].min(), d[A].max()])
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=d[A], y=d[B], mode="markers", name="Günler", hoverinfo="skip",
+                                  marker=dict(size=4, opacity=0.35, color="rgb(120,140,170)")))
+        fig2.add_trace(go.Scatter(x=xs_, y=slope * xs_ + icpt, mode="lines", name="Doğrusal uyum",
+                                  line=dict(width=3, color="red")))
+        fig2.update_layout(
+            height=260, margin=dict(l=5, r=5, t=45, b=5), showlegend=False,
+            title=dict(text=f"Günlük getiriler: ρ = {rho:.2f} · eğim (β) {slope:.2f}", font=dict(size=13)),
+            xaxis_title=f"{A} günlük getiri %", yaxis_title=f"{B} günlük getiri %")
+        st.plotly_chart(fig2, use_container_width=True, config=PLOTLY_CFG, key="pf_pair_scatter")
+        st.caption(f"Her nokta bir işlem günü. Kırmızı çizgi {B} getirisinin {A} getirisine doğrusal regresyonu "
+                   f"(eğim {slope:.2f}); noktalar çizgiye ne kadar yakınsa korelasyon o kadar yüksek.")
 
 
 def _render_cosine(coords, urets, in_map, min_obs):
@@ -1221,6 +1281,7 @@ def _render_cosine(coords, urets, in_map, min_obs):
                "YÖNÜ ölçer (boylara bölünür), bu yüzden vektörler 1'den kısaysa (3 faktör hisseyi tam "
                "açıklamıyorsa) korelasyondan YÜKSEK çıkar; korelasyonu en iyi nokta çarpım (x·y) yaklaşıklar. "
                "Gerçek korelasyon her zaman kesin değerdir.")
+    _pair_plots(A, B, va, vb, cos, rho, urets)
     if len(in_map) > 2:
         with st.expander("Tüm seçili çiftler"):
             rws = []
