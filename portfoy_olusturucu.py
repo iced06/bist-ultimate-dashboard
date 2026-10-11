@@ -654,45 +654,16 @@ def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
                f"%{max_w * 100:.0f}. Maks-Sharpe, hiçbir hisse risksiz faizi aşmıyorsa Min varyansa düşer.")
 
     # ── hisse bazında beklenen getiri – risk dağılımı; "yüksek getiri / düşük risk" bölgesi vurgulu ──
-    med_s, med_r = float(np.median(sig)), float(np.median(mu_s))
-    in_zone = [bool(s_ <= med_s and r_ >= med_r) for s_, r_ in zip(sig, mu_s)]
-    xs_, ys_ = sig * 100, mu_s * 100
-    port_pts = [("Mevcut", w, "red", "star", 18), ("Min varyans", w_gmv, "white", "diamond", 12),
-                ("Maks. Sharpe", w_tan, "orange", "diamond", 12)]
-    px_ = [float(np.sqrt(wv @ cov @ wv) * 100) for _, wv, *_ in port_pts]
-    py_ = [float(wv @ mu_s * 100) for _, wv, *_ in port_pts]
-    x_lo, x_hi = min(xs_.min(), *px_) * 0.92, max(xs_.max(), *px_) * 1.06
-    y_lo, y_hi = min(ys_.min(), *py_, rf * 100) - 4, max(ys_.max(), *py_, rf * 100) + 4
-    def _gmark(t):
-        g = _num(uni.loc[t, "gorunum_puani"]) if t in uni.index else np.nan
-        return "" if np.isnan(g) else (" *" if g > 4 else (" +" if g >= 3 else " -"))
-    glabels = [t + _gmark(t) for t in names]
     gvals = np.array([_num(uni.loc[t, "gorunum_puani"]) if t in uni.index else np.nan for t in names])
-    fz = go.Figure()
-    fz.add_shape(type="rect", x0=x_lo, x1=med_s * 100, y0=med_r * 100, y1=y_hi, layer="below",
-                 fillcolor="rgba(46,160,67,0.16)", line=dict(width=1, color="rgba(46,160,67,0.6)", dash="dot"))
-    fz.add_annotation(x=(x_lo + med_s * 100) / 2, y=y_hi, yanchor="top", showarrow=False,
-                      text="<b>Yüksek getiri · düşük risk</b>", font=dict(color="rgb(46,160,67)", size=12))
-    fz.add_vline(x=med_s * 100, line_dash="dot", line_color="gray")
-    fz.add_hline(y=med_r * 100, line_dash="dot", line_color="gray")
-    fz.add_hline(y=rf * 100, line_dash="dash", line_color="orange",
-                 annotation_text=f"Risksiz faiz %{rf * 100:.1f}", annotation_position="bottom right")
-    fz.add_trace(go.Scatter(
-        x=xs_, y=ys_, mode="markers+text", name="Hisseler", text=glabels, textposition="top center",
-        marker=dict(size=[10 + 60 * float(wi) for wi in w],
-                    color=["rgb(46,160,67)" if z else "rgb(120,140,170)" for z in in_zone],
-                    line=dict(width=[2 if z else 0.5 for z in in_zone], color="white"), opacity=0.9),
-        customdata=np.column_stack([w * 100, (mu_s - rf) / sig, gvals]),
-        hovertemplate="<b>%{text}</b><br>Risk σ %{x:.1f}%<br>Beklenen getiri %{y:.1f}%<br>"
-                      "Ağırlık %{customdata[0]:.1f}%<br>Getiri/Risk %{customdata[1]:.2f}<br>"
-                      "Görünüm %{customdata[2]:.1f}<extra></extra>"))
-    for (lab, _, color, sym, size), x_, y_ in zip(port_pts, px_, py_):
-        fz.add_trace(go.Scatter(x=[x_], y=[y_], mode="markers", name=lab,
-                                marker=dict(size=size, color=color, symbol=sym, line=dict(width=1, color="black"))))
-    fz.update_layout(title="Hisse bazında beklenen getiri – risk (nokta büyüklüğü = ağırlık)", height=420,
-                     xaxis=dict(title="Risk: yıllık standart sapma σ %", range=[x_lo, x_hi]),
-                     yaxis=dict(title="Beklenen getiri % (Markowitz)", range=[y_lo, y_hi]),
-                     margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
+    glabels = [t + _gorunum_mark(g) for t, g in zip(names, gvals)]
+    port_pts = [("Mevcut", (float(np.sqrt(w @ cov @ w)), float(w @ mu_s)), "red", "star", 18),
+                ("Min varyans", (float(np.sqrt(w_gmv @ cov @ w_gmv)), float(w_gmv @ mu_s)), "white", "diamond", 12),
+                ("Maks. Sharpe", (float(np.sqrt(w_tan @ cov @ w_tan)), float(w_tan @ mu_s)), "orange", "diamond", 12)]
+    fz, in_zone = _return_risk_figure(
+        names, mu_s, sig, rf, glabels, gvals, [10 + 60 * float(wi) for wi in w],
+        extras=[("Ağırlık", w * 100, ".1f", "%")], port_pts=port_pts,
+        title="Hisse bazında beklenen getiri – risk (nokta büyüklüğü = ağırlık)",
+        ytitle="Beklenen getiri % (Markowitz)")
     st.plotly_chart(fz, use_container_width=True, config=PLOTLY_CFG, key="pf_ret_risk_scatter")
     zone = sorted((t for t, z in zip(names, in_zone) if z),
                   key=lambda t: -((mu_s[names.index(t)] - rf) / sig[names.index(t)]))
@@ -848,6 +819,149 @@ def _fnum(x):
     return v if np.isfinite(v) else np.nan
 
 
+def _build_valuation_results(uni, tickers, last, peers, hists, params):
+    """Hedef fiyat sonuçları: {ticker: target_for_stock çıktısı + overall/gorunum/val/href/sref/sector}.
+    Sektör referansı TÜM peers (rapor evreni) üzerinden kurulur; tickers yalnızca sonucu istenenler.
+    Dönüş: (results, sector_all)."""
+    mult_cols = ("pe", "fwd_pe", "ev_ebitda", "fwd_ev_ebitda")
+    rows = pd.DataFrame({t: {k: _fnum(v.get(k)) for k in mult_cols} for t, v in peers.items()}).T
+    sector_all = {t: (uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"]) else None)
+                  for t in rows.index}
+    sref_all = pv.sector_reference(rows, sector_all)
+    ov_by_sector = pd.to_numeric(uni["overall_puani"], errors="coerce").groupby(uni["sektor"]).mean()
+    results = {}
+    for t in tickers:
+        v = peers.get(t)
+        price = last.get(t)
+        if not v or not price:
+            continue
+        sek = sector_all.get(t)
+        sref, fallback = {}, []
+        for k in mult_cols:
+            sv = sref_all.get(sek, {}).get(k, (np.nan, 0))
+            if not np.isfinite(sv[0]):
+                sv = sref_all[pv.ALL_KEY].get(k, (np.nan, 0))
+                if np.isfinite(sv[0]):
+                    fallback.append(k)
+            sref[k] = sv
+        href = pv.history_reference(hists.get(t), v, pv.DEFAULTS["min_hist"], params)
+        ov, go_ = _num(uni.loc[t, "overall_puani"]), _num(uni.loc[t, "gorunum_puani"])
+        res = pv.target_for_stock(price, v, href, sref, None if np.isnan(ov) else ov,
+                                  _fnum(ov_by_sector.get(sek)), None if np.isnan(go_) else go_, sek, params)
+        res.update(overall=None if np.isnan(ov) else ov, gorunum=None if np.isnan(go_) else go_, val=v,
+                   href=href, sref=sref, sector=sek or UNASSIGNED, sector_fallback=bool(fallback))
+        results[t] = res
+    return results, sector_all
+
+
+def _render_multiple_tables(results, order):
+    """Çarpan karşılaştırma tabloları (İleri F/K ve İleri FD/FAVÖK): güncel · geçmiş · sektör."""
+    for key, title, cur_key in (("fwd_pe", "İleri F/K", "pe"), ("fwd_ev_ebitda", "İleri FD/FAVÖK", "ev_ebitda")):
+        rws = []
+        for t in order:
+            r = results[t]
+            if key not in r["methods"] and key not in r["rejected"] and not np.isfinite(_fnum(r["val"].get(key))):
+                continue
+            cur = _fnum(r["val"].get(key))
+            hr = r["href"].get(key, {})
+            hmed, sv = hr.get("median", np.nan), r["sref"][key]
+            rws.append({
+                "Hisse": t, "Güncel (trailing)": _fnum(r["val"].get(cur_key)), title: cur,
+                "Geçmiş medyan": hmed, "Geçmiş n": hr.get("n", 0),
+                "Geçmişe göre %": (cur / hmed - 1) * 100 if np.isfinite(hmed) and np.isfinite(cur) else np.nan,
+                "Geçmişte bugünden düşük %": hr.get("pct_below", np.nan) * 100,
+                "Sektör medyan": sv[0], "Sektör n": sv[1],
+                "Sektöre göre %": (cur / sv[0] - 1) * 100 if np.isfinite(sv[0]) and np.isfinite(cur) else np.nan,
+                "Hedef çarpan": r["methods"].get(key, {}).get("target_multiple", np.nan),
+                "Hedef fiyat ₺": r["methods"].get(key, {}).get("target_price", np.nan),
+                "Not": r["rejected"].get(key, ""),
+            })
+        st.markdown(f"**{title}**" + (" — bankacılık/sigorta/finansta FD/FAVÖK kullanılmaz" if key == "fwd_ev_ebitda" else ""))
+        if not rws:
+            st.caption("Hesaplanabilen hisse yok.")
+            continue
+        st.dataframe(pd.DataFrame(rws), hide_index=True, use_container_width=True, column_config={
+            c: st.column_config.NumberColumn(format="%.1f" if "%" in c else "%.2f")
+            for c in ("Güncel (trailing)", title, "Geçmiş medyan", "Geçmişe göre %", "Geçmişte bugünden düşük %",
+                      "Sektör medyan", "Sektöre göre %", "Hedef çarpan", "Hedef fiyat ₺")
+            if c != "Not"})
+    fb = [t for t in order if results[t]["sector_fallback"]]
+    if fb:
+        st.caption("Sektörde yeterli hisse (≥3) olmadığı için tüm rapor evreni medyanı kullanılan hisseler: "
+                   + ", ".join(fb))
+
+
+def _render_valuation_notes(w_hist, k_q, k_o):
+    with st.expander("ℹ️ Hedef fiyat nasıl hesaplanıyor? Sınırlar nelerdir?"):
+        st.markdown(
+            "1. **Çarpanlar:** her hisse için *ileri F/K* (piyasa değeri ÷ tahmini 4 çeyreklik net kâr) ve "
+            "*ileri FD/FAVÖK* (firma değeri ÷ tahmini FAVÖK). İleri değerler uygulamanın mekanik tahmininden "
+            "(mevsimsellik + momentum + ortalamaya dönüş) gelir; analist konsensüsü değildir.\n"
+            "2. **Geçmiş:** hissenin kendi geçmiş çeyrekleri için, o güne kadarki finansallarla ayni tahmin "
+            "yöntemi yeniden çalıştırılıp ileri çarpanlar yeniden kurulur (rapor gecikmesi 60 gün, fiyatlar "
+            "bölünme düzeltmeli). Medyan için en az 6 gözlem gerekir.\n"
+            "3. **Sektör:** aynı sektördeki rapor evreni hisselerinin güncel ileri çarpan medyanı (≥3 hisse; "
+            "yoksa tüm evren medyanı).\n"
+            f"4. **Hedef çarpan** = %{w_hist} geçmiş + %{100 - w_hist} sektör; sonra *Overall* (sektör ortalamasına "
+            f"göre puan başına %{k_q}) ve *Görünüm* (3'e göre puan başına %{k_o}) ile ölçeklenir, "
+            "0.75–1.25 aralığına kırpılır.\n"
+            "5. **Hedef fiyat:** F/K için fiyat × hedef/güncel çarpan; FD/FAVÖK için (hedef FD/FAVÖK × tahmini "
+            "FAVÖK − net borç) ÷ hisse sayısı. Mevcut yöntemlerin ortalaması alınır; fiyatın 0.5x–2x'i ile sınırlıdır.\n"
+            "6. **Potansiyel** = hedef/fiyat − 1; **Öncelik** 1 = en yüksek potansiyel. Güven: iki yöntem + hem geçmiş "
+            "hem sektör referansı varsa Yüksek.\n\n"
+            "**Sınırlar:** hedef fiyat, çarpanların ortalamaya döneceği varsayımıdır (zaman ufku belirsiz); "
+            "tahmin gürültülüdür (özellikle kâr dalgalanan/enflasyon muhasebesi etkili şirketlerde); "
+            "finansal verisi olmayan hisseler (ör. bazı bankalar) hesaplanamaz. **Yatırım tavsiyesi değildir.**")
+
+
+def _return_risk_figure(names, mu, sig, rf, glabels, gvals, sizes, extras=(), port_pts=(), title="", ytitle="",
+                        height=420):
+    """Beklenen getiri – risk dağılımı; risk medyanının altında & getiri medyanının üstünde kalan 'yüksek getiri /
+    düşük risk' bölgesi yeşil vurgulu. mu/sig ondalık (yıllık). extras: [(etiket, dizi, biçim, sonek)] hover
+    satırları; port_pts: [(etiket, (sigma, mu), renk, sembol, boyut)] (ondalık). Dönüş: (figür, in_zone listesi)."""
+    mu, sig = np.asarray(mu, dtype=float), np.asarray(sig, dtype=float)
+    med_s, med_r = float(np.median(sig)), float(np.median(mu))
+    in_zone = [bool(s_ <= med_s and r_ >= med_r) for s_, r_ in zip(sig, mu)]
+    xs_, ys_ = sig * 100, mu * 100
+    px_ = [pt[1][0] * 100 for pt in port_pts]
+    py_ = [pt[1][1] * 100 for pt in port_pts]
+    x_lo, x_hi = min([xs_.min()] + px_) * 0.92, max([xs_.max()] + px_) * 1.06
+    y_lo, y_hi = min([ys_.min(), rf * 100] + py_) - 4, max([ys_.max(), rf * 100] + py_) + 4
+    fz = go.Figure()
+    fz.add_shape(type="rect", x0=x_lo, x1=med_s * 100, y0=med_r * 100, y1=y_hi, layer="below",
+                 fillcolor="rgba(46,160,67,0.16)", line=dict(width=1, color="rgba(46,160,67,0.6)", dash="dot"))
+    fz.add_annotation(x=(x_lo + med_s * 100) / 2, y=y_hi, yanchor="top", showarrow=False,
+                      text="<b>Yüksek getiri · düşük risk</b>", font=dict(color="rgb(46,160,67)", size=12))
+    fz.add_vline(x=med_s * 100, line_dash="dot", line_color="gray")
+    fz.add_hline(y=med_r * 100, line_dash="dot", line_color="gray")
+    fz.add_hline(y=rf * 100, line_dash="dash", line_color="orange",
+                 annotation_text=f"Risksiz faiz %{rf * 100:.1f}", annotation_position="bottom right")
+    cols = [np.asarray(e[1], dtype=float) for e in extras] + [(mu - rf) / sig, np.asarray(gvals, dtype=float)]
+    hover = "<b>%{text}</b><br>Risk σ %{x:.1f}%<br>Beklenen getiri %{y:.1f}%<br>"
+    for i, (lab, _, fmt, suf) in enumerate(extras):
+        hover += f"{lab} %{{customdata[{i}]:{fmt}}}{suf}<br>"
+    hover += (f"Getiri/Risk %{{customdata[{len(extras)}]:.2f}}<br>"
+              f"Görünüm %{{customdata[{len(extras) + 1}]:.1f}}<extra></extra>")
+    fz.add_trace(go.Scatter(
+        x=xs_, y=ys_, mode="markers+text", name="Hisseler", text=glabels, textposition="top center",
+        marker=dict(size=list(sizes), color=["rgb(46,160,67)" if z else "rgb(120,140,170)" for z in in_zone],
+                    line=dict(width=[2 if z else 0.5 for z in in_zone], color="white"), opacity=0.9),
+        customdata=np.column_stack(cols), hovertemplate=hover))
+    for (lab, _, color, sym, size), x_, y_ in zip(port_pts, px_, py_):
+        fz.add_trace(go.Scatter(x=[x_], y=[y_], mode="markers", name=lab,
+                                marker=dict(size=size, color=color, symbol=sym, line=dict(width=1, color="black"))))
+    fz.update_layout(title=title, height=height,
+                     xaxis=dict(title="Risk: yıllık standart sapma σ %", range=[x_lo, x_hi]),
+                     yaxis=dict(title=ytitle, range=[y_lo, y_hi]),
+                     margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
+    return fz, in_zone
+
+
+def _gorunum_mark(g) -> str:
+    """Görünüm puanı işareti: >4 '*', 3–4 '+', <3 '-' (puan yoksa boş)."""
+    return "" if g is None or np.isnan(g) else (" *" if g > 4 else (" +" if g >= 3 else " -"))
+
+
 def _render_valuation(a, uni, universe_tickers, fetch_fn, deps):
     st.markdown("---")
     st.markdown("### 🎯 Hedef fiyat ve ucuzluk önceliği")
@@ -901,35 +1015,7 @@ def _render_valuation(a, uni, universe_tickers, fetch_fn, deps):
         st.info("Finansal veri bulunamadı (Financial Data içe aktarılmamış olabilir).")
         return
 
-    mult_cols = ("pe", "fwd_pe", "ev_ebitda", "fwd_ev_ebitda")
-    rows = pd.DataFrame({t: {k: _fnum(v.get(k)) for k in mult_cols} for t, v in peers.items()}).T
-    sector_all = {t: (uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"]) else None)
-                  for t in rows.index}
-    sref_all = pv.sector_reference(rows, sector_all)
-    ov_by_sector = pd.to_numeric(uni["overall_puani"], errors="coerce").groupby(uni["sektor"]).mean()
-
-    results = {}
-    for t in in_uni:
-        v = peers.get(t)
-        price = last.get(t)
-        if not v or not price:
-            continue
-        sek = sector_all.get(t)
-        sref, fallback = {}, []
-        for k in mult_cols:
-            sv = sref_all.get(sek, {}).get(k, (np.nan, 0))
-            if not np.isfinite(sv[0]):
-                sv = sref_all[pv.ALL_KEY].get(k, (np.nan, 0))
-                if np.isfinite(sv[0]):
-                    fallback.append(k)
-            sref[k] = sv
-        href = pv.history_reference(hists.get(t), v, pv.DEFAULTS["min_hist"], params)
-        ov, go_ = _num(uni.loc[t, "overall_puani"]), _num(uni.loc[t, "gorunum_puani"])
-        res = pv.target_for_stock(price, v, href, sref, None if np.isnan(ov) else ov,
-                                  _fnum(ov_by_sector.get(sek)), None if np.isnan(go_) else go_, sek, params)
-        res.update(overall=None if np.isnan(ov) else ov, gorunum=None if np.isnan(go_) else go_, val=v,
-                   href=href, sref=sref, sector=sek or UNASSIGNED, sector_fallback=bool(fallback))
-        results[t] = res
+    results, sector_all = _build_valuation_results(uni, in_uni, last, peers, hists, params)
     if not results:
         st.info("Seçili hisselerin hiçbiri için değerleme hesaplanamadı (finansal verisi yok).")
         return
@@ -942,8 +1028,11 @@ def _render_valuation(a, uni, universe_tickers, fetch_fn, deps):
         wsum = sum(w_of.get(t, 0.0) for t in ok["ticker"])
         wup = (sum(w_of.get(t, 0.0) * u for t, u in zip(ok["ticker"], ok["upside"])) / wsum) if wsum > 0 else np.nan
         _metric(k1, "Ağırlıklı potansiyel", f"%{wup * 100:+.1f}", f"portföyün %{wsum * 100:.0f}'i kapsanıyor")
-        _metric(k2, "En ucuz", ok.iloc[0]["ticker"], f"%{ok.iloc[0]['upside'] * 100:+.0f} potansiyel")
-        _metric(k3, "En pahalı", ok.iloc[-1]["ticker"], f"%{ok.iloc[-1]['upside'] * 100:+.0f} potansiyel")
+        okc = ok[ok["confidence"] != "Düşük"]
+        okc = okc if len(okc) else ok
+        _metric(k2, "En ucuz", okc.iloc[0]["ticker"], f"%{okc.iloc[0]['upside'] * 100:+.0f} potansiyel")
+        _metric(k3, "En pahalı", okc.sort_values("upside").iloc[0]["ticker"],
+                f"%{okc['upside'].min() * 100:+.0f} potansiyel")
         _metric(k4, "Ucuz/pahalı", f"{int((ok['upside'] >= 0.10).sum())} / {int((ok['upside'] <= -0.10).sum())}",
                 "≥%10 / ≤−%10 potansiyel")
     show = pd.DataFrame({
@@ -984,39 +1073,7 @@ def _render_valuation(a, uni, universe_tickers, fetch_fn, deps):
         st.caption("⚠️ Bazı hedef fiyatlar uç değer koruması nedeniyle fiyatın 0.5x–2x'i ile sınırlandı.")
 
     with st.expander("🔬 Çarpan karşılaştırması: güncel · geçmiş · sektör"):
-        for key, title, cur_key in (("fwd_pe", "İleri F/K", "pe"), ("fwd_ev_ebitda", "İleri FD/FAVÖK", "ev_ebitda")):
-            rws = []
-            for t in pr_df["ticker"]:
-                r = results[t]
-                if key not in r["methods"] and key not in r["rejected"] and not np.isfinite(_fnum(r["val"].get(key))):
-                    continue
-                cur = _fnum(r["val"].get(key))
-                hr = r["href"].get(key, {})
-                hmed, sv = hr.get("median", np.nan), r["sref"][key]
-                rws.append({
-                    "Hisse": t, "Güncel (trailing)": _fnum(r["val"].get(cur_key)), title: cur,
-                    "Geçmiş medyan": hmed, "Geçmiş n": hr.get("n", 0),
-                    "Geçmişe göre %": (cur / hmed - 1) * 100 if np.isfinite(hmed) and np.isfinite(cur) else np.nan,
-                    "Geçmişte bugünden düşük %": hr.get("pct_below", np.nan) * 100,
-                    "Sektör medyan": sv[0], "Sektör n": sv[1],
-                    "Sektöre göre %": (cur / sv[0] - 1) * 100 if np.isfinite(sv[0]) and np.isfinite(cur) else np.nan,
-                    "Hedef çarpan": r["methods"].get(key, {}).get("target_multiple", np.nan),
-                    "Hedef fiyat ₺": r["methods"].get(key, {}).get("target_price", np.nan),
-                    "Not": r["rejected"].get(key, ""),
-                })
-            st.markdown(f"**{title}**" + (" — bankacılık/sigorta/finansta FD/FAVÖK kullanılmaz" if key == "fwd_ev_ebitda" else ""))
-            if not rws:
-                st.caption("Hesaplanabilen hisse yok.")
-                continue
-            st.dataframe(pd.DataFrame(rws), hide_index=True, use_container_width=True, column_config={
-                c: st.column_config.NumberColumn(format="%.1f" if "%" in c else "%.2f")
-                for c in ("Güncel (trailing)", title, "Geçmiş medyan", "Geçmişe göre %", "Geçmişte bugünden düşük %",
-                          "Sektör medyan", "Sektöre göre %", "Hedef çarpan", "Hedef fiyat ₺")
-                if c != "Not"})
-        fb = [t for t in results if results[t]["sector_fallback"]]
-        if fb:
-            st.caption("Sektörde yeterli hisse (≥3) olmadığı için tüm rapor evreni medyanı kullanılan hisseler: "
-                       + ", ".join(fb))
+        _render_multiple_tables(results, list(pr_df["ticker"]))
 
     fig = go.Figure()
     for t in ok["ticker"]:
@@ -1035,26 +1092,7 @@ def _render_valuation(a, uni, universe_tickers, fetch_fn, deps):
     if len(fig.data):
         st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG)
 
-    with st.expander("ℹ️ Hedef fiyat nasıl hesaplanıyor? Sınırlar nelerdir?"):
-        st.markdown(
-            "1. **Çarpanlar:** her hisse için *ileri F/K* (piyasa değeri ÷ tahmini 4 çeyreklik net kâr) ve "
-            "*ileri FD/FAVÖK* (firma değeri ÷ tahmini FAVÖK). İleri değerler uygulamanın mekanik tahmininden "
-            "(mevsimsellik + momentum + ortalamaya dönüş) gelir; analist konsensüsü değildir.\n"
-            "2. **Geçmiş:** hissenin kendi geçmiş çeyrekleri için, o güne kadarki finansallarla ayni tahmin "
-            "yöntemi yeniden çalıştırılıp ileri çarpanlar yeniden kurulur (rapor gecikmesi 60 gün, fiyatlar "
-            "bölünme düzeltmeli). Medyan için en az 6 gözlem gerekir.\n"
-            "3. **Sektör:** aynı sektördeki rapor evreni hisselerinin güncel ileri çarpan medyanı (≥3 hisse; "
-            "yoksa tüm evren medyanı).\n"
-            f"4. **Hedef çarpan** = %{w_hist} geçmiş + %{100 - w_hist} sektör; sonra *Overall* (sektör ortalamasına "
-            f"göre puan başına %{k_q}) ve *Görünüm* (3'e göre puan başına %{k_o}) ile ölçeklenir, "
-            "0.75–1.25 aralığına kırpılır.\n"
-            "5. **Hedef fiyat:** F/K için fiyat × hedef/güncel çarpan; FD/FAVÖK için (hedef FD/FAVÖK × tahmini "
-            "FAVÖK − net borç) ÷ hisse sayısı. Mevcut yöntemlerin ortalaması alınır; fiyatın 0.5x–2x'i ile sınırlıdır.\n"
-            "6. **Potansiyel** = hedef/fiyat − 1; **Öncelik** 1 = en yüksek potansiyel. Güven: iki yöntem + hem geçmiş "
-            "hem sektör referansı varsa Yüksek.\n\n"
-            "**Sınırlar:** hedef fiyat, çarpanların ortalamaya döneceği varsayımıdır (zaman ufku belirsiz); "
-            "tahmin gürültülüdür (özellikle kâr dalgalanan/enflasyon muhasebesi etkili şirketlerde); "
-            "finansal verisi olmayan hisseler (ör. bazı bankalar) hesaplanamaz. **Yatırım tavsiyesi değildir.**")
+    _render_valuation_notes(w_hist, k_q, k_o)
 
 
 # ───────────────────────── beklenen getiri yöntemleri (PCA, karakteristik regresyonu) ─────────────────────────

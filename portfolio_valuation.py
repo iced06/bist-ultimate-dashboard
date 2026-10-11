@@ -215,9 +215,11 @@ def target_for_stock(price: float, val: dict, hist_ref: dict, sec_ref: dict, ove
     return res
 
 
-def prioritize(results: dict) -> pd.DataFrame:
+def prioritize(results: dict, low_conf_last: bool = True) -> pd.DataFrame:
     """results: {ticker: target_for_stock çıktısı + 'overall' + 'gorunum'}. Potansiyele göre sıralı tablo
-    (Öncelik 1 = en ucuz). Hedefi olmayanlar sona atılır, sırası boş kalır."""
+    (Öncelik 1 = en ucuz). low_conf_last=True iken güveni 'Düşük' olan hedefler (uç değer sınırına çarpmış ya da
+    tek zayıf referanslı) güvenilir olanların ARDINA alınır - aksi halde liste sınıra çarpmış +%100'lerle dolar.
+    Hedefi olmayanlar en sona atılır, sırası boş kalır."""
     rows = []
     for t, r in results.items():
         rows.append(dict(ticker=t, price=r["price"], target=r["target_price"], upside=r["upside"],
@@ -227,6 +229,10 @@ def prioritize(results: dict) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df = df.sort_values("upside", ascending=False, na_position="last").reset_index(drop=True)
+    df["_none"] = df["upside"].isna()
+    df["_low"] = (df["confidence"] == "Düşük") if low_conf_last else False
+    df = df.sort_values(["_none", "_low", "upside"], ascending=[True, True, False],
+                        na_position="last").drop(columns=["_none", "_low"])
+    df = df.reset_index(drop=True)
     df["rank"] = np.where(df["upside"].notna(), np.arange(1, len(df) + 1), np.nan)
     return df

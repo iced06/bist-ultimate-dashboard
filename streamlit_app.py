@@ -58,6 +58,13 @@ except Exception as _portfoy_import_error:
         st.error("📐 Portföy özelliği yüklenemedi (portfoy_olusturucu.py import hatası).")
         st.code(str(_portfoy_import_error))
 
+try:
+    from stock_analyzer import display_stock_analyzer
+except Exception as _stock_analyzer_import_error:
+    def display_stock_analyzer(*args, **kwargs):
+        st.error("🔬 Stock Analyzer özelliği yüklenemedi (stock_analyzer.py import hatası).")
+        st.code(str(_stock_analyzer_import_error))
+
 st.set_page_config(
     page_title="BIST Technical Analysis",
     page_icon="📊",
@@ -4450,7 +4457,7 @@ def main():
         
         with st.sidebar:
             st.header("⚙️ Settings")
-            mode = st.radio("Mode", ["📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "🌍 Macro Analysis", "💰 Funds", "📄 Company Reports", "📐 Portfolio"])
+            mode = st.radio("Mode", ["📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "🌍 Macro Analysis", "💰 Funds", "📄 Company Reports", "🔬 Stock Analyzer", "📐 Portfolio"])
             st.markdown("---")
             st.subheader("⏱️ Timeframe")
             available_tf = {k: v for k, v in TIMEFRAMES.items() if not v["auth_required"] or auth}
@@ -5374,6 +5381,15 @@ def main():
             except Exception as e:
                 st.error(f"Company reports error: {str(e)}")
                 st.info("Database connection may be temporarily unavailable.")
+        elif mode == "🔬 Stock Analyzer":
+            try:
+                display_stock_analyzer(
+                    fetch_stock_data, valuation_fn=compute_stock_valuations,
+                    valuation_history_fn=compute_valuation_history,
+                    financial_loader=_load_financial_store_for)
+            except Exception as e:
+                st.error(f"Stock Analyzer error: {str(e)}")
+                st.info("Database or price data source may be temporarily unavailable.")
         elif mode == "📐 Portfolio":
             try:
                 display_portfolio_builder(
