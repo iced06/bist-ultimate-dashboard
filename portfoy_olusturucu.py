@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import portfolio_analytics as pa
+import portfolio_factors as pf
 import portfolio_valuation as pv
 import portfoy_store as store
 from sirket_raporlari import (
@@ -662,6 +663,11 @@ def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
     py_ = [float(wv @ mu_s * 100) for _, wv, *_ in port_pts]
     x_lo, x_hi = min(xs_.min(), *px_) * 0.92, max(xs_.max(), *px_) * 1.06
     y_lo, y_hi = min(ys_.min(), *py_, rf * 100) - 4, max(ys_.max(), *py_, rf * 100) + 4
+    def _gmark(t):
+        g = _num(uni.loc[t, "gorunum_puani"]) if t in uni.index else np.nan
+        return "" if np.isnan(g) else (" *" if g > 4 else (" +" if g >= 3 else " -"))
+    glabels = [t + _gmark(t) for t in names]
+    gvals = np.array([_num(uni.loc[t, "gorunum_puani"]) if t in uni.index else np.nan for t in names])
     fz = go.Figure()
     fz.add_shape(type="rect", x0=x_lo, x1=med_s * 100, y0=med_r * 100, y1=y_hi, layer="below",
                  fillcolor="rgba(46,160,67,0.16)", line=dict(width=1, color="rgba(46,160,67,0.6)", dash="dot"))
@@ -672,13 +678,14 @@ def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
     fz.add_hline(y=rf * 100, line_dash="dash", line_color="orange",
                  annotation_text=f"Risksiz faiz %{rf * 100:.1f}", annotation_position="bottom right")
     fz.add_trace(go.Scatter(
-        x=xs_, y=ys_, mode="markers+text", name="Hisseler", text=names, textposition="top center",
+        x=xs_, y=ys_, mode="markers+text", name="Hisseler", text=glabels, textposition="top center",
         marker=dict(size=[10 + 60 * float(wi) for wi in w],
                     color=["rgb(46,160,67)" if z else "rgb(120,140,170)" for z in in_zone],
                     line=dict(width=[2 if z else 0.5 for z in in_zone], color="white"), opacity=0.9),
-        customdata=np.column_stack([w * 100, (mu_s - rf) / sig]),
+        customdata=np.column_stack([w * 100, (mu_s - rf) / sig, gvals]),
         hovertemplate="<b>%{text}</b><br>Risk σ %{x:.1f}%<br>Beklenen getiri %{y:.1f}%<br>"
-                      "Ağırlık %{customdata[0]:.1f}%<br>Getiri/Risk %{customdata[1]:.2f}<extra></extra>"))
+                      "Ağırlık %{customdata[0]:.1f}%<br>Getiri/Risk %{customdata[1]:.2f}<br>"
+                      "Görünüm %{customdata[2]:.1f}<extra></extra>"))
     for (lab, _, color, sym, size), x_, y_ in zip(port_pts, px_, py_):
         fz.add_trace(go.Scatter(x=[x_], y=[y_], mode="markers", name=lab,
                                 marker=dict(size=size, color=color, symbol=sym, line=dict(width=1, color="black"))))
@@ -690,7 +697,8 @@ def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
     zone = sorted((t for t, z in zip(names, in_zone) if z),
                   key=lambda t: -((mu_s[names.index(t)] - rf) / sig[names.index(t)]))
     st.caption("🟩 Yeşil bölge: risk (σ) seçili hisselerin medyanının altında, beklenen getiri medyanının üstünde "
-               "— göreli bir ayrım, mutlak 'iyi' demek değildir. "
+               "— göreli bir ayrım, mutlak 'iyi' demek değildir. Etiket işareti Görünüm puanı: "
+               "**\\*** 4 üzeri, **+** 3–4 arası, **-** 3 altı. "
                + ("Bölgedeki hisseler (getiri/risk sırasıyla): " + ", ".join(zone) + "." if zone
                   else "Bölgede hisse yok."))
 
@@ -802,6 +810,8 @@ def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
                                         "Volatilite": st.column_config.NumberColumn("Volatilite %", format="%.1f")})
             st.button("➕ Önerilenleri sepete ekle", key="pf_add_suggested",
                       on_click=_add_tickers, args=(list(sg["ticker"]),))
+
+    _render_return_methods(a, uni, universe_tickers, fetch_fn, deps, mu_s)
 
 
 # ───────────────────────── değerleme: hedef fiyat & ucuzluk ─────────────────────────
@@ -1045,6 +1055,175 @@ def _render_valuation(a, uni, universe_tickers, fetch_fn, deps):
             "**Sınırlar:** hedef fiyat, çarpanların ortalamaya döneceği varsayımıdır (zaman ufku belirsiz); "
             "tahmin gürültülüdür (özellikle kâr dalgalanan/enflasyon muhasebesi etkili şirketlerde); "
             "finansal verisi olmayan hisseler (ör. bazı bankalar) hesaplanamaz. **Yatırım tavsiyesi değildir.**")
+
+
+# ───────────────────────── beklenen getiri yöntemleri (PCA, karakteristik regresyonu) ─────────────────────────
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fm_fit(panel_sig, _panel, alpha_frac):
+    return pf.fama_macbeth_ridge(_panel, alpha_frac=alpha_frac)
+
+
+def _render_return_methods(a, uni, universe_tickers, fetch_fn, deps, mu_s):
+    st.markdown("---")
+    st.markdown("### 🧮 Beklenen getiri yöntemleri karşılaştırması")
+    if not deps or not deps.get("valuation") or not deps.get("history") or not deps.get("loader"):
+        st.caption("Değerleme fonksiyonları bu ortamda yüklenemedi.")
+        return
+    if not st.toggle("Yöntemleri hesapla", key="pf_ret_on",
+                     help="Rapor evreninin 6 yıllık fiyatlarını ve finansallarını yükler (ilk açılışta 1-3 dk; "
+                          "sonra 30 dk önbellekte)."):
+        st.caption("Markowitz (tarihsel), PCA faktör modeli ve karakteristik regresyonu (ucuzluk, büyüme, momentum + "
+                   "puanlar) ile hisse bazında beklenen getiriyi yan yana koyar.")
+        return
+    st.session_state.setdefault("pf_ret_h", "3 ay")
+    st.session_state.setdefault("pf_ret_ridge", 100)
+    st.session_state.setdefault("pf_ret_k", 3)
+    st.session_state.setdefault("pf_ret_prem", 3)
+    st.session_state.setdefault("pf_ret_base", "Evren ortalaması")
+    with st.expander("⚙️ Varsayımlar", expanded=False):
+        c0, = st.columns(1)
+        base_opt = c0.selectbox("Karakteristik regresyonunun tabanı", ["Evren ortalaması", "Risksiz faiz",
+                                                                        "Sepet ortalaması (Markowitz)"],
+                                key="pf_ret_base",
+                                help="Regresyon yalnızca hisseler ARASINDAKİ farkı tahmin eder; mutlak düzey bir "
+                                     "tabandan başlar. Evren ortalaması: rapor evreninin analiz penceresindeki ort. "
+                                     "yıllık getirisi (sepet bilerek seçildiği için Markowitz'in tarihsel getirisi "
+                                     "genelde bunun üstündedir: seçim yanlılığı). Risksiz faiz: TL faizi.")
+        c1, c2, c3, c4 = st.columns(4)
+        h_label = c1.selectbox("Getiri ufku (regresyon)", ["3 ay", "6 ay"], key="pf_ret_h",
+                               help="Regresyonun tahmin ettiği sonraki getiri penceresi. 3 ay daha çok gözlem verir.")
+        ridge = c2.slider("Ridge gücü %", 10, 300, step=10, key="pf_ret_ridge",
+                          help="Katsayıları sıfıra çeker (aşırı uyumu bastırır). 100 = orta; yüksek = daha "
+                               "temkinli tahmin.")
+        k_fac = c3.slider("PCA faktör sayısı", 2, 6, key="pf_ret_k")
+        prem = c4.slider("Puan primi (σ başına, yıllık %)", 0, 10, key="pf_ret_prem",
+                         help="Overall/Görünüm puanları geçmiş verisi olmadığı için regresyonda ÖĞRENİLEMEZ; "
+                              "bu sabit prim, puanı kesitsel olarak 1σ yüksek olan hissenin beklenen getirisine "
+                              "eklenen yıllık %'dir. 0 = puanlar kullanılmaz.")
+    horizon = 63 if h_label == "3 ay" else 126
+
+    names = a["names"]
+    uni_t = tuple(sorted(universe_tickers))
+    with st.spinner("Evren fiyatları, finansallar ve geçmiş çarpanlar hesaplanıyor (ilk seferde 1-3 dk)..."):
+        fin = deps["loader"](uni_t)
+        uprices, _ = _load_close_prices(uni_t, a["start"], fetch_fn)
+        if uprices.empty:
+            st.warning("Evren fiyatları alınamadı.")
+            return
+        up = _to_calendar(uprices, a["cal"])
+        urets = (up / up.shift(1) - 1.0).iloc[1:].replace([np.inf, -np.inf], np.nan)
+        last = {t: float(uprices[t].dropna().iloc[-1]) for t in uprices.columns if uprices[t].notna().any()}
+        items = tuple((t, round(last[t], 4)) for t in uni_t if t in fin and t in last)
+        sig = hashlib.md5("|".join(f"{t}:{p}" for t, p in items).encode()).hexdigest()[:12]
+        peers = _peer_valuations(deps["valuation"], fin, sig, items)
+        long_start = (date.today() - timedelta(days=6 * 366)).isoformat()
+        long_px, _ = _load_close_prices(tuple(sorted(peers)), long_start, fetch_fn)
+        price_d, hists = {}, {}
+        for t in peers:
+            if t in long_px.columns and long_px[t].notna().any():
+                s_ = long_px[t].dropna()
+                price_d[t] = s_
+                hists[t] = _val_history(deps["history"], t, fin[t], s_, f"{t}:{s_.index[-1]}:{len(s_)}")
+    if len(peers) < 15:
+        st.info("Karakteristik regresyonu için yeterli hisse (finansal verisi olan, en az 15) yok.")
+    sector_all = {t: (uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"]) else None)
+                  for t in peers}
+
+    # PCA faktör modeli
+    pca = pf.pca_factor_mu(urets, k=k_fac)
+    # karakteristik regresyonu
+    panel = pf.build_panel(hists, price_d, sector_all, horizon=horizon)
+    fm = _fm_fit(f"{sig}|{horizon}|{len(panel)}", panel, ridge / 100.0) if len(panel) else None
+    cur = pf.current_features(peers, hists, price_d, sector_all)
+    uni_mean = float(urets.mean().mean() * pa.TRADING_DAYS)
+    rf_ = float(a["s"]["rf"])
+    bsk_mean = float(np.mean(mu_s))
+    base = {"Evren ortalaması": uni_mean, "Risksiz faiz": rf_}.get(base_opt, bsk_mean)
+    ov = pd.to_numeric(uni["overall_puani"], errors="coerce").reindex(cur.index)
+    gv = pd.to_numeric(uni["gorunum_puani"], errors="coerce").reindex(cur.index)
+    score_z = pf._winsor_z(0.5 * pf._winsor_z(ov).fillna(0) + 0.5 * pf._winsor_z(gv).fillna(0))
+    pm = pf.predict_mu(cur, fm["gamma"], horizon, base, score_z, prem / 100.0) if fm and fm["n_periods"] else None
+
+    rows = []
+    for t, m_ in zip(names, mu_s):
+        row = {"Hisse": t, "Markowitz (tarihsel, shrunk) %": float(m_) * 100,
+               "PCA faktör modeli %": float(pca["mu"].get(t, np.nan)) * 100,
+               "Karakteristik regresyon %": float(pm["mu"].get(t, np.nan)) * 100 if pm is not None else np.nan}
+        vals = [row[k] for k in ("Markowitz (tarihsel, shrunk) %", "PCA faktör modeli %", "Karakteristik regresyon %")
+                if np.isfinite(row[k])]
+        row["Ortalama %"] = float(np.mean(vals)) if vals else np.nan
+        row["Yöntem aralığı (pp)"] = float(max(vals) - min(vals)) if len(vals) > 1 else np.nan
+        rows.append(row)
+    tbl = pd.DataFrame(rows).sort_values("Ortalama %", ascending=False)
+    st.dataframe(tbl, hide_index=True, use_container_width=True, column_config={
+        c: st.column_config.NumberColumn(format="%.1f") for c in tbl.columns if c != "Hisse"} | {
+        "Yöntem aralığı (pp)": st.column_config.NumberColumn(
+            format="%.1f", help="Üç yöntemin en yüksek ve en düşük tahmini arasındaki fark; büyükse tahmin "
+                                "belirsizdir.")})
+    fig = go.Figure()
+    for col, color in (("Markowitz (tarihsel, shrunk) %", "#8892A6"), ("PCA faktör modeli %", "#4C9BE8"),
+                       ("Karakteristik regresyon %", "#6FCF97")):
+        fig.add_trace(go.Bar(name=col.replace(" %", ""), x=tbl["Hisse"], y=tbl[col], marker_color=color))
+    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=10, b=10),
+                      legend=dict(orientation="h", y=-0.25), yaxis_title="Yıllık beklenen getiri %")
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG, key="pf_ret_methods_bar")
+
+    if fm is not None and fm["n_periods"]:
+        sig_ok = np.isfinite(fm["ic_t"]) and fm["ic_t"] >= 2
+        mag = ("orta" if fm["ic_mean"] >= 0.10 else "zayıf" if fm["ic_mean"] >= 0.05 else "çok zayıf")
+        verdict = ((f"✅ İstatistiksel olarak anlamlı ama etki {mag} (IC ≥ 0.10 'orta' sayılır); tahmini tek başına "
+                    "değil, diğer yöntemlerle birlikte, düşük ağırlıkla kullan.") if sig_ok else
+                   "⚠️ IC istatistiksel olarak anlamlı değil: bu evrende/dönemde özelliklerin getiriyi ayırt ettiğine "
+                   "dair güçlü kanıt YOK; karakteristik tahmini ihtiyatla kullan.")
+        st.caption(
+            f"Karakteristik regresyon: {fm['n_periods']} çeyrek × ~{fm['n_obs'] // max(fm['n_periods'], 1)} hisse; "
+            f"zaman dışı bilgi katsayısı (IC) {fm['ic_mean']:+.2f} (t = {fm['ic_t']:.1f}). " + verdict)
+        st.caption(f"Taban: %{base * 100:.1f} ({base_opt}). Referans: evren ort. %{uni_mean * 100:.1f} · "
+                   f"sepet Markowitz ort. %{bsk_mean * 100:.1f} · PCA evren ort. %{float(pca['mu'].mean()) * 100:.1f} "
+                   f"· risksiz faiz %{rf_ * 100:.1f}. Yöntemler arasındaki büyük farkların çoğu taban farkından gelir: "
+                   "sepet bilerek yüksek puanlı hisselerden seçildiği için tarihsel getirisi evrenin üstünde.")
+    else:
+        st.caption("⚠️ Karakteristik regresyonu için yeterli geçmiş gözlem oluşturulamadı.")
+    st.caption(f"PCA: {pca['k']} faktör evren getiri varyansının %{pca['explained'].sum() * 100:.0f}'ini açıklıyor; "
+               "beklenen getiri yalnızca ortak faktörlerle açıklanan kısım (hissenin kendine özgü şans eseri "
+               "ortalaması atılır). Hiçbiri geleceği bilmez; tarihsel ortalamadan daha kararlı birer referanstır. "
+               "Yatırım tavsiyesi değildir.")
+
+    with st.expander("🔬 Tanılama: katsayılar, faktörler, hisse bazında katkılar"):
+        if fm is not None and fm["n_periods"]:
+            coef = pd.DataFrame({"Özellik": [pf.FEATURE_LABELS[f] for f in pf.FEATURES],
+                                 "Katsayı γ (ufuk getirisi / 1σ)": fm["gamma"].values,
+                                 "t-değeri": fm["tstat"].values})
+            st.markdown("**Karakteristik regresyonu — Fama-MacBeth katsayıları**")
+            st.dataframe(coef, hide_index=True, use_container_width=True, column_config={
+                "Katsayı γ (ufuk getirisi / 1σ)": st.column_config.NumberColumn(format="%+.4f"),
+                "t-değeri": st.column_config.NumberColumn(format="%+.1f")})
+            st.caption("Pozitif katsayı: özelliği yüksek (daha ucuz / daha çok büyüyen / momentumu güçlü) "
+                       "hisse sonraki ufukta ortalamanın üstünde getiri sağlamış. |t| ≥ 2 anlamlı sayılır; "
+                       "işaretler sezgiye ters çıkabilir — model veriden öğrenir.")
+        if pm is not None:
+            dec = pd.DataFrame({"Hisse": names})
+            for f in pf.FEATURES:
+                dec[pf.FEATURE_LABELS[f].split(":")[-1].strip() + " (z)"] = [cur[f].get(t, np.nan) for t in names]
+            dec["Özellik katkısı %"] = [pm["rel_features"].get(t, np.nan) * 100 for t in names]
+            dec["Puan primi %"] = [pm["rel_score"].get(t, np.nan) * 100 for t in names]
+            st.markdown(f"**Hisse bazında özellikler (z-skoru) ve katkılar** — taban: {base_opt.lower()} "
+                        f"%{base * 100:.1f}")
+            st.dataframe(dec, hide_index=True, use_container_width=True,
+                         column_config={c: st.column_config.NumberColumn(format="%.2f") for c in dec.columns
+                                        if c != "Hisse"})
+        pdf = pd.DataFrame({"Faktör": [f"F{i + 1}" for i in range(pca["k"])],
+                            "Açıkladığı varyans %": pca["explained"] * 100,
+                            "Faktör primi λ (yıllık %)": pca["premia"] * 100})
+        st.markdown("**PCA faktörleri**")
+        st.dataframe(pdf, hide_index=True, use_container_width=True, column_config={
+            c: st.column_config.NumberColumn(format="%.1f") for c in pdf.columns if c != "Faktör"})
+        r2 = pd.DataFrame({"Hisse": names, "PCA R² (faktörlerle açıklanan)": [pca["r2"].get(t, np.nan) for t in names]})
+        st.dataframe(r2, hide_index=True, use_container_width=True,
+                     column_config={"PCA R² (faktörlerle açıklanan)": st.column_config.NumberColumn(format="%.2f")})
+        st.caption("Faktör primi λ: faktör getirisinin yıllık ortalaması (işaret keyfi, yüklerle birlikte anlamlı). "
+                   "R² düşükse hisse ortak faktörlerle az açıklanıyor, PCA tahmini o hisse için zayıf.")
 
 
 # ───────────────────────── 3D harita ─────────────────────────
