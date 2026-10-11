@@ -286,6 +286,141 @@ def optimize_weights(method: str, mu: np.ndarray, cov: np.ndarray,
     raise ValueError(f"bilinmeyen yöntem: {method}")
 
 
+# ───────────────────────── model portföy: kardinalite kısıtlı optimizasyon ─────────────────────────
+
+def _utility(w, mu, cov, gamma):
+    return float(w @ mu - 0.5 * gamma * w @ cov @ w)
+
+
+def mean_variance_weights(mu, cov, objective: str = "utility", gamma: float = 4.0, rf: float = 0.0,
+                          lo: float = 0.0, hi: float = 1.0, groups=None, group_cap: float | None = None,
+                          x0=None):
+    """Long-only ağırlıklar, sum=1, lo<=w<=hi, her grup (sektör) toplamı <= group_cap.
+    objective: 'utility' -> max w'mu - gamma/2 w'Σw ; 'sharpe' -> max (w'mu - rf)/sqrt(w'Σw) (hiçbir kombinasyonun
+    fazla getirisi pozitif değilse utility çözümü döner). Dönüş: (weights, note|None)."""
+    mu, cov = np.asarray(mu, float), np.asarray(cov, float)
+    n = len(mu)
+    lo, hi = float(lo), float(max(hi, 1.0 / n + 1e-9))
+    lo = min(lo, 1.0 / n - 1e-9)
+    cons = [{"type": "eq", "fun": lambda w: w.sum() - 1.0, "jac": lambda w: np.ones(n)}]
+    note = None
+    if groups is not None and group_cap is not None:
+        g = np.asarray(groups)
+        labels = [x for x in dict.fromkeys(g.tolist()) if x is not None]
+        eff = max(float(group_cap), 1.0 / max(len(labels), 1) + 1e-6)
+        if eff > group_cap + 1e-12:
+            note = f"Sektör sınırı bu havuz için en az %{eff * 100:.0f} olmak zorunda; yükseltildi."
+        for lab in labels:
+            mask = (g == lab).astype(float)
+            cons.append({"type": "ineq", "fun": (lambda w, m=mask: eff - m @ w), "jac": (lambda w, m=mask: -m)})
+    start = np.full(n, 1.0 / n) if x0 is None else np.clip(np.asarray(x0, float), lo, hi)
+    start = start / start.sum()
+
+    def util(w):
+        return -(w @ mu - 0.5 * gamma * w @ cov @ w)
+
+    def util_g(w):
+        return -(mu - gamma * cov @ w)
+
+    res = minimize(util, start, jac=util_g, method="SLSQP", bounds=[(lo, hi)] * n, constraints=cons,
+                   options={"maxiter": 400, "ftol": 1e-12})
+    w_u = np.clip(res.x, lo, hi)
+    w_u = w_u / w_u.sum()
+    if objective != "sharpe":
+        return w_u, note
+    ex = mu - rf
+
+    def nsh(w):
+        s = np.sqrt(max(w @ cov @ w, 1e-18))
+        return -(w @ ex) / s
+
+    def nsh_g(w):
+        s = np.sqrt(max(w @ cov @ w, 1e-18))
+        return -ex / s + (w @ ex) * (cov @ w) / s ** 3
+
+    best, best_v = None, np.inf
+    for s0 in (w_u, np.full(n, 1.0 / n), start):
+        r = minimize(nsh, np.clip(s0, lo, hi) / np.clip(s0, lo, hi).sum(), jac=nsh_g, method="SLSQP",
+                     bounds=[(lo, hi)] * n, constraints=cons, options={"maxiter": 400, "ftol": 1e-12})
+        w = np.clip(r.x, lo, hi)
+        w = w / w.sum()
+        if nsh(w) < best_v:
+            best, best_v = w, nsh(w)
+    if -best_v <= 0:
+        return w_u, ((note + " ") if note else "") + (
+            "Hiçbir portföyün fazla getirisi risksiz faizi aşmıyor; Maks. Sharpe anlamsız, fayda çözümü kullanıldı.")
+    return best, note
+
+
+def _objective_value(w, mu, cov, objective, gamma, rf):
+    if objective == "sharpe":
+        s = float(np.sqrt(max(w @ cov @ w, 1e-18)))
+        return float((w @ mu - rf) / s)
+    return _utility(w, mu, cov, gamma)
+
+
+def select_model_portfolio(mu, cov, sectors=None, k: int = 15, objective: str = "utility", gamma: float = 4.0,
+                           rf: float = 0.0, cap: float = 0.15, min_w: float = 0.02,
+                           sector_cap: float | None = 0.35, max_swaps: int = 12) -> dict:
+    """Evrenden k hisse seçip ağırlıklandırır (kardinalite kısıtlı ortalama-varyans).
+
+    Sezgisel (NP-zor problem): (1) tüm havuzda kısıtlı optimum; (2) en küçük ağırlıklıların bir kısmı atılıp yeniden
+    optimize edilerek k'ya inilir (geriye eleme); (3) son k'da alt sınır (min_w) ile çözülür; (4) seçilmeyen hisselerin
+    marjinal faydası (μ_j − γ(Σw)_j) seçilenin en zayıfından yüksekse yer değiştirilir, amaç iyileşirse kabul edilir
+    (en fazla max_swaps tur). Dönüş: dict(idx[list], weights[array, idx sırasıyla], objective, notes[list], history)."""
+    mu, cov = np.asarray(mu, float), np.asarray(cov, float)
+    n = len(mu)
+    k = int(min(k, n))
+    sec = np.asarray(sectors) if sectors is not None else None
+    notes: list[str] = []
+    cap = max(float(cap), 1.0 / k + 1e-6)
+
+    def solve(ix, lo, hi):
+        w, nt = mean_variance_weights(mu[ix], cov[np.ix_(ix, ix)], objective, gamma, rf, lo, hi,
+                                      None if sec is None else sec[ix], sector_cap)
+        if nt and nt not in notes:
+            notes.append(nt)
+        return w
+
+    idx = list(range(n))
+    history = []
+    while len(idx) > k:
+        w = solve(idx, 0.0, cap)
+        history.append((len(idx), _objective_value(w, mu[idx], cov[np.ix_(idx, idx)], objective, gamma, rf)))
+        drop = max(1, int(round((len(idx) - k) * 0.35)))
+        order = np.argsort(w)
+        keep = sorted(np.array(idx)[order[drop:]].tolist())
+        idx = keep
+    lo = min(float(min_w), 0.9 / k)
+    w = solve(idx, lo, cap)
+    val = _objective_value(w, mu[idx], cov[np.ix_(idx, idx)], objective, gamma, rf)
+    for _ in range(max_swaps):
+        pool = [j for j in range(n) if j not in idx]
+        if not pool:
+            break
+        sub = cov[np.ix_(idx, idx)]
+        marg_sel = mu[idx] - gamma * sub @ w                    # seçilenlerin marjinal faydası
+        w_full = np.zeros(n)
+        w_full[idx] = w
+        marg_out = mu - gamma * cov @ w_full
+        cands = sorted(pool, key=lambda j: -marg_out[j])[:6]
+        weakest = list(np.argsort(marg_sel)[:3])
+        best_move = None
+        for wk in weakest:                                      # en iyi (tek) yer değiştirmeyi seç
+            for j in cands:
+                new_idx = sorted([i for p_, i in enumerate(idx) if p_ != wk] + [j])
+                w2 = solve(new_idx, lo, cap)
+                v2 = _objective_value(w2, mu[new_idx], cov[np.ix_(new_idx, new_idx)], objective, gamma, rf)
+                if v2 > val + 1e-9 and (best_move is None or v2 > best_move[0]):
+                    best_move = (v2, new_idx, w2)
+        if best_move is None:
+            break
+        val, idx, w = best_move
+    order = np.argsort(-w)
+    idx = [idx[i] for i in order]
+    w = w[order]
+    return dict(idx=idx, weights=w, objective=val, notes=notes, history=history)
+
 # ───────────────────────── metrikler ─────────────────────────
 
 def risk_contributions(w, cov) -> np.ndarray:

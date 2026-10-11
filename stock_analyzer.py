@@ -17,10 +17,10 @@ import portfolio_analytics as pa
 import portfolio_factors as pf
 import portfolio_valuation as pv
 from portfoy_olusturucu import (
-    LABEL_ICON, LOOKBACKS, PLOTLY_CFG, UNASSIGNED,
+    LABEL_ICON, LOOKBACKS, PLACEHOLDER, PLOTLY_CFG, UNASSIGNED,
     _build_valuation_results, _default_rf, _fnum, _gorunum_mark, _load_close_prices, _market_window,
-    _metric, _num, _peer_valuations, _render_multiple_tables, _render_valuation_notes, _return_risk_figure,
-    _to_calendar, _val_history,
+    _map_figure, _metric, _num, _peer_valuations, _render_multiple_tables, _render_valuation_notes,
+    _return_risk_figure, _to_calendar, _val_history,
 )
 from sirket_raporlari import DONEM_LABELS, get_available_periods_for_rollup, get_reports_for_period
 
@@ -202,11 +202,11 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
         _render_valuation_notes(w_hist, k_q, k_o)
 
     # ───────────── 2) beklenen getiri – risk ─────────────
-    st.markdown("---")
-    st.markdown("### 📈 Beklenen getiri – risk dağılımı")
     up = _to_calendar(uprices, (bench_px.index if bench_px is not None else uprices.index)[-(lookback + 1):])
     returns, dropped = pa.build_returns(up, min_obs=max(60, int(0.75 * lookback)))
     if returns.shape[1] < 5:
+        st.markdown("---")
+        st.markdown("### 📈 Beklenen getiri – risk dağılımı")
         st.info("Ortak tarih penceresinde yeterli hisse kalmadı; geriye bakışı kısaltmayı dene.")
         return
     cov_d, shrink = pa.ledoit_wolf_cov(returns.values)
@@ -214,8 +214,8 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
     mu_hist = returns.mean().values * pa.TRADING_DAYS
     names_all = list(returns.columns)
     sig_all = np.sqrt(np.diag(cov))
+    urets = (up / up.shift(1) - 1.0).iloc[1:].replace([np.inf, -np.inf], np.nan)
     if ret_src == RET_SOURCES[1]:
-        urets = (up / up.shift(1) - 1.0).iloc[1:].replace([np.inf, -np.inf], np.nan)
         pca = pf.pca_factor_mu(urets, k=3)
         mu_all = np.array([float(pca["mu"].get(t, np.nan)) for t in names_all])
         src_note = (f"PCA: 3 faktör evren varyansının %{pca['explained'].sum() * 100:.0f}'ini açıklıyor; beklenen "
@@ -224,6 +224,18 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
         mu_all = 0.5 * mu_hist + 0.5 * mu_hist.mean()
         src_note = (f"Markowitz: tarihsel ortalamanın kesit ortalamasına %50 çekilmiş hali; risk Ledoit-Wolf "
                     f"kovaryansı (shrinkage %{shrink * 100:.0f}).")
+    _render_return_risk_section(scored, results, names_all, mu_all, sig_all, rf, sector_pick, ret_src, lb_label,
+                                src_note, dropped)
+
+    # ───────────── 3) model portföy ─────────────
+    bench_ret = ((bench_px / bench_px.shift(1) - 1.0).reindex(urets.index) if bench_px is not None else None)
+    _render_model_portfolio(uni, scored, results, names_all, mu_all, cov, rf, urets, bench_ret, ret_src, lookback)
+
+
+def _render_return_risk_section(scored, results, names_all, mu_all, sig_all, rf, sector_pick, ret_src, lb_label,
+                                src_note, dropped):
+    st.markdown("---")
+    st.markdown("### 📈 Beklenen getiri – risk dağılımı")
     sel = [i for i, t in enumerate(names_all) if t in scored.index and np.isfinite(mu_all[i])
            and (sector_pick == "Tümü" or scored.loc[t, "sektor"] == sector_pick)]
     if len(sel) < 3:
@@ -265,3 +277,188 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
                                 ("Overall", "Görünüm", "Beklenen getiri %", "Risk σ %")} | {
                      "Potansiyel %": st.column_config.NumberColumn(format="%+.1f"),
                      "Getiri/Risk": st.column_config.NumberColumn(format="%.2f")})
+
+
+CONF_WEIGHT = {"Yüksek": 1.0, "Orta": 0.6, "Düşük": 0.25}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _model_select(mu, cov, sectors, k, objective, gamma, rf, cap, min_w, sector_cap):
+    sel = pa.select_model_portfolio(np.asarray(mu), np.asarray(cov), list(sectors), k=k, objective=objective,
+                                    gamma=gamma, rf=rf, cap=cap, min_w=min_w, sector_cap=sector_cap)
+    return {"idx": [int(i) for i in sel["idx"]], "weights": np.asarray(sel["weights"]), "objective": sel["objective"],
+            "notes": list(sel["notes"])}
+
+
+def _send_to_portfolio(tickers):
+    """Model portföyü Portföy sekmesindeki sepete aktarır (kayıtlı portföyden ayrılır)."""
+    ss = st.session_state
+    ss["pf_basket"] = list(tickers)
+    ss["pf_ver"] = ss.get("pf_ver", 0) + 1
+    ss["pf_active"] = None
+    ss["pf_saved_sel"] = PLACEHOLDER
+    ss.pop("pf_snapshot", None)
+    ss["pf_store_msg"] = ("ok", f"Stock Analyzer model portföyü sepete aktarıldı ({len(tickers)} hisse).")
+    ss["sa_mp_sent"] = True
+
+
+def _render_model_portfolio(uni, scored, results, names_all, mu_base, cov, rf, urets, bench_ret, ret_src, lookback):
+    st.markdown("---")
+    st.markdown("### 🧺 Model portföy")
+    st.caption("Evrenden, beklenen getiriyi risk karşılığında en çok artıracak hisseleri seçip ağırlıklandırır "
+               "(kardinalite kısıtlı ortalama-varyans optimizasyonu). Beklenen getiri = seçili kaynak + hedef fiyat "
+               "potansiyelinin güvene göre ağırlıklı payı. Yatırım tavsiyesi değildir.")
+    st.session_state.setdefault("sa_mp_k", 15)
+    st.session_state.setdefault("sa_mp_obj", "Fayda: getiri − risk cezası (önerilen)")
+    st.session_state.setdefault("sa_mp_gamma", 4.0)
+    st.session_state.setdefault("sa_mp_cap", 15)
+    st.session_state.setdefault("sa_mp_min", 2)
+    st.session_state.setdefault("sa_mp_sec", 35)
+    st.session_state.setdefault("sa_mp_tp", 25)
+    st.session_state.setdefault("sa_mp_gmin", 0.0)
+    with st.expander("⚙️ Model portföy ayarları", expanded=False):
+        a1, a2, a3, a4 = st.columns(4)
+        k = a1.slider("Hisse sayısı", 5, 30, key="sa_mp_k")
+        obj_label = a2.selectbox("Hedef", ["Fayda: getiri − risk cezası (önerilen)", "Maks. Sharpe"], key="sa_mp_obj",
+                                 help="Fayda: w'μ − (γ/2)·w'Σw. TL'de risksiz faiz çok yüksek olduğu için Maks. Sharpe "
+                                      "çoğu zaman anlamsızlaşır; fayda yaklaşımı bu durumda daha güvenilirdir.")
+        gamma = a3.slider("Risk iştahı γ (yüksek = daha temkinli)", 1.0, 12.0, step=0.5, key="sa_mp_gamma")
+        tp_w = a4.slider("Hedef fiyat payı %", 0, 100, step=5, key="sa_mp_tp",
+                         help="Beklenen getiriye, hedef fiyat potansiyelinin (−%50..+%100 ile sınırlı) güven ile "
+                              "çarpılmış bu yüzdesi eklenir. 0 = yalnızca tarihsel/PCA kaynağı.")
+        b1, b2, b3, b4 = st.columns(4)
+        cap = b1.slider("Hisse başına üst sınır %", 8, 40, key="sa_mp_cap")
+        min_w = b2.slider("Hisse başına alt sınır %", 1, 6, key="sa_mp_min")
+        sec_cap = b3.slider("Sektör üst sınırı %", 15, 100, step=5, key="sa_mp_sec")
+        g_min = b4.slider("En düşük Görünüm puanı", 0.0, 5.0, step=0.5, key="sa_mp_gmin",
+                          help="Aday havuzunu Görünüm puanına göre daraltır (0 = hepsi).")
+    objective = "sharpe" if obj_label == "Maks. Sharpe" else "utility"
+
+    mu_arr = np.asarray(mu_base, dtype=float)
+    pool = []
+    for i, t in enumerate(names_all):
+        if t not in scored.index or not np.isfinite(mu_arr[i]):
+            continue
+        g = _num(scored.loc[t, "gorunum_puani"])
+        if np.isfinite(g) and g < g_min:
+            continue
+        pool.append(i)
+    if len(pool) < k:
+        st.info(f"Aday havuzu ({len(pool)} hisse) istenen hisse sayısından ({k}) küçük; filtreleri gevşet.")
+        return
+    tick = [names_all[i] for i in pool]
+    view = np.array([(np.clip(results[t]["upside"], -0.5, 1.0) * CONF_WEIGHT.get(results[t]["confidence"], 0.0)
+                      if t in results and np.isfinite(results[t]["upside"]) else 0.0) for t in tick])
+    mu_pool = mu_arr[pool] + (tp_w / 100.0) * view
+    cov_pool = cov[np.ix_(pool, pool)]
+    secs = tuple(str(scored.loc[t, "sektor"]) if pd.notna(scored.loc[t, "sektor"]) else UNASSIGNED for t in tick)
+    with st.spinner("Model portföy optimize ediliyor..."):
+        sel = _model_select(tuple(np.round(mu_pool, 8)), cov_pool, secs, int(k), objective, float(gamma), float(rf),
+                            cap / 100.0, min_w / 100.0, sec_cap / 100.0)
+    ix = sel["idx"]
+    w = np.asarray(sel["weights"])
+    m_t = [tick[i] for i in ix]
+    mu_m, cov_m = mu_pool[ix], cov_pool[np.ix_(ix, ix)]
+    sig_m = np.sqrt(np.diag(cov_m))
+    rc = pa.risk_contributions(w, cov_m)
+    p_ret, p_sig = float(w @ mu_m), float(np.sqrt(w @ cov_m @ w))
+    corr_m = cov_m / np.outer(sig_m, sig_m)
+    iu = np.triu_indices(len(w), 1)
+    eqw = np.full(len(tick), 1.0 / len(tick))
+    e_ret, e_sig = float(eqw @ mu_pool), float(np.sqrt(eqw @ cov_pool @ eqw))
+    for nt in sel["notes"]:
+        st.caption("ℹ️ " + nt)
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    _metric(k1, "Beklenen getiri", f"%{p_ret * 100:.1f}", f"evren eşit ağırlık %{e_ret * 100:.1f}")
+    _metric(k2, "Risk σ", f"%{p_sig * 100:.1f}", f"evren eşit ağırlık %{e_sig * 100:.1f}")
+    _metric(k3, "Getiri/Risk", _sharpe_txt(p_ret, rf, p_sig), f"risksiz faiz %{rf * 100:.1f}")
+    _metric(k4, "Efektif hisse", f"{1.0 / float(np.sum(w ** 2)):.1f} / {len(w)}")
+    _metric(k5, "Ort. ikili korelasyon", f"{float(corr_m[iu].mean()):.2f}")
+
+    rows = []
+    for t, wi, mu_i, sg_i, rc_i, ix_i in zip(m_t, w, mu_m, sig_m, rc, ix):
+        r = results.get(t)
+        rows.append({
+            "Hisse": t + _gorunum_mark(_num(scored.loc[t, "gorunum_puani"])),
+            "Sektör": secs[ix_i],
+            "Ağırlık %": wi * 100,
+            "Beklenen getiri %": mu_i * 100,
+            "Baz getiri % (kaynak)": mu_arr[pool[ix_i]] * 100,
+            "Hedef fiyat katkısı %": (tp_w / 100.0) * view[ix_i] * 100,
+            "Risk σ %": sg_i * 100,
+            "Getiri/Risk": (mu_i - rf) / sg_i,
+            "Risk katkısı %": rc_i * 100,
+            "Overall": _num(scored.loc[t, "overall_puani"]),
+            "Görünüm": _num(scored.loc[t, "gorunum_puani"]),
+            "Potansiyel %": (r["upside"] * 100 if r and np.isfinite(r["upside"]) else np.nan),
+            "Güven": (r["confidence"] if r else "—"),
+        })
+    mt = pd.DataFrame(rows)
+    st.dataframe(mt, hide_index=True, use_container_width=True, column_config={
+        "Ağırlık %": st.column_config.ProgressColumn("Ağırlık %", min_value=0, max_value=float(max(cap, 1)), format="%.1f"),
+        "Risk katkısı %": st.column_config.ProgressColumn("Risk katkısı %", min_value=0, max_value=float(max(cap, 1)),
+                                                          format="%.1f"),
+        "Beklenen getiri %": st.column_config.NumberColumn(format="%.1f"),
+        "Baz getiri % (kaynak)": st.column_config.NumberColumn(format="%.1f"),
+        "Hedef fiyat katkısı %": st.column_config.NumberColumn(format="%+.1f"),
+        "Risk σ %": st.column_config.NumberColumn(format="%.1f"),
+        "Getiri/Risk": st.column_config.NumberColumn(format="%.2f"),
+        "Overall": st.column_config.NumberColumn(format="%.1f"),
+        "Görünüm": st.column_config.NumberColumn(format="%.1f"),
+        "Potansiyel %": st.column_config.NumberColumn(format="%+.1f"),
+    })
+    st.caption(f"Beklenen getiri = baz kaynak ({ret_src.split(' (')[0]}) + hedef fiyat katkısı (potansiyel × güven × "
+               f"%{tp_w}). Geriye bakış {lookback} işlem günü; risk Ledoit-Wolf kovaryansı. Hisse yanındaki işaret "
+               "Görünüm puanı (**\\*** >4, **+** 3–4, **-** <3). Seçim ve ağırlıklar bir sezgisel optimizasyonun "
+               "sonucudur; küçük girdi değişiklikleri portföyü değiştirebilir.")
+    st.button("📐 Model portföyü Portföy sekmesine aktar", key="sa_mp_send", on_click=_send_to_portfolio,
+              args=(m_t,))
+    if st.session_state.pop("sa_mp_sent", False):
+        st.success("Aktarıldı: Portföy sekmesinde sepet olarak göreceksin (kaydetmek için Kayıtlı portföy bölümünü kullan).")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fb = go.Figure([go.Bar(name="Ağırlık %", x=m_t, y=w * 100), go.Bar(name="Risk katkısı %", x=m_t, y=rc * 100)])
+        fb.update_layout(barmode="group", title="Ağırlık vs risk katkısı", height=340,
+                         margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
+        st.plotly_chart(fb, use_container_width=True, config=PLOTLY_CFG, key="sa_mp_bar")
+    with c2:
+        sec_w: dict = {}
+        for wi, ix_i in zip(w, ix):
+            sec_w[secs[ix_i]] = sec_w.get(secs[ix_i], 0.0) + float(wi)
+        fp = go.Figure(go.Pie(labels=list(sec_w), values=[v * 100 for v in sec_w.values()], hole=0.45,
+                              textinfo="label+percent"))
+        fp.update_layout(title="Sektör dağılımı", height=340, margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
+        st.plotly_chart(fp, use_container_width=True, config=PLOTLY_CFG, key="sa_mp_sectors")
+
+    gv_m = np.array([_num(scored.loc[t, "gorunum_puani"]) for t in m_t])
+    fz, _ = _return_risk_figure(
+        m_t, mu_m, sig_m, rf, [t + _gorunum_mark(g) for t, g in zip(m_t, gv_m)], gv_m, [10 + 60 * float(x) for x in w],
+        extras=[("Ağırlık", w * 100, ".1f", "%")],
+        port_pts=[("Model portföy", (p_sig, p_ret), "red", "star", 18)],
+        title="Model portföy: hisse bazında beklenen getiri – risk (nokta büyüklüğü = ağırlık)",
+        ytitle="Beklenen getiri % (model)")
+    st.plotly_chart(fz, use_container_width=True, config=PLOTLY_CFG, key="sa_mp_scatter")
+
+    # 3B vektör haritası: evrenin korelasyon uzayı, model portföy hisseleri vektörle
+    st.markdown("**🌐 Model portföy — 3B vektör haritası (korelasyon uzayı)**")
+    min_obs = max(60, int(0.6 * lookback))
+    ur = urets.loc[:, urets.notna().sum() >= min_obs]
+    coords, expl = pa.correlation_embedding(ur, k=3, min_periods=min_obs)
+    miss = [t for t in m_t if t not in coords.index]
+    ustats = pa.universe_stats(ur, bench_ret)
+    wmap = dict(zip(m_t, w))
+    port_vec = (sum(wmap[t] * coords.loc[t].values for t in m_t) if not miss else None)
+    titles = [f"Faktör 1 · ortak/piyasa (%{expl[0] * 100:.0f})", f"Faktör 2 (%{expl[1] * 100:.0f})",
+              f"Faktör 3 (%{expl[2] * 100:.0f})"]
+    fm = _map_figure(coords, uni, ustats, m_t, wmap, titles, True, port_vec)
+    fm.update_layout(height=520)
+    st.plotly_chart(fm, use_container_width=True, config=PLOTLY_CFG, key="sa_mp_map")
+    st.caption(f"3 faktör evrenin korelasyon yapısının %{expl.sum() * 100:.0f}'ini açıklıyor. Seçili 15 hisse orijinden "
+               "çıkan vektör, sarı çubuk model portföyün ağırlıklı vektörüdür; vektörler birbirinden ne kadar "
+               "açıkken (düşük kosinüs) o kadar çeşitlenmiş demektir." + (f" Haritada olmayanlar: {', '.join(miss)}." if miss else ""))
+
+
+def _sharpe_txt(r, rf, s):
+    return f"{(r - rf) / s:.2f}" if s > 0 else "—"

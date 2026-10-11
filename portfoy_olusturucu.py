@@ -1335,10 +1335,20 @@ def _map_figure(pos, uni, ustats, basket, weights, axis_titles, vectors, port_ve
             name="Portföy", hovertext=["", "Portföy (ağırlıklı vektör toplamı)"], hoverinfo="text",
             line=dict(width=9, color="gold"),
             marker=dict(size=[1, 10], color="gold", symbol="diamond")))
+    scene = dict(xaxis_title=axis_titles[0], yaxis_title=axis_titles[1], zaxis_title=axis_titles[2],
+                 aspectmode="cube")
+    if vectors and tuple(origin) == (0.0, 0.0, 0.0):
+        # Korelasyon uzayı: birim uzunluk her eksende aynı (açılar bozulmaz), eksen aralığı veriye sıkı, kamera yakın.
+        arr_ = np.vstack([pos.values, np.zeros((1, 3))]) if len(pos) else np.zeros((1, 3))
+        lo, hi = arr_.min(axis=0) - 0.08, arr_.max(axis=0) + 0.08
+        scene.update(aspectmode="data", camera=dict(eye=dict(x=1.0, y=1.0, z=0.7)),
+                     xaxis=dict(title=axis_titles[0], range=[float(lo[0]), float(hi[0])]),
+                     yaxis=dict(title=axis_titles[1], range=[float(lo[1]), float(hi[1])]),
+                     zaxis=dict(title=axis_titles[2], range=[float(lo[2]), float(hi[2])]))
+        for k_ in ("xaxis_title", "yaxis_title", "zaxis_title"):
+            scene.pop(k_, None)
     fig.update_layout(
-        height=380, margin=dict(l=0, r=0, t=0, b=0), showlegend=False, uirevision="pf3d",
-        scene=dict(xaxis_title=axis_titles[0], yaxis_title=axis_titles[1], zaxis_title=axis_titles[2],
-                   aspectmode="cube"))
+        height=380, margin=dict(l=0, r=0, t=0, b=0), showlegend=False, uirevision="pf3d", scene=scene)
     return fig
 
 
