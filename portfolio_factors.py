@@ -29,6 +29,13 @@ FEATURE_LABELS = {
     "growth": "Tahmini kâr büyümesi",
     "mom": "Momentum (12-1 ay)",
 }
+FEATURE_COLS = {
+    "cheap_pe_sec": "F/K ucuzluk – sektör (z)",
+    "cheap_ev_sec": "FD/FAVÖK ucuzluk – sektör (z)",
+    "cheap_pe_own": "F/K ucuzluk – kendi geçmişi (z)",
+    "growth": "Kâr büyümesi (z)",
+    "mom": "Momentum (z)",
+}
 
 
 # ───────────────────────── 1) PCA faktör modeli ─────────────────────────

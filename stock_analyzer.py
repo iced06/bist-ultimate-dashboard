@@ -16,6 +16,8 @@ import streamlit as st
 import portfolio_analytics as pa
 import portfolio_factors as pf
 import portfolio_valuation as pv
+from kpi_help import df as _df
+from kpi_help import metric_help
 from portfoy_olusturucu import (
     LABEL_ICON, LOOKBACKS, PLACEHOLDER, PLOTLY_CFG, UNASSIGNED,
     _build_valuation_results, _default_rf, _fnum, _gorunum_mark, _load_close_prices, _market_window,
@@ -172,7 +174,7 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
             "Not": ["; ".join(f"{pv.MULT_LABELS[k]}: {why}" for k, why in results[t]["rejected"].items())
                     for t in pr_df["ticker"]],
         })
-        st.dataframe(show, hide_index=True, use_container_width=True, height=min(640, 38 * (len(show) + 1)),
+        _df(show, hide_index=True, use_container_width=True, height=min(640, 38 * (len(show) + 1)),
                      column_config={
                          "Öncelik": st.column_config.NumberColumn(
                              format="%d", help="1 = en ucuz (potansiyele göre, tüm evren içinde)."),
@@ -272,7 +274,7 @@ def _render_return_risk_section(scored, results, names_all, mu_all, sig_all, rf,
         "Yüksek getiri · düşük risk": ["✅" if z else "" for z in in_zone],
     }).sort_values("Getiri/Risk", ascending=False)
     st.markdown("**Hisse özeti — kalite, ucuzluk ve getiri/risk birlikte**")
-    st.dataframe(summ, hide_index=True, use_container_width=True, height=min(640, 38 * (len(summ) + 1)),
+    _df(summ, hide_index=True, use_container_width=True, height=min(640, 38 * (len(summ) + 1)),
                  column_config={c: st.column_config.NumberColumn(format="%.1f") for c in
                                 ("Overall", "Görünüm", "Beklenen getiri %", "Risk σ %")} | {
                      "Potansiyel %": st.column_config.NumberColumn(format="%+.1f"),
@@ -395,7 +397,7 @@ def _render_model_portfolio(uni, scored, results, names_all, mu_base, cov, rf, u
             "Güven": (r["confidence"] if r else "—"),
         })
     mt = pd.DataFrame(rows)
-    st.dataframe(mt, hide_index=True, use_container_width=True, column_config={
+    _df(mt, hide_index=True, use_container_width=True, column_config={
         "Ağırlık %": st.column_config.ProgressColumn("Ağırlık %", min_value=0, max_value=float(max(cap, 1)), format="%.1f"),
         "Risk katkısı %": st.column_config.ProgressColumn("Risk katkısı %", min_value=0, max_value=float(max(cap, 1)),
                                                           format="%.1f"),

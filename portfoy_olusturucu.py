@@ -15,10 +15,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import portfolio_analytics as pa
+import kpi_help
 import portfolio_factors as pf
 import portfolio_factorspace as fsp
 import portfolio_valuation as pv
 import portfoy_store as store
+from kpi_help import df as _df
 from sirket_raporlari import (
     DONEM_LABELS,
     get_available_periods_for_rollup,
@@ -377,13 +379,13 @@ def _render_sector(sektor, skor, makro, df, ver, basket):
         edited = st.data_editor(
             editor_df, key=f"pf_ed_{ver}_{key}", hide_index=True, use_container_width=True,
             disabled=["Hisse", "Overall", "Marj", "Büyüme", "Görünüm"],
-            column_config={
+            column_config=kpi_help.with_help({
                 "Seç": st.column_config.CheckboxColumn("Seç", width="small"),
                 "Overall": num("Overall", format="%.1f"),
                 "Marj": num("Marj", format="%.1f"),
                 "Büyüme": num("Büyüme", format="%.1f"),
                 "Görünüm": num("Görünüm", format="%.1f"),
-            },
+            }, editor_df.columns),
         )
         return [t for t, s in zip(edited["Hisse"], edited["Seç"]) if s]
 
@@ -426,7 +428,7 @@ def _fmt(x, f="{:.2f}"):
 
 
 def _metric(col, label, value, sub=None):
-    col.metric(label, value)
+    col.metric(label, value, help=kpi_help.metric_help(label))
     if sub:
         col.caption(sub)
 
@@ -468,8 +470,8 @@ def _render_manual(tickers) -> dict:
     man = st.data_editor(
         pd.DataFrame({"Hisse": tickers, "Ağırlık %": [round(100.0 / len(tickers), 1)] * len(tickers)}),
         key=f"pf_manual_{sig}", hide_index=True, disabled=["Hisse"],
-        column_config={"Ağırlık %": st.column_config.NumberColumn(min_value=0.0, max_value=100.0,
-                                                                  format="%.1f")})
+        column_config=kpi_help.with_help({"Ağırlık %": st.column_config.NumberColumn(
+            min_value=0.0, max_value=100.0, format="%.1f")}, ["Hisse", "Ağırlık %"]))
     vals = man["Ağırlık %"].fillna(0).clip(lower=0).astype(float)
     st.caption(f"Girilen toplam %{vals.sum():.1f} — hesaplamada %100'e normalize edilir.")
     return dict(zip(man["Hisse"], vals))
@@ -575,7 +577,8 @@ def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
 
     sc = st.columns(len(health["subs"]))
     for col, (name, v) in zip(sc, health["subs"].items()):
-        col.metric(f"{name} skoru", "—" if v is None else f"{v:.0f}/100")
+        col.metric(f"{name} skoru", "—" if v is None else f"{v:.0f}/100",
+                   help=kpi_help.metric_help(f"{name} skoru"))
     with st.expander("Sağlık skoru nasıl hesaplanıyor?"):
         st.markdown(
             "- **Çeşitlendirme (%30):** ortalama ikili korelasyon (0.25 → 100, 0.85 → 0) ile efektif "
@@ -611,7 +614,7 @@ def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
         "Max DD %": stats["max_dd"].reindex(names).values * 100,
         "Overall": [overall_of[t] for t in names],
     }).sort_values("Ağırlık %", ascending=False)
-    st.dataframe(
+    _df(
         table, hide_index=True, use_container_width=True,
         column_config={
             "Ağırlık %": st.column_config.ProgressColumn("Ağırlık %", min_value=0, max_value=100,
@@ -645,7 +648,7 @@ def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
         mv_rows.append({"Portföy": lab, "Beklenen getiri %": r_, "Risk σ %": s_, "Sharpe": sh_,
                         "Efektif hisse": 1.0 / float(np.sum(wv ** 2))})
     st.markdown("**Markowitz özeti — portföy düzeyi**")
-    st.dataframe(pd.DataFrame(mv_rows), hide_index=True, use_container_width=True,
+    _df(pd.DataFrame(mv_rows), hide_index=True, use_container_width=True,
                  column_config={"Beklenen getiri %": st.column_config.NumberColumn(format="%.1f"),
                                 "Risk σ %": st.column_config.NumberColumn(format="%.1f"),
                                 "Sharpe": st.column_config.NumberColumn(format="%.2f"),
@@ -775,7 +778,7 @@ def _render_results(a, uni, universe_tickers, fetch_fn, deps=None):
             show = show.rename(columns={"ticker": "Hisse", "corr": "Portföyle korelasyon",
                                         "overall": "Overall", "vol": "Volatilite"})
             show["Volatilite"] = show["Volatilite"] * 100
-            st.dataframe(show[["Hisse", "Sektör", "Portföyle korelasyon", "Overall", "Volatilite"]],
+            _df(show[["Hisse", "Sektör", "Portföyle korelasyon", "Overall", "Volatilite"]],
                          hide_index=True, use_container_width=True,
                          column_config={"Portföyle korelasyon": st.column_config.NumberColumn(format="%.2f"),
                                         "Overall": st.column_config.NumberColumn(format="%.1f"),
@@ -881,7 +884,7 @@ def _render_multiple_tables(results, order):
         if not rws:
             st.caption("Hesaplanabilen hisse yok.")
             continue
-        st.dataframe(pd.DataFrame(rws), hide_index=True, use_container_width=True, column_config={
+        _df(pd.DataFrame(rws), hide_index=True, use_container_width=True, column_config={
             c: st.column_config.NumberColumn(format="%.1f" if "%" in c else "%.2f")
             for c in ("Güncel (trailing)", title, "Geçmiş medyan", "Geçmişe göre %", "Geçmişte bugünden düşük %",
                       "Sektör medyan", "Sektöre göre %", "Hedef çarpan", "Hedef fiyat ₺")
@@ -1051,7 +1054,7 @@ def _render_valuation(a, uni, universe_tickers, fetch_fn, deps):
         "Not": ["; ".join(f"{pv.MULT_LABELS[k]}: {why}" for k, why in results[t]["rejected"].items())
                 for t in pr_df["ticker"]],
     })
-    st.dataframe(show, hide_index=True, use_container_width=True, column_config={
+    _df(show, hide_index=True, use_container_width=True, column_config={
         "Öncelik": st.column_config.NumberColumn(format="%d", help="1 = en ucuz (potansiyele göre)."),
         "Fiyat ₺": st.column_config.NumberColumn(format="%.2f"),
         "Hedef fiyat ₺": st.column_config.NumberColumn(format="%.2f"),
@@ -1195,7 +1198,7 @@ def _render_return_methods(a, uni, universe_tickers, fetch_fn, deps, mu_s):
         row["Yöntem aralığı (pp)"] = float(max(vals) - min(vals)) if len(vals) > 1 else np.nan
         rows.append(row)
     tbl = pd.DataFrame(rows).sort_values("Ortalama %", ascending=False)
-    st.dataframe(tbl, hide_index=True, use_container_width=True, column_config={
+    _df(tbl, hide_index=True, use_container_width=True, column_config={
         c: st.column_config.NumberColumn(format="%.1f") for c in tbl.columns if c != "Hisse"} | {
         "Yöntem aralığı (pp)": st.column_config.NumberColumn(
             format="%.1f", help="Üç yöntemin en yüksek ve en düşük tahmini arasındaki fark; büyükse tahmin "
@@ -1235,7 +1238,7 @@ def _render_return_methods(a, uni, universe_tickers, fetch_fn, deps, mu_s):
                                  "Katsayı γ (ufuk getirisi / 1σ)": fm["gamma"].values,
                                  "t-değeri": fm["tstat"].values})
             st.markdown("**Karakteristik regresyonu — Fama-MacBeth katsayıları**")
-            st.dataframe(coef, hide_index=True, use_container_width=True, column_config={
+            _df(coef, hide_index=True, use_container_width=True, column_config={
                 "Katsayı γ (ufuk getirisi / 1σ)": st.column_config.NumberColumn(format="%+.4f"),
                 "t-değeri": st.column_config.NumberColumn(format="%+.1f")})
             st.caption("Pozitif katsayı: özelliği yüksek (daha ucuz / daha çok büyüyen / momentumu güçlü) "
@@ -1244,22 +1247,22 @@ def _render_return_methods(a, uni, universe_tickers, fetch_fn, deps, mu_s):
         if pm is not None:
             dec = pd.DataFrame({"Hisse": names})
             for f in pf.FEATURES:
-                dec[pf.FEATURE_LABELS[f].split(":")[-1].strip() + " (z)"] = [cur[f].get(t, np.nan) for t in names]
+                dec[pf.FEATURE_COLS[f]] = [cur[f].get(t, np.nan) for t in names]
             dec["Özellik katkısı %"] = [pm["rel_features"].get(t, np.nan) * 100 for t in names]
             dec["Puan primi %"] = [pm["rel_score"].get(t, np.nan) * 100 for t in names]
             st.markdown(f"**Hisse bazında özellikler (z-skoru) ve katkılar** — taban: {base_opt.lower()} "
                         f"%{base * 100:.1f}")
-            st.dataframe(dec, hide_index=True, use_container_width=True,
+            _df(dec, hide_index=True, use_container_width=True,
                          column_config={c: st.column_config.NumberColumn(format="%.2f") for c in dec.columns
                                         if c != "Hisse"})
         pdf = pd.DataFrame({"Faktör": [f"F{i + 1}" for i in range(pca["k"])],
                             "Açıkladığı varyans %": pca["explained"] * 100,
                             "Faktör primi λ (yıllık %)": pca["premia"] * 100})
         st.markdown("**PCA faktörleri**")
-        st.dataframe(pdf, hide_index=True, use_container_width=True, column_config={
+        _df(pdf, hide_index=True, use_container_width=True, column_config={
             c: st.column_config.NumberColumn(format="%.1f") for c in pdf.columns if c != "Faktör"})
         r2 = pd.DataFrame({"Hisse": names, "PCA R² (faktörlerle açıklanan)": [pca["r2"].get(t, np.nan) for t in names]})
-        st.dataframe(r2, hide_index=True, use_container_width=True,
+        _df(r2, hide_index=True, use_container_width=True,
                      column_config={"PCA R² (faktörlerle açıklanan)": st.column_config.NumberColumn(format="%.2f")})
         st.caption("Faktör primi λ: faktör getirisinin yıllık ortalaması (işaret keyfi, yüklerle birlikte anlamlı). "
                    "R² düşükse hisse ortak faktörlerle az açıklanıyor, PCA tahmini o hisse için zayıf.")
@@ -1370,7 +1373,7 @@ def _render_factor_space(a, uni, universe_tickers, fetch_fn, deps):
         "Momentum z": Zb[:, 0], "Risk z": Zb[:, 1],
         "FD/FAVÖK z": Zb[:, 2], "FD/FAVÖK ~": ["doldurulmuş" if bool(Zdf.loc[t, "imputed"]) else "" for t in kept],
     }).sort_values("Ağırlık %", ascending=False)
-    st.dataframe(tbl, hide_index=True, use_container_width=True, column_config={
+    _df(tbl, hide_index=True, use_container_width=True, column_config={
         "Ağırlık %": st.column_config.NumberColumn(format="%.1f"),
         "Beklenen getiri %": st.column_config.NumberColumn(format="%.1f"),
         "Momentum z": st.column_config.NumberColumn(format="%+.2f"),
@@ -1379,7 +1382,7 @@ def _render_factor_space(a, uni, universe_tickers, fetch_fn, deps):
 
     eig_rows = _eigen_table(eig_p, "Portföy") + (_eigen_table(eig_u, "Evren") if eig_u is not None else [])
     st.markdown("**Öz vektörler (PCA): Σu = λu**")
-    st.dataframe(pd.DataFrame(eig_rows), hide_index=True, use_container_width=True, column_config={
+    _df(pd.DataFrame(eig_rows), hide_index=True, use_container_width=True, column_config={
         "λ": st.column_config.NumberColumn(format="%.2f"),
         "Açıkladığı %": st.column_config.NumberColumn(format="%.0f"),
         "Momentum": st.column_config.NumberColumn(format="%+.2f"),
@@ -1661,7 +1664,7 @@ def _render_cosine(coords, urets, in_map, min_obs):
                                 "x·y": float(np.dot(coords.loc[x].values, coords.loc[y].values)),
                                 "Açı °": float(np.degrees(np.arccos(np.clip(c_, -1, 1)))) if np.isfinite(c_) else np.nan,
                                 "Gerçek korelasyon": float(urets[[x, y]].corr(min_periods=min_obs).iloc[0, 1])})
-            st.dataframe(pd.DataFrame(rws).sort_values("Kosinüs (3B)", ascending=False), hide_index=True,
+            _df(pd.DataFrame(rws).sort_values("Kosinüs (3B)", ascending=False), hide_index=True,
                          use_container_width=True,
                          column_config={"Kosinüs (3B)": st.column_config.NumberColumn(format="%.2f"),
                                         "x·y": st.column_config.NumberColumn(format="%.2f"),
@@ -2010,7 +2013,7 @@ def _render_time_section(a, uni, universe_tickers, fetch_fn):
                      "Volatilite %": mb["vol"] * 100, "Sharpe": mb["sharpe"], "Sortino": mb["sortino"],
                      "Max DD %": mb["max_dd"] * 100, "Beta": 1.0, "Yıllık devir %": np.nan,
                      "Toplam maliyet %": np.nan, "Bitiş (100 →)": 100.0 * (1 + mb["total_return"]), "Not": ""})
-    st.dataframe(pd.DataFrame(rows).set_index("Yöntem").round(2), use_container_width=True)
+    _df(pd.DataFrame(rows).set_index("Yöntem").round(2), use_container_width=True)
     warns = ["Sepeti **bugün** seçtin: geçmişte iyi görünmesi seçim yanlılığıdır, geleceği garanti etmez.",
              f"Maliyet: taraf başı {cost_bp} bp uygulandı; vergi/kayma yok. Sharpe/Sortino risksiz faiz "
              f"%{s['rf'] * 100:.1f} ile hesaplandı."]
@@ -2152,7 +2155,7 @@ def display_portfolio_builder(fetch_fn, valuation_fn=None, valuation_history_fn=
             elif "single" in analysis:
                 st.info("Optimizasyon için en az 2 hisse gerekli (ortak geçmişi yeterli olan). "
                         "Tek hissenin istatistikleri aşağıda.")
-                st.dataframe(analysis["single"], use_container_width=True)
+                _df(analysis["single"], use_container_width=True)
         else:
             st.info("💡 Portföy kutusu, sepete hisse eklediğinde burada belirir.")
 
