@@ -16,6 +16,7 @@ import streamlit as st
 
 import portfolio_analytics as pa
 import portfolio_factors as pf
+import portfolio_factorspace as fsp
 import portfolio_valuation as pv
 import portfoy_store as store
 from sirket_raporlari import (
@@ -1264,6 +1265,147 @@ def _render_return_methods(a, uni, universe_tickers, fetch_fn, deps, mu_s):
                    "R² düşükse hisse ortak faktörlerle az açıklanıyor, PCA tahmini o hisse için zayıf.")
 
 
+# ───────────────────────── faktör uzayında portföy (momentum · risk · FD/FAVÖK) ─────────────────────────
+
+def _eigen_table(eig, label):
+    lam, U, expl = eig
+    rows = []
+    for k in range(3):
+        load = U[:, k]
+        dom = int(np.argmax(np.abs(load)))
+        rows.append({
+            "Öz vektör": f"{label} u{k + 1}", "λ": float(lam[k]), "Açıkladığı %": float(expl[k] * 100),
+            "Momentum": float(load[0]), "Risk": float(load[1]), "FD/FAVÖK": float(load[2]),
+            "Baskın eksen": f"{fsp.AXIS_SHORT[fsp.AXES[dom]]} ({'+' if load[dom] >= 0 else '−'})"})
+    return rows
+
+
+def _render_factor_space(a, uni, universe_tickers, fetch_fn, deps):
+    st.markdown("---")
+    st.markdown("### 🧭 Faktör uzayında portföy (3B model)")
+    st.caption("Her hisse, (momentum, risk, ileri FD/FAVÖK) eksenlerinde orijinden çıkan bir vektör: **yön** = faktör "
+               "karakteri, **uzunluk** = beklenen getiri. Portföy vektörü ağırlıklı toplamdır; öz vektörler "
+               "(PCA) riskin/maruziyetin yoğunlaştığı yönleri gösterir. Yatırım tavsiyesi değildir.")
+    if not st.toggle("Faktör uzayı modelini aç", key="pf_fs_on",
+                     help="Rapor evreninin fiyatlarını ve finansallarını yükler (ilk açılışta ~1 dk; sonra önbellekte)."):
+        return
+    st.session_state.setdefault("pf_fs_len", "Beklenen getiri (önerilen)")
+    st.session_state.setdefault("pf_fs_univ", True)
+    c1, c2 = st.columns(2)
+    len_mode = c1.selectbox("Vektör uzunluğu", ["Beklenen getiri (önerilen)", "Faktör z-skoru (konum)"], key="pf_fs_len",
+                            help="Beklenen getiri: uzunluk = |beklenen getiri|, yön = faktör karakteri (yeşil = pozitif, "
+                                 "kırmızı = negatif getiri). Konum: vektör ucu hissenin z-skor koordinatıdır.")
+    show_univ = c2.checkbox("Evrenin (piyasa) öz vektörlerini de göster", key="pf_fs_univ",
+                            help="Kesikli oklar: evrendeki tüm hisselerin faktör kovaryansının öz vektörleri.")
+    mode = "return" if len_mode.startswith("Beklenen") else "position"
+
+    names, w_all = a["names"], np.asarray(a["w"], float)
+    mu_s = 0.5 * np.asarray(a["mu"], float) + 0.5 * float(np.mean(a["mu"]))
+    uni_t = tuple(sorted(universe_tickers))
+    with st.spinner("Evren faktörleri hesaplanıyor (ilk seferde ~1 dk)..."):
+        uprices, _ = _load_close_prices(uni_t, a["start"], fetch_fn)
+        if uprices.empty:
+            st.warning("Evren fiyatları alınamadı.")
+            return
+        up = _to_calendar(uprices, a["cal"])
+        urets = (up / up.shift(1) - 1.0).iloc[1:].replace([np.inf, -np.inf], np.nan)
+        urets = urets.loc[:, urets.notna().sum() >= max(60, int(0.6 * len(urets)))]
+        mom = pa.momentum_scores(urets)
+        vol = urets.std(ddof=1) * np.sqrt(pa.TRADING_DAYS)
+        fwd_ev = {}
+        if deps and deps.get("valuation") and deps.get("loader"):
+            fin = deps["loader"](uni_t)
+            last = {t: float(uprices[t].dropna().iloc[-1]) for t in uprices.columns if uprices[t].notna().any()}
+            items = tuple((t, round(last[t], 4)) for t in uni_t if t in fin and t in last)
+            sig = hashlib.md5("|".join(f"{t}:{p}" for t, p in items).encode()).hexdigest()[:12]
+            peers = _peer_valuations(deps["valuation"], fin, sig, items)
+            for t, v in peers.items():
+                ok_, _ = pv.forecast_ok(v.get("ev_ebitda"), v.get("fwd_ev_ebitda"), pv.DEFAULTS)
+                if ok_:
+                    fwd_ev[t] = _fnum(v.get("fwd_ev_ebitda"))
+        else:
+            st.warning("Değerleme verisi yüklenemedi: FD/FAVÖK ekseni nötr (0) bırakıldı.")
+    sector_all = {t: (uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"]) else None)
+                  for t in urets.columns}
+    Zdf = fsp.factor_matrix(mom, vol, pd.Series(fwd_ev, dtype=float), sector_all)
+    kept = [t for t in names if t in Zdf.index]
+    miss = [t for t in names if t not in Zdf.index]
+    if miss:
+        st.caption("Faktör uzayında olmayan hisseler (momentum/volatilite için yeterli geçmiş yok): " + ", ".join(miss))
+    if len(kept) < 3:
+        st.info("Faktör uzayı için en az 3 hisse gerekli.")
+        return
+    pos = [names.index(t) for t in kept]
+    w = w_all[pos] / w_all[pos].sum()
+    mu_b = mu_s[pos]
+    Zb = Zdf.loc[kept, fsp.AXES].values
+    V = fsp.build_vectors(Zb, mu_b, mode)
+    vp = fsp.portfolio_vector(V, w)
+    eig_p = fsp.eigen_axes(fsp.second_moment(V, w))
+    eig_u = fsp.eigen_axes(np.cov(Zdf[fsp.AXES].values.T)) if show_univ else None
+    fig = fsp.factor_figure(kept, V, w, mu_b, Zb, vp, eig_p, eig_u, mode=mode,
+                            Z_universe=(Zdf[fsp.AXES].values if mode == "position" else None))
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CFG, key="pf_fs_chart")
+    imp = [t for t in kept if bool(Zdf.loc[t, "imputed"])]
+    st.caption("Eksenler evren üzerinde z-skoru (±3'e kırpılmış): momentum = analiz penceresi getirisi (son 1 ay hariç), "
+               "risk = yıllık volatilite, FD/FAVÖK = log(ileri FD/FAVÖK) — düşük değer ucuz demektir. "
+               + ("Altın vektör = portföy (Σ wᵢvᵢ). Kalın oklar portföyün, kesikli oklar evrenin öz vektörleri "
+                  "(kırmızı/yeşil/mavi = 1./2./3. öz vektör; uzunluk √λ ile orantılı). "
+                  + (f"FD/FAVÖK'ü olmayan/anlamsız olduğu için sektör ya da evren medyanıyla doldurulan hisseler: "
+                     f"{', '.join(imp)}." if imp else "")))
+
+    # maruziyet ve hizalanma
+    ex = fsp.exposures(Zb, w)
+    align = float(np.linalg.norm(vp) / max(float(np.sum(w * np.linalg.norm(V, axis=1))), 1e-12))
+    m1, m2, m3, m4 = st.columns(4)
+    _metric(m1, "Momentum maruziyeti", f"{ex['exposure']['mom']:+.2f}σ", f"eksene açı {ex['angle']['mom']:.0f}°")
+    _metric(m2, "Risk maruziyeti", f"{ex['exposure']['vol']:+.2f}σ", f"eksene açı {ex['angle']['vol']:.0f}° "
+                                                                      "(90° = riskten bağımsız)")
+    _metric(m3, "FD/FAVÖK maruziyeti", f"{ex['exposure']['ev']:+.2f}σ", f"eksene açı {ex['angle']['ev']:.0f}° "
+                                                                         "(− = ucuz tarafa eğilim)")
+    _metric(m4, "Yön uyumu", f"{align:.2f}", "|Σwᵢvᵢ| / Σwᵢ|vᵢ| — 1: aynı yön, düşük: çeşitlenmiş/hedge")
+
+    tbl = pd.DataFrame({
+        "Hisse": kept, "Ağırlık %": w * 100, "Beklenen getiri %": mu_b * 100,
+        "Momentum z": Zb[:, 0], "Risk z": Zb[:, 1],
+        "FD/FAVÖK z": Zb[:, 2], "FD/FAVÖK ~": ["doldurulmuş" if bool(Zdf.loc[t, "imputed"]) else "" for t in kept],
+    }).sort_values("Ağırlık %", ascending=False)
+    st.dataframe(tbl, hide_index=True, use_container_width=True, column_config={
+        "Ağırlık %": st.column_config.NumberColumn(format="%.1f"),
+        "Beklenen getiri %": st.column_config.NumberColumn(format="%.1f"),
+        "Momentum z": st.column_config.NumberColumn(format="%+.2f"),
+        "Risk z": st.column_config.NumberColumn(format="%+.2f"),
+        "FD/FAVÖK z": st.column_config.NumberColumn(format="%+.2f")})
+
+    eig_rows = _eigen_table(eig_p, "Portföy") + (_eigen_table(eig_u, "Evren") if eig_u is not None else [])
+    st.markdown("**Öz vektörler (PCA): Σu = λu**")
+    st.dataframe(pd.DataFrame(eig_rows), hide_index=True, use_container_width=True, column_config={
+        "λ": st.column_config.NumberColumn(format="%.2f"),
+        "Açıkladığı %": st.column_config.NumberColumn(format="%.0f"),
+        "Momentum": st.column_config.NumberColumn(format="%+.2f"),
+        "Risk": st.column_config.NumberColumn(format="%+.2f"),
+        "FD/FAVÖK": st.column_config.NumberColumn(format="%+.2f")})
+    st.caption("u₁ en büyük özdeğerli yön: faktör uzayında portföyün (ya da evrenin) en çok yayıldığı/yoğunlaştığı "
+               "eksen. Yükler o yönün hangi faktörlerin karışımı olduğunu gösterir. Not: bu üç faktör uzayındaki "
+               "özayrışımdır (3×3); getiri kovaryansının hisse uzayındaki öz vektörleri değildir (onlar 3B haritadaki "
+               "korelasyon uzayında).")
+
+    # kosinüs benzerliği matrisi
+    C = fsp.cosine_matrix(Zb)
+    st.markdown("**Kosinüs benzerliği matrisi (faktör karakteri)**")
+    st.plotly_chart(fsp.cosine_heatmap(kept, C), use_container_width=True, config=PLOTLY_CFG, key="pf_fs_cos")
+    iu = np.triu_indices(len(kept), 1)
+    pairs = sorted(zip(C[iu], np.array(kept)[iu[0]], np.array(kept)[iu[1]]))
+    corr = a["corr"].reindex(index=kept, columns=kept).values
+    ok_pair = np.isfinite(corr[iu]) & np.isfinite(C[iu])
+    link = float(np.corrcoef(C[iu][ok_pair], corr[iu][ok_pair])[0, 1]) if ok_pair.sum() > 3 else np.nan
+    st.caption(f"Ortalama ikili kosinüs {float(C[iu].mean()):+.2f}. En benzer karakter: {pairs[-1][1]}–{pairs[-1][2]} "
+               f"({pairs[-1][0]:+.2f}); en farklı: {pairs[0][1]}–{pairs[0][2]} ({pairs[0][0]:+.2f}). "
+               "Benzer yönlü hisseler aynı faktör risklerini taşır (risk toplanır), ters yönlüler birbirini dengeler. "
+               + (f"Faktör karakteri benzerliği ile gerçek getiri korelasyonu arasındaki ilişki: r = {link:+.2f} "
+                  "(düşükse bu üç faktör hisselerin birlikte hareketini tek başına açıklamıyor)." if np.isfinite(link) else ""))
+
+
 # ───────────────────────── 3D harita ─────────────────────────
 
 def _feature_frame(urets, bench_ret, uni, sector_score) -> pd.DataFrame:
@@ -2026,3 +2168,4 @@ def display_portfolio_builder(fetch_fn, valuation_fn=None, valuation_history_fn=
         with box:
             _render_results(analysis, uni, list(uni.index), fetch_fn, deps)
             _render_time_section(analysis, uni, list(uni.index), fetch_fn)
+            _render_factor_space(analysis, uni, list(uni.index), fetch_fn, deps)
