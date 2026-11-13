@@ -53,7 +53,35 @@ def _quality_cheapness_figure(results, order):
     return fig
 
 
-def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=None, financial_loader=None):
+_KP = "sa"          # widget anahtar öneki: Yerli "sa", Yabancı "saf" (Kapsam=Tümü iken ikisi birlikte çizilir)
+
+
+def K(name: str) -> str:
+    return f"{_KP}_{name}"
+
+
+def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=None, financial_loader=None,
+                           scope="TR", fetch_fn_try=None):
+    """scope: 'TR' (rapor evreni, İş Yatırım finansalları), 'FOR' (fon portföylerindeki yabancı hisseler, yfinance;
+    TL bazlı getiri), 'ALL' (iki sekme). fetch_fn_try: yabancı fiyatları TL'ye çeviren fetch fonksiyonu."""
+    global _KP
+    if scope == "ALL":
+        t_tr, t_for = st.tabs(["🇹🇷 Yerli (TR)", "🌎 Yabancı (FOR)"])
+        with t_tr:
+            _KP = "sa"
+            _analyzer_tr(fetch_fn, valuation_fn, valuation_history_fn, financial_loader)
+        with t_for:
+            _KP = "saf"
+            _analyzer_for(fetch_fn_try or fetch_fn, valuation_fn)
+    elif scope == "FOR":
+        _KP = "saf"
+        _analyzer_for(fetch_fn_try or fetch_fn, valuation_fn)
+    else:
+        _KP = "sa"
+        _analyzer_tr(fetch_fn, valuation_fn, valuation_history_fn, financial_loader)
+
+
+def _analyzer_tr(fetch_fn, valuation_fn=None, valuation_history_fn=None, financial_loader=None):
     st.markdown("### 🔬 Stock Analyzer")
     st.caption("Company Reports'ta Görünüm puanı hesaplanmış tüm hisseler için hedef fiyat / ucuzluk önceliği ve "
                "beklenen getiri – risk dağılımı. Veriler 📄 Company Reports ve finansal veri tabanından gelir. "
@@ -67,7 +95,7 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
         st.info("Henüz kayıtlı şirket raporu yok — önce 📄 Company Reports bölümünden rapor ekle.")
         return
     options = [(int(r.yil), r.donem) for r in periods.itertuples()]
-    yil, donem = st.selectbox("Rapor dönemi", options, key="sa_period",
+    yil, donem = st.selectbox("Rapor dönemi", options, key=K("period"),
                               format_func=lambda p: f"{DONEM_LABELS.get(p[1], p[1])} {p[0]}")
     reports = get_reports_for_period(yil, donem)
     if reports is None or reports.empty:
@@ -81,32 +109,32 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
         return
 
     sectors = sorted({s for s in scored["sektor"].dropna().unique()})
-    if st.session_state.get("sa_sector") not in ["Tümü"] + sectors:
-        st.session_state["sa_sector"] = "Tümü"
-    st.session_state.setdefault("sa_lookback", "1 yıl")
-    st.session_state.setdefault("sa_ret_src", RET_SOURCES[0])
-    st.session_state.setdefault("sa_whist", 50)
-    st.session_state.setdefault("sa_kq", 10)
-    st.session_state.setdefault("sa_ko", 5)
+    if st.session_state.get(K("sector")) not in ["Tümü"] + sectors:
+        st.session_state[K("sector")] = "Tümü"
+    st.session_state.setdefault(K("lookback"), "1 yıl")
+    st.session_state.setdefault(K("ret_src"), RET_SOURCES[0])
+    st.session_state.setdefault(K("whist"), 50)
+    st.session_state.setdefault(K("kq"), 10)
+    st.session_state.setdefault(K("ko"), 5)
     c1, c2, c3 = st.columns(3)
-    sector_pick = c1.selectbox("Sektör filtresi (gösterim)", ["Tümü"] + sectors, key="sa_sector",
+    sector_pick = c1.selectbox("Sektör filtresi (gösterim)", ["Tümü"] + sectors, key=K("sector"),
                                help="Yalnızca gösterimi süzer; sektör medyanları ve karşılaştırmalar tüm evrenle "
                                     "hesaplanır.")
-    lb_label = c2.selectbox("Geriye bakış (getiri–risk)", list(LOOKBACKS), key="sa_lookback")
-    ret_src = c3.selectbox("Beklenen getiri kaynağı", RET_SOURCES, key="sa_ret_src",
+    lb_label = c2.selectbox("Geriye bakış (getiri–risk)", list(LOOKBACKS), key=K("lookback"))
+    ret_src = c3.selectbox("Beklenen getiri kaynağı", RET_SOURCES, key=K("ret_src"),
                            help="Markowitz: tarihsel ortalamanın kesit ortalamasına %50 çekilmiş hali. PCA: yalnızca "
                                 "ortak faktörlerle açıklanan kısım.")
     with st.expander("⚙️ Hedef fiyat varsayımları", expanded=False):
         e1, e2, e3, e4 = st.columns(4)
-        w_hist = e1.slider("Geçmiş medyanın ağırlığı %", 0, 100, step=10, key="sa_whist")
-        k_q = e2.slider("Kalite primi (Overall, puan başına %)", 0, 25, key="sa_kq")
-        k_o = e3.slider("Görünüm primi (puan başına %)", 0, 15, key="sa_ko")
+        w_hist = e1.slider("Geçmiş medyanın ağırlığı %", 0, 100, step=10, key=K("whist"))
+        k_q = e2.slider("Kalite primi (Overall, puan başına %)", 0, 25, key=K("kq"))
+        k_o = e3.slider("Görünüm primi (puan başına %)", 0, 15, key=K("ko"))
         rf_def = _default_rf()
         rf = e4.number_input("Risksiz faiz % (yıllık)", 0.0, 150.0, round((rf_def or 0.35) * 100, 1), 0.5,
-                             key="sa_rf") / 100.0
+                             key=K("rf")) / 100.0
     params = dict(w_hist=w_hist / 100.0, k_quality=k_q / 100.0, k_outlook=k_o / 100.0)
 
-    if not st.toggle("Analizi çalıştır", key="sa_on",
+    if not st.toggle("Analizi çalıştır", key=K("on"),
                      help="Evrenin 6 yıllık fiyatlarını ve finansallarını yükler (ilk açılışta birkaç dakika; sonra "
                           "30 dk önbellekte)."):
         st.info("Analizi başlatmak için üstteki 'Analizi çalıştır' anahtarını aç (ilk seferde birkaç dakika sürer).")
@@ -138,6 +166,109 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
         return
 
     results, sector_all = _build_valuation_results(uni, list(scored.index), last, peers, hists, params)
+    _render_analysis(uni, scored, results, uprices, bench_px, sector_pick, lb_label, ret_src, rf,
+                     w_hist, k_q, k_o, lookback)
+
+
+def _analyzer_for(fetch_fn_try, valuation_fn):
+    """Yabancı hisse analizörü: fon portföylerinde en çok tutulan N yabancı hisse; çarpanlar ve analist verisi
+    yfinance'tan, fiyatlar TL'ye çevrilmiş (kur dahil). Hedef fiyat: İLERİ F/K'nın yabancı evren içindeki sektör
+    medyanına göre (geçmiş çarpan yok) + analist ortalama hedefi yanında gösterilir."""
+    import global_data as gd
+    st.markdown("### 🔬 Stock Analyzer — Yabancı hisseler")
+    st.caption("Fon portföylerindeki yabancı hisseler için hedef fiyat / ucuzluk önceliği ve beklenen getiri – risk "
+               "dağılımı. Çarpanlar, analist puanı ve hedefleri Yahoo Finance'tan (yfinance); fiyatlar TL'ye "
+               "çevrilmiş olduğundan getiri **kur etkisini de içerir**. Yatırım tavsiyesi değildir.")
+    uni_all = gd.foreign_universe()
+    if uni_all.empty:
+        st.info("Yabancı hisse listesi alınamadı (fon veritabanı ya da yfinance erişilemiyor).")
+        return
+    st.session_state.setdefault(K("lookback"), "1 yıl")
+    st.session_state.setdefault(K("ret_src"), RET_SOURCES[0])
+    st.session_state.setdefault(K("topn"), 80)
+    st.session_state.setdefault(K("ko"), 5)
+    c1, c2, c3, c4 = st.columns(4)
+    top_n = c1.slider("Hisse sayısı (en çok fon tutan)", 30, min(300, len(uni_all)), key=K("topn"),
+                      help="Fon portföylerinde en çok fon tarafından tutulan N yabancı hisse analiz edilir.")
+    lb_label = c2.selectbox("Geriye bakış (getiri–risk)", list(LOOKBACKS), key=K("lookback"))
+    ret_src = c3.selectbox("Beklenen getiri kaynağı", RET_SOURCES, key=K("ret_src"))
+    rf_def = _default_rf()
+    rf = c4.number_input("Risksiz faiz % (TL, yıllık)", 0.0, 150.0, round((rf_def or 0.35) * 100, 1), 0.5,
+                         key=K("rf")) / 100.0
+    with st.expander("⚙️ Hedef fiyat varsayımları", expanded=False):
+        k_o = st.slider("Analist puanı primi (puan başına %)", 0, 15, key=K("ko"),
+                        help="Hedef çarpan, analist puanı (6 − konsensüs ortalaması; 5 = Güçlü Al, 3 = Tut) 3'ün "
+                             "üstündeyse yukarı, altındaysa aşağı ölçeklenir.")
+    params = dict(w_hist=0.0, k_quality=0.0, k_outlook=k_o / 100.0)
+
+    if not st.toggle("Analizi çalıştır", key=K("on"),
+                     help="Seçilen yabancı hisselerin 6 yıllık fiyatını ve yfinance verisini yükler (ilk açılışta "
+                          "birkaç dakika; sonra önbellekte)."):
+        st.info("Analizi başlatmak için üstteki 'Analizi çalıştır' anahtarını aç (ilk seferde birkaç dakika sürer).")
+        return
+
+    lookback = LOOKBACKS[lb_label]
+    symbols = tuple(uni_all["symbol"].head(top_n))
+    with st.spinner("Yabancı hisselerin fiyatları ve yfinance verileri yükleniyor (ilk seferde birkaç dakika)..."):
+        start, bench_px = _market_window(lookback, fetch_fn_try)
+        uprices, _ = _load_close_prices(symbols, start, fetch_fn_try)
+        if uprices.empty:
+            st.warning("Yabancı hisse fiyatları alınamadı (yfinance erişimi ya da kur verisi).")
+            return
+        last = {t: float(uprices[t].dropna().iloc[-1]) for t in uprices.columns if uprices[t].notna().any()}
+        peers, rows, analyst = _foreign_inputs(tuple(sorted(last)), tuple(round(last[t], 4) for t in sorted(last)),
+                                               valuation_fn)
+    if not peers:
+        st.info("Yabancı hisseler için çarpan verisi alınamadı.")
+        return
+    uni = pd.DataFrame(rows).set_index("ticker", drop=False)
+    uni["sektor"] = uni["sektor"].where(uni["sektor"].notna(), None)
+    scored = uni
+    results, _ = _build_valuation_results(uni, list(scored.index), last, peers, {}, params)
+    sectors = sorted({s for s in uni["sektor"].dropna().unique()})
+    if st.session_state.get(K("sector")) not in ["Tümü"] + sectors:
+        st.session_state[K("sector")] = "Tümü"
+    sector_pick = st.selectbox("Sektör filtresi (gösterim)", ["Tümü"] + sectors, key=K("sector"),
+                               help="Yalnızca gösterimi süzer; sektör medyanları tüm yabancı evrenle hesaplanır.")
+    _render_analysis(uni, scored, results, uprices, bench_px, sector_pick, lb_label, ret_src, rf,
+                     0, 0, k_o, lookback, analyst=analyst)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _foreign_inputs(symbols: tuple, prices: tuple, _valuation_fn):
+    """Yabancı evren girdileri: (peers {sym: değerleme}, uni satırları, analist {sym: {...}}). Her hisse için
+    yfinance .info (çarpanlar, sektör, analist) paralel çekilir."""
+    from concurrent.futures import ThreadPoolExecutor
+    import global_data as gd
+
+    def one(arg):
+        sym, px = arg
+        info = gd.get_info(gd.yahoo_of(sym))
+        return sym, px, info, gd.valuations_from_info(info)
+
+    peers, rows, analyst = {}, [], {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for sym, px, info, v in ex.map(one, zip(symbols, prices)):
+            rm = v.get("rec_mean")
+            rows.append({"ticker": sym, "sektor": v.get("sector") or None, "overall_puani": np.nan,
+                         "marj_toplam_puani": np.nan, "buyume_puani": np.nan,
+                         "gorunum_puani": (6.0 - rm) if rm else np.nan})
+            if any(v.get(k) for k in ("pe", "fwd_pe", "ev_ebitda")):
+                peers[sym] = v
+            cur = info.get("currentPrice") or info.get("regularMarketPrice")
+            tm = v.get("target_mean")
+            if tm and cur:
+                analyst[sym] = {"upside": tm / cur - 1.0, "n": int(v.get("n_analyst") or 0),
+                                "rec": v.get("rec_key") or "—", "mean": rm}
+    return peers, rows, analyst
+
+
+def _render_analysis(uni, scored, results, uprices, bench_px, sector_pick, lb_label, ret_src, rf,
+                     w_hist, k_q, k_o, lookback, analyst=None):
+    """Hedef fiyat tablosu + getiri–risk + model portföy (Yerli ve Yabancı için ortak). analyst: yabancı modda
+    {sym: {upside, n, rec, mean}} (Yahoo analist hedefi); None = Yerli."""
+    for_mode = analyst is not None
+    last = {t: float(uprices[t].dropna().iloc[-1]) for t in uprices.columns if uprices[t].notna().any()}
     shown = [t for t in scored.index if t in results and (sector_pick == "Tümü" or scored.loc[t, "sektor"] == sector_pick)]
 
     # ───────────── 1) hedef fiyat ve ucuzluk önceliği ─────────────
@@ -159,21 +290,32 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
                     f"%{okc['upside'].min() * 100:+.0f} potansiyel")
             _metric(k4, "Ucuz/pahalı", f"{int((ok['upside'] >= 0.10).sum())} / {int((ok['upside'] <= -0.10).sum())}",
                     "≥%10 / ≤−%10 potansiyel")
-        show = pd.DataFrame({
+        cols = {
             "Öncelik": pr_df["rank"],
             "Hisse": [t + _gorunum_mark(results[t]["gorunum"]) for t in pr_df["ticker"]],
             "Sektör": [results[t]["sector"] for t in pr_df["ticker"]],
             "Fiyat ₺": pr_df["price"],
             "Hedef fiyat ₺": pr_df["target"],
             "Potansiyel %": pr_df["upside"] * 100,
+        }
+        if for_mode:
+            cols["Analist hedefi ₺"] = [pr_df["price"][i] * (1 + analyst[t]["upside"]) if t in analyst else np.nan
+                                        for i, t in enumerate(pr_df["ticker"])]
+            cols["Analist potansiyel %"] = [analyst[t]["upside"] * 100 if t in analyst else np.nan
+                                            for t in pr_df["ticker"]]
+            cols["Analist sayısı"] = [analyst[t]["n"] if t in analyst else np.nan for t in pr_df["ticker"]]
+        cols.update({
             "Ucuzluk": [(LABEL_ICON.get(l, "") + " " + l).strip() for l in pr_df["label"]],
             "Güven": pr_df["confidence"],
-            "Overall": pr_df["overall"],
-            "Görünüm": pr_df["gorunum"],
-            "Kalite çarpanı": pr_df["adj"],
-            "Not": ["; ".join(f"{pv.MULT_LABELS[k]}: {why}" for k, why in results[t]["rejected"].items())
-                    for t in pr_df["ticker"]],
         })
+        if not for_mode:
+            cols["Overall"] = pr_df["overall"]
+        cols["Görünüm"] = pr_df["gorunum"]
+        if not for_mode:
+            cols["Kalite çarpanı"] = pr_df["adj"]
+        cols["Not"] = ["; ".join(f"{pv.MULT_LABELS[k]}: {why}" for k, why in results[t]["rejected"].items())
+                       for t in pr_df["ticker"]]
+        show = pd.DataFrame(cols)
         _df(show, hide_index=True, use_container_width=True, height=min(640, 38 * (len(show) + 1)),
                      column_config={
                          "Öncelik": st.column_config.NumberColumn(
@@ -181,9 +323,17 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
                          "Fiyat ₺": st.column_config.NumberColumn(format="%.2f"),
                          "Hedef fiyat ₺": st.column_config.NumberColumn(format="%.2f"),
                          "Potansiyel %": st.column_config.NumberColumn(format="%+.1f"),
+                         "Analist hedefi ₺": st.column_config.NumberColumn(format="%.2f"),
+                         "Analist potansiyel %": st.column_config.NumberColumn(format="%+.1f"),
+                         "Analist sayısı": st.column_config.NumberColumn(format="%d"),
                          "Overall": st.column_config.NumberColumn(format="%.1f"),
                          "Görünüm": st.column_config.NumberColumn(format="%.1f"),
                          "Kalite çarpanı": st.column_config.NumberColumn(format="%.2f")})
+        if for_mode:
+            st.caption("**Yabancı hisse notu:** 'Görünüm' sütunu burada **analist puanıdır** (6 − Yahoo konsensüs "
+                       "ortalaması; 5 = Güçlü Al, 3 = Tut, 1 = Güçlü Sat). Hedef fiyat, ileri F/K'nın yabancı evren "
+                       "içindeki sektör medyanına dayanır (geçmiş çarpan yok); **Analist hedefi** ise analistlerin "
+                       "ortalama 12 aylık hedefidir — ikisi birbirini doğrulamak için yan yana gösterilir. Fiyatlar TL'dedir.")
         st.caption("Hisse yanındaki işaret Görünüm puanı: **\\*** 4 üzeri, **+** 3–4 arası, **-** 3 altı. Güveni "
                    "'Düşük' olan hedefler (uç değer sınırına çarpan ya da zayıf referanslı) güvenilir olanların "
                    "ARDINA sıralanır; 'En ucuz/En pahalı' kutuları da güvenilir hedeflerden seçilir.")
@@ -196,12 +346,18 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
             st.caption("Değerleme hesaplanamayan hisseler (finansal veri yok): " + ", ".join(missing))
         if any(results[t]["clipped"] for t in shown):
             st.caption("⚠️ Bazı hedef fiyatlar uç değer koruması nedeniyle fiyatın 0.5x–2x'i ile sınırlandı.")
-        fig_q = _quality_cheapness_figure(results, list(pr_df["ticker"]))
-        if len(fig_q.data):
-            st.plotly_chart(fig_q, use_container_width=True, config=PLOTLY_CFG, key="sa_quality_cheapness")
+        if for_mode:
+            fig_a = _model_vs_analyst_figure(results, analyst, list(pr_df["ticker"]))
+            if fig_a is not None:
+                st.plotly_chart(fig_a, use_container_width=True, config=PLOTLY_CFG, key=K("model_vs_analyst"))
+        else:
+            fig_q = _quality_cheapness_figure(results, list(pr_df["ticker"]))
+            if len(fig_q.data):
+                st.plotly_chart(fig_q, use_container_width=True, config=PLOTLY_CFG, key=K("quality_cheapness"))
         with st.expander("🔬 Çarpan karşılaştırması: güncel · geçmiş · sektör"):
             _render_multiple_tables(results, list(pr_df["ticker"]))
-        _render_valuation_notes(w_hist, k_q, k_o)
+        if not for_mode:
+            _render_valuation_notes(w_hist, k_q, k_o)
 
     # ───────────── 2) beklenen getiri – risk ─────────────
     up = _to_calendar(uprices, (bench_px.index if bench_px is not None else uprices.index)[-(lookback + 1):])
@@ -226,12 +382,38 @@ def display_stock_analyzer(fetch_fn, valuation_fn=None, valuation_history_fn=Non
         mu_all = 0.5 * mu_hist + 0.5 * mu_hist.mean()
         src_note = (f"Markowitz: tarihsel ortalamanın kesit ortalamasına %50 çekilmiş hali; risk Ledoit-Wolf "
                     f"kovaryansı (shrinkage %{shrink * 100:.0f}).")
+    if for_mode:
+        src_note += " Getiriler TL bazlıdır (kur etkisi dahil); işlem günleri BIST takvimine hizalanmıştır."
     _render_return_risk_section(scored, results, names_all, mu_all, sig_all, rf, sector_pick, ret_src, lb_label,
                                 src_note, dropped)
 
     # ───────────── 3) model portföy ─────────────
     bench_ret = ((bench_px / bench_px.shift(1) - 1.0).reindex(urets.index) if bench_px is not None else None)
     _render_model_portfolio(uni, scored, results, names_all, mu_all, cov, rf, urets, bench_ret, ret_src, lookback)
+
+
+def _model_vs_analyst_figure(results, analyst, order):
+    """Yabancı mod: modelin (sektör çarpanı) potansiyeli ↔ analist ortalama hedefinin potansiyeli."""
+    pts = [(t, results[t]["upside"] * 100, analyst[t]["upside"] * 100, results[t]["label"]) for t in order
+           if t in analyst and np.isfinite(results[t]["upside"])]
+    if len(pts) < 3:
+        return None
+    fig = go.Figure()
+    for lab in ("Çok ucuz", "Ucuz", "Makul", "Pahalı", "Çok pahalı"):
+        sub = [p for p in pts if p[3] == lab]
+        if sub:
+            fig.add_trace(go.Scatter(
+                x=[p[1] for p in sub], y=[p[2] for p in sub], mode="markers+text", name=lab,
+                text=[p[0].replace("FOR:", "") for p in sub], textposition="top center", textfont=dict(size=9),
+                marker=dict(size=10, color=LABEL_COLOR[lab], opacity=0.85, line=dict(width=0.5, color="white")),
+                hovertemplate="<b>%{text}</b><br>Model potansiyeli %{x:+.0f}%<br>Analist potansiyeli %{y:+.0f}%"
+                              "<extra></extra>"))
+    fig.add_hline(y=0, line_dash="dot", line_color="gray")
+    fig.add_vline(x=0, line_dash="dot", line_color="gray")
+    fig.update_layout(title="Model hedefi ↔ analist hedefi (sağ üst: ikisi de ucuz diyor)", height=440,
+                      xaxis_title="Model potansiyeli % (sektör ileri F/K)", yaxis_title="Analist ort. hedef potansiyeli %",
+                      margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
+    return fig
 
 
 def _render_return_risk_section(scored, results, names_all, mu_all, sig_all, rf, sector_pick, ret_src, lb_label,
@@ -256,7 +438,7 @@ def _render_return_risk_section(scored, results, names_all, mu_all, sig_all, rf,
         title=f"Hisse bazında beklenen getiri – risk ({ret_src.split(' (')[0]}, {lb_label})",
         ytitle=f"Beklenen getiri % ({ret_src.split(' (')[0]})", height=600)
     fz.update_traces(textfont=dict(size=9), selector=dict(name="Hisseler"))
-    st.plotly_chart(fz, use_container_width=True, config=PLOTLY_CFG, key="sa_ret_risk_scatter")
+    st.plotly_chart(fz, use_container_width=True, config=PLOTLY_CFG, key=K("ret_risk_scatter"))
     sharpe = (mu_ - rf) / sg_
     zone = sorted((t for t, z in zip(nm, in_zone) if z), key=lambda t: -sharpe[nm.index(t)])
     st.caption(f"🟩 Yeşil bölge: risk (σ) gösterilen hisselerin medyanının altında, beklenen getiri medyanının üstünde "
@@ -292,7 +474,7 @@ def _model_select(mu, cov, sectors, k, objective, gamma, rf, cap, min_w, sector_
             "notes": list(sel["notes"])}
 
 
-def _send_to_portfolio(tickers):
+def _send_to_portfolio(tickers, kp="sa"):
     """Model portföyü Portföy sekmesindeki sepete aktarır (kayıtlı portföyden ayrılır)."""
     ss = st.session_state
     ss["pf_basket"] = list(tickers)
@@ -301,7 +483,7 @@ def _send_to_portfolio(tickers):
     ss["pf_saved_sel"] = PLACEHOLDER
     ss.pop("pf_snapshot", None)
     ss["pf_store_msg"] = ("ok", f"Stock Analyzer model portföyü sepete aktarıldı ({len(tickers)} hisse).")
-    ss["sa_mp_sent"] = True
+    ss[f"{kp}_mp_sent"] = True
 
 
 def _render_model_portfolio(uni, scored, results, names_all, mu_base, cov, rf, urets, bench_ret, ret_src, lookback):
@@ -310,29 +492,29 @@ def _render_model_portfolio(uni, scored, results, names_all, mu_base, cov, rf, u
     st.caption("Evrenden, beklenen getiriyi risk karşılığında en çok artıracak hisseleri seçip ağırlıklandırır "
                "(kardinalite kısıtlı ortalama-varyans optimizasyonu). Beklenen getiri = seçili kaynak + hedef fiyat "
                "potansiyelinin güvene göre ağırlıklı payı. Yatırım tavsiyesi değildir.")
-    st.session_state.setdefault("sa_mp_k", 15)
-    st.session_state.setdefault("sa_mp_obj", "Fayda: getiri − risk cezası (önerilen)")
-    st.session_state.setdefault("sa_mp_gamma", 4.0)
-    st.session_state.setdefault("sa_mp_cap", 15)
-    st.session_state.setdefault("sa_mp_min", 2)
-    st.session_state.setdefault("sa_mp_sec", 35)
-    st.session_state.setdefault("sa_mp_tp", 25)
-    st.session_state.setdefault("sa_mp_gmin", 0.0)
+    st.session_state.setdefault(K("mp_k"), 15)
+    st.session_state.setdefault(K("mp_obj"), "Fayda: getiri − risk cezası (önerilen)")
+    st.session_state.setdefault(K("mp_gamma"), 4.0)
+    st.session_state.setdefault(K("mp_cap"), 15)
+    st.session_state.setdefault(K("mp_min"), 2)
+    st.session_state.setdefault(K("mp_sec"), 35)
+    st.session_state.setdefault(K("mp_tp"), 25)
+    st.session_state.setdefault(K("mp_gmin"), 0.0)
     with st.expander("⚙️ Model portföy ayarları", expanded=False):
         a1, a2, a3, a4 = st.columns(4)
-        k = a1.slider("Hisse sayısı", 5, 30, key="sa_mp_k")
-        obj_label = a2.selectbox("Hedef", ["Fayda: getiri − risk cezası (önerilen)", "Maks. Sharpe"], key="sa_mp_obj",
+        k = a1.slider("Hisse sayısı", 5, 30, key=K("mp_k"))
+        obj_label = a2.selectbox("Hedef", ["Fayda: getiri − risk cezası (önerilen)", "Maks. Sharpe"], key=K("mp_obj"),
                                  help="Fayda: w'μ − (γ/2)·w'Σw. TL'de risksiz faiz çok yüksek olduğu için Maks. Sharpe "
                                       "çoğu zaman anlamsızlaşır; fayda yaklaşımı bu durumda daha güvenilirdir.")
-        gamma = a3.slider("Risk iştahı γ (yüksek = daha temkinli)", 1.0, 12.0, step=0.5, key="sa_mp_gamma")
-        tp_w = a4.slider("Hedef fiyat payı %", 0, 100, step=5, key="sa_mp_tp",
+        gamma = a3.slider("Risk iştahı γ (yüksek = daha temkinli)", 1.0, 12.0, step=0.5, key=K("mp_gamma"))
+        tp_w = a4.slider("Hedef fiyat payı %", 0, 100, step=5, key=K("mp_tp"),
                          help="Beklenen getiriye, hedef fiyat potansiyelinin (−%50..+%100 ile sınırlı) güven ile "
                               "çarpılmış bu yüzdesi eklenir. 0 = yalnızca tarihsel/PCA kaynağı.")
         b1, b2, b3, b4 = st.columns(4)
-        cap = b1.slider("Hisse başına üst sınır %", 8, 40, key="sa_mp_cap")
-        min_w = b2.slider("Hisse başına alt sınır %", 1, 6, key="sa_mp_min")
-        sec_cap = b3.slider("Sektör üst sınırı %", 15, 100, step=5, key="sa_mp_sec")
-        g_min = b4.slider("En düşük Görünüm puanı", 0.0, 5.0, step=0.5, key="sa_mp_gmin",
+        cap = b1.slider("Hisse başına üst sınır %", 8, 40, key=K("mp_cap"))
+        min_w = b2.slider("Hisse başına alt sınır %", 1, 6, key=K("mp_min"))
+        sec_cap = b3.slider("Sektör üst sınırı %", 15, 100, step=5, key=K("mp_sec"))
+        g_min = b4.slider("En düşük Görünüm puanı", 0.0, 5.0, step=0.5, key=K("mp_gmin"),
                           help="Aday havuzunu Görünüm puanına göre daraltır (0 = hepsi).")
     objective = "sharpe" if obj_label == "Maks. Sharpe" else "utility"
 
@@ -414,9 +596,9 @@ def _render_model_portfolio(uni, scored, results, names_all, mu_base, cov, rf, u
                f"%{tp_w}). Geriye bakış {lookback} işlem günü; risk Ledoit-Wolf kovaryansı. Hisse yanındaki işaret "
                "Görünüm puanı (**\\*** >4, **+** 3–4, **-** <3). Seçim ve ağırlıklar bir sezgisel optimizasyonun "
                "sonucudur; küçük girdi değişiklikleri portföyü değiştirebilir.")
-    st.button("📐 Model portföyü Portföy sekmesine aktar", key="sa_mp_send", on_click=_send_to_portfolio,
-              args=(m_t,))
-    if st.session_state.pop("sa_mp_sent", False):
+    st.button("📐 Model portföyü Portföy sekmesine aktar", key=K("mp_send"), on_click=_send_to_portfolio,
+              args=(m_t, _KP))
+    if st.session_state.pop(K("mp_sent"), False):
         st.success("Aktarıldı: Portföy sekmesinde sepet olarak göreceksin (kaydetmek için Kayıtlı portföy bölümünü kullan).")
 
     c1, c2 = st.columns(2)
@@ -424,7 +606,7 @@ def _render_model_portfolio(uni, scored, results, names_all, mu_base, cov, rf, u
         fb = go.Figure([go.Bar(name="Ağırlık %", x=m_t, y=w * 100), go.Bar(name="Risk katkısı %", x=m_t, y=rc * 100)])
         fb.update_layout(barmode="group", title="Ağırlık vs risk katkısı", height=340,
                          margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
-        st.plotly_chart(fb, use_container_width=True, config=PLOTLY_CFG, key="sa_mp_bar")
+        st.plotly_chart(fb, use_container_width=True, config=PLOTLY_CFG, key=K("mp_bar"))
     with c2:
         sec_w: dict = {}
         for wi, ix_i in zip(w, ix):
@@ -432,7 +614,7 @@ def _render_model_portfolio(uni, scored, results, names_all, mu_base, cov, rf, u
         fp = go.Figure(go.Pie(labels=list(sec_w), values=[v * 100 for v in sec_w.values()], hole=0.45,
                               textinfo="label+percent"))
         fp.update_layout(title="Sektör dağılımı", height=340, margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
-        st.plotly_chart(fp, use_container_width=True, config=PLOTLY_CFG, key="sa_mp_sectors")
+        st.plotly_chart(fp, use_container_width=True, config=PLOTLY_CFG, key=K("mp_sectors"))
 
     gv_m = np.array([_num(scored.loc[t, "gorunum_puani"]) for t in m_t])
     fz, _ = _return_risk_figure(
@@ -441,7 +623,7 @@ def _render_model_portfolio(uni, scored, results, names_all, mu_base, cov, rf, u
         port_pts=[("Model portföy", (p_sig, p_ret), "red", "star", 18)],
         title="Model portföy: hisse bazında beklenen getiri – risk (nokta büyüklüğü = ağırlık)",
         ytitle="Beklenen getiri % (model)")
-    st.plotly_chart(fz, use_container_width=True, config=PLOTLY_CFG, key="sa_mp_scatter")
+    st.plotly_chart(fz, use_container_width=True, config=PLOTLY_CFG, key=K("mp_scatter"))
 
     # 3B vektör haritası: evrenin korelasyon uzayı, model portföy hisseleri vektörle
     st.markdown("**🌐 Model portföy — 3B vektör haritası (korelasyon uzayı)**")
@@ -456,7 +638,7 @@ def _render_model_portfolio(uni, scored, results, names_all, mu_base, cov, rf, u
               f"Faktör 3 (%{expl[2] * 100:.0f})"]
     fm = _map_figure(coords, uni, ustats, m_t, wmap, titles, True, port_vec)
     fm.update_layout(height=520)
-    st.plotly_chart(fm, use_container_width=True, config=PLOTLY_CFG, key="sa_mp_map")
+    st.plotly_chart(fm, use_container_width=True, config=PLOTLY_CFG, key=K("mp_map"))
     st.caption(f"3 faktör evrenin korelasyon yapısının %{expl.sum() * 100:.0f}'ini açıklıyor. Seçili 15 hisse orijinden "
                "çıkan vektör, sarı çubuk model portföyün ağırlıklı vektörüdür; vektörler birbirinden ne kadar "
                "açıkken (düşük kosinüs) o kadar çeşitlenmiş demektir." + (f" Haritada olmayanlar: {', '.join(miss)}." if miss else ""))

@@ -20,6 +20,10 @@ import portfolio_factors as pf
 import portfolio_factorspace as fsp
 import portfolio_valuation as pv
 import portfoy_store as store
+try:
+    import global_data as gd
+except Exception:           # yfinance yoksa yabancı hisse seçici kapanır
+    gd = None
 from kpi_help import df as _df
 from sirket_raporlari import (
     DONEM_LABELS,
@@ -390,6 +394,28 @@ def _render_sector(sektor, skor, makro, df, ver, basket):
         return [t for t, s in zip(edited["Hisse"], edited["Seç"]) if s]
 
 
+def _render_foreign_picker(ver, basket, expanded=False):
+    """Yabancı hisse seçici (fon portföylerinde en çok tutulanlar). Dönüş: (liste evreni, seçilenler) ya da None."""
+    uf = gd.foreign_universe() if gd is not None else pd.DataFrame()
+    if uf.empty:
+        st.caption("🌎 Yabancı hisse listesi alınamadı (fon veritabanı / yfinance).")
+        return None
+    with st.expander(f"🌎 Yabancı hisseler — fonların en çok tuttukları ({len(uf)} hisse)", expanded=expanded):
+        st.caption("Kaynak: fon portföyleri. Fiyatlar yfinance'tan alınır ve işlem günündeki kurla **TL'ye çevrilir** "
+                   "(getiri kur etkisini içerir). Yabancı hisselerde Company Reports puanı yoktur; yalnızca risk/getiri "
+                   "ve çeşitlendirme hesaplanır.")
+        st.button("⭐ En çok tutulan 5'i ekle", key=f"pf_topf_{ver}", on_click=_add_tickers,
+                  args=(list(uf["symbol"].head(5)),))
+        editor_df = pd.DataFrame({"Seç": uf["symbol"].isin(basket).values, "Hisse": uf["yahoo"].values,
+                                  "Fon sayısı": uf["n_fon"].values})
+        edited = st.data_editor(
+            editor_df, key=f"pf_edf_{ver}", hide_index=True, use_container_width=True, height=320,
+            disabled=["Hisse", "Fon sayısı"],
+            column_config={"Seç": st.column_config.CheckboxColumn("Seç", width="small"),
+                           "Fon sayısı": st.column_config.NumberColumn("Fon sayısı", format="%d")})
+        return set(uf["symbol"]), [s for s, c in zip(uf["symbol"], edited["Seç"]) if c]
+
+
 STICKY_CSS = """<style>
 div[data-testid="stColumn"]:has(#pf-basket-anchor),
 div[data-testid="column"]:has(#pf-basket-anchor) {
@@ -415,8 +441,11 @@ def _render_basket_panel(uni: pd.DataFrame):
         sek = uni.loc[t, "sektor"] if t in uni.index and pd.notna(uni.loc[t, "sektor"]) else "—"
         ov = uni.loc[t, "overall_puani"] if t in uni.index else np.nan
         c1, c2 = st.columns([5, 1])
-        c1.markdown(f"**{t}** · {sek}" + (f" · {ov:.1f}/5" if pd.notna(ov) else
-                                          ("" if t in uni.index else " · _bu dönemde rapor yok_")))
+        if gd is not None and gd.is_foreign(t):
+            c1.markdown(f"**{gd.display_symbol(t)}** · yabancı hisse")
+        else:
+            c1.markdown(f"**{t}** · {sek}" + (f" · {ov:.1f}/5" if pd.notna(ov) else
+                                              ("" if t in uni.index else " · _bu dönemde rapor yok_")))
         c2.button("✕", key=f"pf_rm_{t}", on_click=_remove_ticker, args=(t,))
     st.button("🗑️ Sepeti temizle", on_click=_clear_basket, use_container_width=True)
 
@@ -2071,39 +2100,56 @@ def _render_time_section(a, uni, universe_tickers, fetch_fn):
 # ───────────────────────── ana giriş ─────────────────────────
 
 def display_portfolio_builder(fetch_fn, valuation_fn=None, valuation_history_fn=None,
-                              financial_loader=None):
+                              financial_loader=None, scope="TR", fetch_fn_try=None):
     """fetch_fn: streamlit_app.fetch_stock_data (symbol, start_date=, interval=).
     valuation_fn / valuation_history_fn / financial_loader: streamlit_app'teki değerleme
     fonksiyonları (compute_stock_valuations, compute_valuation_history, _load_financial_store_for);
-    verilmezse hedef fiyat bölümü devre dışı kalır."""
+    verilmezse hedef fiyat bölümü devre dışı kalır.
+    scope: 'TR' | 'FOR' | 'ALL' - hangi hisse seçicilerinin gösterileceği (sepet kapsamdan bağımsız kalıcıdır).
+    fetch_fn_try: yabancı fiyatları TL'ye çeviren fetch (BIST'te aynen geçer); yabancı kapsamda kullanılır."""
     deps = dict(valuation=valuation_fn, history=valuation_history_fn, loader=financial_loader)
+    use_tr, use_for = scope in ("TR", "ALL"), scope in ("FOR", "ALL")
+    if fetch_fn_try is not None:
+        fetch_fn = fetch_fn_try        # BIST'te fetch_stock_data ile aynı; yabancıda TL'ye çevirir (sepet karışık olabilir)
     st.markdown("### 📐 Portföy Çalışma Alanı")
     st.caption("En iyi sektörlere bak, her sektörden beğendiğin hisseleri seç; portföy kutusu "
                "risk bazlı ağırlıkları, riski ve sağlık skorunu canlı hesaplasın. "
-               "Veriler 📄 Company Reports'tan gelir. Yatırım tavsiyesi değildir.")
+               "BIST verileri 📄 Company Reports'tan gelir; yabancı hisseler fon portföylerinden ve yfinance'tan. "
+               "Yatırım tavsiyesi değildir.")
 
+    reports, rollup, yil, donem = None, None, None, None
     periods = get_available_periods_for_rollup()
     if periods is None or periods.empty:
-        st.info("Henüz kayıtlı şirket raporu yok — önce 📄 Company Reports bölümünden rapor ekle.")
-        return
-    options = [(int(r.yil), r.donem) for r in periods.itertuples()]
-    top = st.columns([4, 1])
-    with top[0]:
-        yil, donem = st.selectbox("Rapor dönemi", options, key="pf_period",
-                                  format_func=lambda p: f"{DONEM_LABELS.get(p[1], p[1])} {p[0]}")
-    with top[1]:
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        st.button("🔄 Güncelle", on_click=_do_update, use_container_width=True,
-                  help="Company Reports'taki güncel rapor/sektör verilerini ve fiyat verilerini yeniden "
-                       "yükler; yeni eklediğin şirketler listeye gelir. Gemini çağrısı yapmaz. Yeni bir "
-                       "sektörün skoru için Company Reports › Sektör Analizi › Hesapla/Yenile gerekir.")
-
-    reports = get_reports_for_period(yil, donem)
-    if reports is None or reports.empty:
-        st.info("Bu dönem için kayıtlı rapor yok.")
-        return
-    rollup = get_sector_rollup(yil, donem)
-    uni = reports.drop_duplicates("ticker").set_index("ticker", drop=False)
+        if use_tr:
+            st.info("Henüz kayıtlı şirket raporu yok — önce 📄 Company Reports bölümünden rapor ekle.")
+        if not use_for:
+            return
+    else:
+        options = [(int(r.yil), r.donem) for r in periods.itertuples()]
+        top = st.columns([4, 1])
+        with top[0]:
+            yil, donem = st.selectbox("Rapor dönemi", options, key="pf_period",
+                                      format_func=lambda p: f"{DONEM_LABELS.get(p[1], p[1])} {p[0]}")
+        with top[1]:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            st.button("🔄 Güncelle", on_click=_do_update, use_container_width=True,
+                      help="Company Reports'taki güncel rapor/sektör verilerini ve fiyat verilerini yeniden "
+                           "yükler; yeni eklediğin şirketler listeye gelir. Gemini çağrısı yapmaz. Yeni bir "
+                           "sektörün skoru için Company Reports › Sektör Analizi › Hesapla/Yenile gerekir.")
+        reports = get_reports_for_period(yil, donem)
+        if reports is None or reports.empty:
+            if use_tr:
+                st.info("Bu dönem için kayıtlı rapor yok.")
+            if not use_for:
+                return
+            reports = None
+        else:
+            rollup = get_sector_rollup(yil, donem)
+    if reports is not None:
+        uni = reports.drop_duplicates("ticker").set_index("ticker", drop=False)
+    else:       # rapor evreni yok (yalnızca yabancı kapsam): boş ama şemalı evren
+        uni = pd.DataFrame(columns=["ticker", "sektor", "overall_puani", "marj_toplam_puani", "buyume_puani",
+                                    "gorunum_puani"]).set_index("ticker", drop=False)
     sector_score = ({r.sektor: r.sektor_skoru for r in rollup.itertuples()}
                     if rollup is not None and not rollup.empty else {})
 
@@ -2127,12 +2173,17 @@ def display_portfolio_builder(fetch_fn, valuation_fn=None, valuation_history_fn=
     left, right = st.columns([3, 2])
     box = st.container()      # görsel olarak sütunların altı; içi aşağıda (kod sırasıyla) doldurulur
 
-    # 1) sektör seçici - sepet burada kesinleşir
+    # 1) sektör / yabancı hisse seçici - sepet burada kesinleşir
     with left:
-        st.markdown("#### 🏭 Sektörler (sektör skoruna göre)")
         picked: dict = {}
-        for sektor, skor, makro, df in _sector_groups(reports, rollup):
-            picked[sektor] = (set(df["ticker"]), _render_sector(sektor, skor, makro, df, ver, basket))
+        if use_tr and reports is not None:
+            st.markdown("#### 🏭 Sektörler (sektör skoruna göre)")
+            for sektor, skor, makro, df in _sector_groups(reports, rollup):
+                picked[sektor] = (set(df["ticker"]), _render_sector(sektor, skor, makro, df, ver, basket))
+        if use_for:
+            fp = _render_foreign_picker(ver, basket, expanded=(scope == "FOR"))
+            if fp is not None:
+                picked["__FOR__"] = fp
         new_basket = list(basket)
         for _, (sector_tickers, checked) in picked.items():
             new_basket = [t for t in new_basket if t not in sector_tickers or t in checked]

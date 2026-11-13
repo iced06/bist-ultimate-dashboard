@@ -123,6 +123,11 @@ HELP: dict[str, str] = {
         "Hissenin çarpanlarının (kendi geçmiş + sektör medyanı, Overall/Görünüm ile ayarlı) ortalamaya döneceği "
         "varsayımıyla bulunan değer. Zaman ufku belirsiz; fiyatın 0.5x–2x'i ile sınırlı."),
     "Potansiyel %": "Hedef fiyat ÷ fiyat − 1. + ucuz (hedefin altında işlem görüyor), − pahalı.",
+    "Analist hedefi ₺": (
+        "Yahoo Finance'taki analistlerin ortalama 12 aylık hedef fiyatı (yabancı hisse), TL'ye güncel fiyat oranıyla "
+        "çevrilmiş. Bu uygulamanın kendi hesabı değildir; model hedefiyle yan yana karşılaştırma içindir."),
+    "Analist potansiyel %": "Analist ortalama hedefi ÷ güncel fiyat − 1 (yerel para biriminde, kur etkisinden bağımsız).",
+    "Analist sayısı": "Ortalama hedefe katkı veren analist sayısı. Az sayıda analist = hedef daha az güvenilir.",
     "Ucuzluk": "Potansiyele göre etiket: ≥+%30 Çok ucuz, +%10 Ucuz, ±%10 Makul, −%10 Pahalı, ≤−%30 Çok pahalı.",
     "Güven": (
         "Hedefin güvenilirliği: Yüksek = iki yöntem (F/K ve FD/FAVÖK) ve hem geçmiş hem sektör referansı var; Orta = biri "

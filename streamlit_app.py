@@ -37,7 +37,7 @@ except Exception as _fon_analiz_import_error:
     # fon_analiz.py veritabani baglantisi gerektiriyor (psycopg2) - bu paket
     # bazi ortamlarda kurulamayabiliyor. Boyle bir durumda TUM uygulamayi
     # cokertmek yerine sadece Funds sekmesini devre disi birakiyoruz.
-    def display_funds_analysis():
+    def display_funds_analysis(scope=None):
         st.error("💰 Funds özelliği yüklenemedi (fon_analiz.py import hatası).")
         st.code(str(_fon_analiz_import_error))
 
@@ -65,6 +65,18 @@ except Exception as _stock_analyzer_import_error:
         st.error("🔬 Stock Analyzer özelliği yüklenemedi (stock_analyzer.py import hatası).")
         st.code(str(_stock_analyzer_import_error))
 
+try:
+    import global_data as gd
+    from stock_profile import display_company_profile, display_foreign_fundamentals
+except Exception as _global_data_import_error:      # yfinance yoksa yabancı özellikler kapanır, BIST çalışır
+    gd = None
+
+    def display_company_profile(*args, **kwargs):
+        st.info("Şirket profili yüklenemedi (yfinance kurulu olmayabilir).")
+
+    def display_foreign_fundamentals(*args, **kwargs):
+        st.info("Yabancı hisse verisi yüklenemedi (yfinance kurulu olmayabilir).")
+
 st.set_page_config(
     page_title="BIST Technical Analysis",
     page_icon="📊",
@@ -73,6 +85,29 @@ st.set_page_config(
 )
 
 load_dotenv()
+
+SCOPE_PAGES = ("📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "💰 Funds",
+               "📄 Company Reports", "🔬 Stock Analyzer", "📐 Portfolio")      # Macro hisse bazli degil -> kapsam yok
+
+
+def _cs():
+    """Single Stock gövdesindeki fiyat metinlerinin para birimi simgesi (BIST ₺; yabancı hissede $, €...).
+    Single Stock bloğu hisseyi yükleyince session_state['_ccy_sym']'e yazar."""
+    return st.session_state.get("_ccy_sym", "₺")
+
+
+def _disp(symbol):
+    """Gösterim adı: 'FOR:AAPL' -> 'AAPL 🌎', BIST kodu aynen."""
+    return gd.display_symbol(symbol) if gd is not None else symbol
+
+
+def _scope_universe(scope, tr_list):
+    """Kapsama gore sembol listesi: TR -> tr_list, FOR -> fon portfoylerindeki yabanci hisseler ('FOR:..'),
+    ALL -> ikisi birlikte."""
+    tr = list(tr_list)
+    fr = gd.foreign_symbols() if gd is not None else []
+    return tr if scope == "TR" else (fr if scope == "FOR" else tr + fr)
+
 
 def get_is_mobile():
     """Detect narrow viewport via CSS class injection and provide responsive defaults."""
@@ -735,6 +770,9 @@ def fetch_stock_data(symbol, start_date="2023-01-01", end_date=None, interval="1
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
+    if gd is not None and gd.is_foreign(symbol):
+        # Yabanci hisse ("FOR:AAPL"): borsapy degil yfinance (bkz. global_data.py)
+        return gd.fetch_history(symbol, start_date, end_date, interval)
     for attempt in range(2):
         try:
             ticker = bp.Ticker(symbol)
@@ -747,6 +785,17 @@ def fetch_stock_data(symbol, start_date="2023-01-01", end_date=None, interval="1
                 time.sleep(2)
                 continue
             return None
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_stock_data_try(symbol, start_date="2023-01-01", end_date=None, interval="1d"):
+    """fetch_stock_data ile ayni, ama yabanci hisselerin OHLC'si islem gunundeki kurla TL'ye cevrilir
+    (Portfoy / Stock Analyzer'da TL bazli getiri-risk icin; kur dahil getiri). BIST hisseleri aynen doner.
+    Kur alinamazsa yabanci hisse icin None doner (karma para birimi portfoyu bozmasin)."""
+    df = fetch_stock_data(symbol, start_date=start_date, end_date=end_date, interval=interval)
+    if gd is None or df is None or not gd.is_foreign(symbol):
+        return df
+    return gd.to_try(df, gd.currency_of(symbol), start_date)
+
 
 def _decay_value_score(series, threshold, ceiling):
     """SINIRLI osilatorler (RSI/Stochastic/CCI/CMF) icin: deger BUY esigini
@@ -1080,6 +1129,8 @@ def _rank_and_enrich(scored, rank_col, valuation_cache, top_n=20, max_workers=5)
     missing = [r for r in top if r['symbol'] not in valuation_cache]
     if missing:
         fund_flow_map = get_latest_fund_flow_map()
+        if gd is not None:
+            fund_flow_map = {**fund_flow_map, **gd.foreign_fund_flow_map()}     # 'FOR:AAPL' anahtarlari
         # ANA THREAD'de (burada, ScriptRunContext mevcut) financial_store'un
         # bir snapshot'i alinir - worker thread'lere ACIKCA gecirilir (bkz.
         # compute_stock_valuations docstring'i).
@@ -1483,6 +1534,7 @@ def import_all_financials(stock_list, max_workers=5):
     # financial_store degisti - onbelleklenmis marj/liste hesaplarini
     # gecersiz kil (yoksa Company Reports/Show List eski veriyi gosterir).
     get_financial_margin_snapshot.clear()
+    get_financial_margin_snapshot_for_periods.clear()
     get_financial_store_summary.clear()
     _get_financial_store_db_ticker_count.clear()
 
@@ -1946,8 +1998,7 @@ def calculate_fundamentals(df_bs):
     return ratios
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_financial_margin_snapshot():
+def _build_margin_snapshots(periods=()):
     """
     Import edilmis (st.session_state.financial_store'daki) her hisse icin
     en son iki DONEMIN Brut Kar Marji %, FAVOK Marji % ve Net Kar Marji %
@@ -1991,7 +2042,16 @@ def get_financial_margin_snapshot():
     alanlari, tam bir yil once ayni ceyrek etiketi icin veri yoksa (orn.
     sadece 1 yillik gecmis import edilmisse) None kalir.
 
-    @st.cache_data ile onbelleklendi: DB'ye tasinan financial_store artik
+    DONEM-DUYARLI (periods): Company Reports'taki "Marjlari Finansallardan
+    Tazele" ve sektor analizi, raporun KENDI doneminin (orn. 2025/6) marjlarini
+    kullanmali - hissenin en son importlu donemini degil. `periods` ile istenen
+    donem etiketleri icin ayrica {donem: {ticker: {...ayni format...}}} uretilir;
+    o donemde verisi olmayan hisse o donem sozlugunde YER ALMAZ. "prev"/"yoy"
+    ilgili donemin kendi onceki/gecen yil karsiligidir.
+    Donus: (latest, by_period). get_financial_margin_snapshot (sadece latest) ve
+    get_financial_margin_snapshot_for_periods bunu @st.cache_data ile sarar.
+
+    (Onbellek notu - eski docstring:) @st.cache_data ile onbelleklendi: DB'ye tasinan financial_store artik
     yuzlerce hisseyi tutabiliyor (once ~30'du) - her Company Reports
     rerun'unda TUMUNU yeniden hesaplamak (parse_balance_sheet_to_df +
     calculate_fundamentals x hisse sayisi) sayfa donusunu gozle gorulur
@@ -2001,6 +2061,7 @@ def get_financial_margin_snapshot():
     _load_financial_store()  # sadece burada gercekten TUM hisseler lazim (bkz. yukaridaki not)
     all_key_items = {**KEY_ITEMS_BY_DESC, **KEY_INCOME_BY_DESC}
     snapshot = {}
+    by_period = {p: {} for p in periods}
     for symbol, raw_data in st.session_state.financial_store.items():
         try:
             df_bs = parse_balance_sheet_to_df(raw_data, item_filter=all_key_items)
@@ -2040,50 +2101,70 @@ def get_financial_margin_snapshot():
             period_cols = [c for c in df_bs.columns if "/" in c]
             if not period_cols:
                 continue
-            period_latest = period_cols[0]
-            period_prev = period_cols[1] if len(period_cols) > 1 else None
-            # YoY-YTD karsilastirmasi: ayni ceyrek etiketinin (orn. "/6") tam
-            # bir yil onceki karsiligi - period_cols'ta VARSA kullan (bkz.
-            # yukaridaki docstring).
-            period_yoy = None
-            try:
-                y_str, q_str = period_latest.split("/")
-                candidate = f"{int(y_str) - 1}/{q_str}"
-                if candidate in period_cols:
-                    period_yoy = candidate
-            except (ValueError, AttributeError):
-                pass
-            snapshot[symbol] = {
-                "period_latest": period_latest,
-                "period_prev": period_prev,
-                "period_yoy": period_yoy,
-                "gross_margin": gm_d.get(period_latest),
-                "gross_margin_prev": gm_d.get(period_prev) if period_prev else None,
-                "gross_margin_yoy": gm_d.get(period_yoy) if period_yoy else None,
-                "ebitda_margin": em_d.get(period_latest),
-                "ebitda_margin_prev": em_d.get(period_prev) if period_prev else None,
-                "ebitda_margin_yoy": em_d.get(period_yoy) if period_yoy else None,
-                "net_margin": nm_d.get(period_latest),
-                "net_margin_prev": nm_d.get(period_prev) if period_prev else None,
-                "net_margin_yoy": nm_d.get(period_yoy) if period_yoy else None,
-                "revenue": _abs_val("revenue", period_latest),
-                "revenue_prev": _abs_val("revenue", period_prev) if period_prev else None,
-                "revenue_yoy": _abs_val("revenue", period_yoy) if period_yoy else None,
-                "ebitda_tl": _ebitda_abs(period_latest),
-                "ebitda_tl_prev": _ebitda_abs(period_prev) if period_prev else None,
-                "ebitda_tl_yoy": _ebitda_abs(period_yoy) if period_yoy else None,
-                "net_profit": (_abs_val("net_profit", period_latest)
-                               or _abs_val("net_profit_parent", period_latest)),
-                "net_profit_prev": ((_abs_val("net_profit", period_prev)
-                                     or _abs_val("net_profit_parent", period_prev))
-                                    if period_prev else None),
-                "net_profit_yoy": ((_abs_val("net_profit", period_yoy)
-                                    or _abs_val("net_profit_parent", period_yoy))
-                                   if period_yoy else None),
-            }
+            def _entry(idx):
+                period_latest = period_cols[idx]
+                period_prev = period_cols[idx + 1] if idx + 1 < len(period_cols) else None
+                # YoY-YTD karsilastirmasi: ayni ceyrek etiketinin (orn. "/6") tam
+                # bir yil onceki karsiligi - period_cols'ta VARSA kullan.
+                period_yoy = None
+                try:
+                    y_str, q_str = period_latest.split("/")
+                    candidate = f"{int(y_str) - 1}/{q_str}"
+                    if candidate in period_cols:
+                        period_yoy = candidate
+                except (ValueError, AttributeError):
+                    pass
+                return {
+                    "period_latest": period_latest,
+                    "period_prev": period_prev,
+                    "period_yoy": period_yoy,
+                    "gross_margin": gm_d.get(period_latest),
+                    "gross_margin_prev": gm_d.get(period_prev) if period_prev else None,
+                    "gross_margin_yoy": gm_d.get(period_yoy) if period_yoy else None,
+                    "ebitda_margin": em_d.get(period_latest),
+                    "ebitda_margin_prev": em_d.get(period_prev) if period_prev else None,
+                    "ebitda_margin_yoy": em_d.get(period_yoy) if period_yoy else None,
+                    "net_margin": nm_d.get(period_latest),
+                    "net_margin_prev": nm_d.get(period_prev) if period_prev else None,
+                    "net_margin_yoy": nm_d.get(period_yoy) if period_yoy else None,
+                    "revenue": _abs_val("revenue", period_latest),
+                    "revenue_prev": _abs_val("revenue", period_prev) if period_prev else None,
+                    "revenue_yoy": _abs_val("revenue", period_yoy) if period_yoy else None,
+                    "ebitda_tl": _ebitda_abs(period_latest),
+                    "ebitda_tl_prev": _ebitda_abs(period_prev) if period_prev else None,
+                    "ebitda_tl_yoy": _ebitda_abs(period_yoy) if period_yoy else None,
+                    "net_profit": (_abs_val("net_profit", period_latest)
+                                   or _abs_val("net_profit_parent", period_latest)),
+                    "net_profit_prev": ((_abs_val("net_profit", period_prev)
+                                         or _abs_val("net_profit_parent", period_prev))
+                                        if period_prev else None),
+                    "net_profit_yoy": ((_abs_val("net_profit", period_yoy)
+                                        or _abs_val("net_profit_parent", period_yoy))
+                                       if period_yoy else None),
+                }
+
+            snapshot[symbol] = _entry(0)
+            for p in periods:
+                if p in period_cols:
+                    by_period[p][symbol] = snapshot[symbol] if period_cols.index(p) == 0                         else _entry(period_cols.index(p))
         except Exception:
             continue
-    return snapshot
+    return snapshot, by_period
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_financial_margin_snapshot():
+    """Her hissenin EN SON importlu donemine ait marj snapshot'i
+    (bkz. _build_margin_snapshots)."""
+    return _build_margin_snapshots()[0]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_financial_margin_snapshot_for_periods(periods):
+    """{donem_etiketi ("2025/6"): {ticker: snapshot}} - raporun KENDI donemine
+    gore marj skoru hesabi icin (bkz. _build_margin_snapshots). `periods`
+    hashable olmali (tuple)."""
+    return _build_margin_snapshots(tuple(periods))[1]
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -2516,8 +2597,16 @@ def compute_stock_valuations(symbol, current_price, financial_store=None):
     thread'lerin ScriptRunContext'i olmadigi icin erisim GUVENILIR DEGIL -
     ana thread'de st.session_state.financial_store'un bir SNAPSHOT'i alinip
     buraya acikca gecirilmesi gerekir, aksi halde tum degerleme sessizce bos
-    doner (kullanici sikayeti: "With Financials" hep 0 gorunuyordu)."""
+    doner (kullanici sikayeti: "With Financials" hep 0 gorunuyordu).
+
+    Yabanci hisse ("FOR:AAPL"): Is Yatirim finansali yok - carpanlar yfinance .info'dan gelir
+    (global_data.foreign_valuations)."""
     result = {}
+    if gd is not None and gd.is_foreign(symbol):
+        try:
+            return gd.foreign_valuations(symbol, current_price)
+        except Exception:
+            return result
     if financial_store is not None:
         raw_data = financial_store.get(symbol)
         if raw_data is None:
@@ -3539,7 +3628,7 @@ def detect_patterns(df):
                     patterns.append({
                         "name": "Double Bottom (W)", "type": "bullish",
                         "index": recent.index[min_idx2],
-                        "description": f"Two price lows at approximately the same level (₺{low1:.2f} and ₺{low2:.2f}), with a rally between them forming a 'W' shape. This is a classic reversal pattern. The breakout above the middle peak (₺{between_high:.2f}) confirms the pattern and targets a move equal to the depth of the W."
+                        "description": f"Two price lows at approximately the same level ({_cs()}{low1:.2f} and {_cs()}{low2:.2f}), with a rally between them forming a 'W' shape. This is a classic reversal pattern. The breakout above the middle peak ({_cs()}{between_high:.2f}) confirms the pattern and targets a move equal to the depth of the W."
                     })
         
         # Simple double top detection
@@ -3553,7 +3642,7 @@ def detect_patterns(df):
                     patterns.append({
                         "name": "Double Top (M)", "type": "bearish",
                         "index": recent.index[max_idx2],
-                        "description": f"Two price highs at approximately the same level (₺{high1:.2f} and ₺{high2:.2f}), with a dip between them forming an 'M' shape. This is a classic bearish reversal. A break below the middle trough (₺{between_low:.2f}) confirms the pattern."
+                        "description": f"Two price highs at approximately the same level ({_cs()}{high1:.2f} and {_cs()}{high2:.2f}), with a dip between them forming an 'M' shape. This is a classic bearish reversal. A break below the middle trough ({_cs()}{between_low:.2f}) confirms the pattern."
                     })
     
     # Deduplicate: keep only the most recent occurrence of each pattern name
@@ -3719,11 +3808,11 @@ def run_monte_carlo(df, stock, num_simulations=1000, forecast_days=30):
     fig_paths.add_trace(go.Scatter(x=days_range, y=p95, mode='lines', line=dict(color='green', dash='dash', width=2), name='95th %ile'))
     
     # Starting price reference
-    fig_paths.add_hline(y=last_price, line_dash="solid", line_color="yellow", annotation_text=f"Current ₺{last_price:.2f}")
+    fig_paths.add_hline(y=last_price, line_dash="solid", line_color="yellow", annotation_text=f"Current {_cs()}{last_price:.2f}")
     
     fig_paths.update_layout(
         title=f"{stock} — {num_simulations} Monte Carlo Paths ({forecast_days} days)",
-        xaxis_title="Days Forward", yaxis_title="Price (₺)",
+        xaxis_title="Days Forward", yaxis_title="Price (" + _cs() + ")",
         height=400, margin=dict(l=40, r=20, t=40, b=70),
         legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, font=dict(size=10))
     )
@@ -3740,13 +3829,13 @@ def run_monte_carlo(df, stock, num_simulations=1000, forecast_days=30):
     ))
     
     fig_dist.add_vline(x=last_price, line_dash="solid", line_color="yellow",
-                       annotation_text=f"Current ₺{last_price:.2f}")
+                       annotation_text=f"Current {_cs()}{last_price:.2f}")
     fig_dist.add_vline(x=np.median(final_prices), line_dash="dash", line_color="white",
-                       annotation_text=f"Median ₺{np.median(final_prices):.2f}")
+                       annotation_text=f"Median {_cs()}{np.median(final_prices):.2f}")
     
     fig_dist.update_layout(
         title=f"Distribution of Simulated Prices after {forecast_days} Days",
-        xaxis_title="Price (₺)", yaxis_title="Frequency",
+        xaxis_title="Price (" + _cs() + ")", yaxis_title="Frequency",
         height=350, margin=dict(l=40, r=20, t=40, b=70),
         legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, font=dict(size=10))
     )
@@ -3766,9 +3855,9 @@ def run_monte_carlo(df, stock, num_simulations=1000, forecast_days=30):
     
     sc1, sc2, sc3 = st.columns(3)
     with sc1:
-        st.metric("Median Price", f"₺{np.median(final_prices):.2f}", f"{median_return:+.1f}%")
+        st.metric("Median Price", f"{_cs()}{np.median(final_prices):.2f}", f"{median_return:+.1f}%")
     with sc2:
-        st.metric("Expected Price", f"₺{np.mean(final_prices):.2f}", f"{expected_return:+.1f}%")
+        st.metric("Expected Price", f"{_cs()}{np.mean(final_prices):.2f}", f"{expected_return:+.1f}%")
     with sc3:
         color = "normal" if prob_above >= 50 else "inverse"
         st.metric("P(Price Up)", f"{prob_above:.1f}%", delta=f"{prob_above-50:+.1f}pp vs 50%", delta_color=color)
@@ -3789,11 +3878,11 @@ def run_monte_carlo(df, stock, num_simulations=1000, forecast_days=30):
             f"{prob_down20:.1f}%",
         ],
         "Target Price": [
-            f"₺{last_price:.2f}+",
-            f"₺{last_price*1.10:.2f}+",
-            f"₺{last_price*1.20:.2f}+",
-            f"below ₺{last_price*0.90:.2f}",
-            f"below ₺{last_price*0.80:.2f}",
+            f"{_cs()}{last_price:.2f}+",
+            f"{_cs()}{last_price*1.10:.2f}+",
+            f"{_cs()}{last_price*1.20:.2f}+",
+            f"below {_cs()}{last_price*0.90:.2f}",
+            f"below {_cs()}{last_price*0.80:.2f}",
         ]
     }
     st.dataframe(pd.DataFrame(prob_data), use_container_width=True, hide_index=True)
@@ -3801,9 +3890,9 @@ def run_monte_carlo(df, stock, num_simulations=1000, forecast_days=30):
     # Confidence intervals
     st.markdown("#### 📐 Confidence Intervals")
     st.markdown(f"""
-    - **90% CI:** ₺{np.percentile(final_prices, 5):.2f} — ₺{np.percentile(final_prices, 95):.2f}
-    - **80% CI:** ₺{np.percentile(final_prices, 10):.2f} — ₺{np.percentile(final_prices, 90):.2f}
-    - **50% CI:** ₺{np.percentile(final_prices, 25):.2f} — ₺{np.percentile(final_prices, 75):.2f}
+    - **90% CI:** {_cs()}{np.percentile(final_prices, 5):.2f} — {_cs()}{np.percentile(final_prices, 95):.2f}
+    - **80% CI:** {_cs()}{np.percentile(final_prices, 10):.2f} — {_cs()}{np.percentile(final_prices, 90):.2f}
+    - **50% CI:** {_cs()}{np.percentile(final_prices, 25):.2f} — {_cs()}{np.percentile(final_prices, 75):.2f}
     """)
     
     st.caption("⚠️ Monte Carlo simulations assume returns follow a normal distribution with constant drift and volatility derived from historical data. Real markets exhibit fat tails, regime changes, and event risk not captured here. Use as one input among many, not as a prediction.")
@@ -3874,7 +3963,7 @@ def display_fibonacci_tab(df, stock):
     trend_text = "📈 Uptrend (retracement from high)" if is_uptrend else "📉 Downtrend (bounce from low)"
     
     st.markdown(f"#### {trend_text}")
-    st.caption(f"Swing High: ₺{swing_high:.2f} ({df.index[swing_high_idx]}) | Swing Low: ₺{swing_low:.2f} ({df.index[swing_low_idx]}) | Range: ₺{diff:.2f}")
+    st.caption(f"Swing High: {_cs()}{swing_high:.2f} ({df.index[swing_high_idx]}) | Swing Low: {_cs()}{swing_low:.2f} ({df.index[swing_low_idx]}) | Range: {_cs()}{diff:.2f}")
     
     # --- Fibonacci Chart ---
     fig = go.Figure()
@@ -3896,7 +3985,7 @@ def display_fibonacci_tab(df, stock):
         color = fib_colors.get(name, "gray")
         fig.add_hline(
             y=level, line_dash="dash", line_color=color,
-            annotation_text=f"{name}: ₺{level:.2f}",
+            annotation_text=f"{name}: {_cs()}{level:.2f}",
             annotation_position="right",
             annotation_font_size=9,
             annotation_font_color=color,
@@ -3906,7 +3995,7 @@ def display_fibonacci_tab(df, stock):
     for name, level in ext_levels.items():
         fig.add_hline(
             y=level, line_dash="dot", line_color="rgba(255,255,255,0.4)",
-            annotation_text=f"{name}: ₺{level:.2f}",
+            annotation_text=f"{name}: {_cs()}{level:.2f}",
             annotation_position="right",
             annotation_font_size=8,
         )
@@ -3961,7 +4050,7 @@ def display_fibonacci_tab(df, stock):
         
         st.markdown(f"""
         <div style="border-left: 4px solid {color}; padding: 0.6rem 1rem; margin: 0.3rem 0; background: {bg}; border-radius: 0 6px 6px 0;">
-            <strong style="color:{color};">{name}</strong>: ₺{level:.2f} — {proximity}
+            <strong style="color:{color};">{name}</strong>: {_cs()}{level:.2f} — {proximity}
             <p style="margin: 0.3rem 0 0 0; font-size: 0.9rem;">{comment}</p>
         </div>
         """, unsafe_allow_html=True)
@@ -3983,7 +4072,7 @@ def display_fibonacci_tab(df, stock):
         
         st.markdown(f"""
         <div style="border-left: 4px solid rgba(255,255,255,0.4); padding: 0.6rem 1rem; margin: 0.3rem 0; border-radius: 0 6px 6px 0;">
-            <strong>{name}</strong>: ₺{level:.2f} — {proximity}
+            <strong>{name}</strong>: {_cs()}{level:.2f} — {proximity}
             <p style="margin: 0.3rem 0 0 0; font-size: 0.9rem;">{comment}</p>
         </div>
         """, unsafe_allow_html=True)
@@ -3998,20 +4087,20 @@ def display_fibonacci_tab(df, stock):
     
     if is_uptrend:
         if current_price > levels["23.6%"]:
-            st.success(f"**Strong Position** — Price (₺{current_price:.2f}) is above the 23.6% level, holding within the shallowest retracement zone. The uptrend remains strong with minimal pullback.")
+            st.success(f"**Strong Position** — Price ({_cs()}{current_price:.2f}) is above the 23.6% level, holding within the shallowest retracement zone. The uptrend remains strong with minimal pullback.")
         elif current_price > fifty_level:
-            st.info(f"**Moderate Retracement** — Price has pulled back to the 38-50% zone. This is a normal and healthy correction within an uptrend. Watch the 50% level (₺{fifty_level:.2f}) for support.")
+            st.info(f"**Moderate Retracement** — Price has pulled back to the 38-50% zone. This is a normal and healthy correction within an uptrend. Watch the 50% level ({_cs()}{fifty_level:.2f}) for support.")
         elif current_price > golden_level:
-            st.warning(f"**Deep Retracement** — Price is testing the critical 61.8% golden ratio zone (₺{golden_level:.2f}). This is the last strong defense for the uptrend. A bounce here is a high-probability buy zone.")
+            st.warning(f"**Deep Retracement** — Price is testing the critical 61.8% golden ratio zone ({_cs()}{golden_level:.2f}). This is the last strong defense for the uptrend. A bounce here is a high-probability buy zone.")
         else:
-            st.error(f"**Very Deep Retracement** — Price has broken below the golden ratio (₺{golden_level:.2f}). The uptrend is in serious jeopardy. A full reversal toward the 100% level (₺{levels['100% (Low)']:.2f}) is possible.")
+            st.error(f"**Very Deep Retracement** — Price has broken below the golden ratio ({_cs()}{golden_level:.2f}). The uptrend is in serious jeopardy. A full reversal toward the 100% level ({_cs()}{levels['100% (Low)']:.2f}) is possible.")
     else:
         if current_price < levels["23.6%"]:
             st.error(f"**Weak Bounce** — Price is below the 23.6% level. The downtrend remains dominant with very little recovery.")
         elif current_price < fifty_level:
             st.warning(f"**Partial Recovery** — Price has bounced to the 38-50% zone. Some buying interest but not enough to signal a full reversal yet.")
         elif current_price < golden_level:
-            st.info(f"**Strong Recovery** — Price is approaching the golden ratio zone. A break above ₺{golden_level:.2f} would be a strong bullish signal.")
+            st.info(f"**Strong Recovery** — Price is approaching the golden ratio zone. A break above {_cs()}{golden_level:.2f} would be a strong bullish signal.")
         else:
             st.success(f"**Full Recovery** — Price has reclaimed above the 61.8% level. The downtrend may be reversing. Watch for a break above the swing high for confirmation.")
 
@@ -4404,16 +4493,27 @@ def compute_sma50_breadth_history(stock_list, days=90):
     
     # Collect daily close data for all stocks
     all_closes = {}
-    for s in stock_list:
+
+    def _close_series(s):
+        # fetch_stock_data hem BIST (borsapy) hem yabanci ('FOR:..', yfinance) hisseyi cozer ve onbellekli;
+        # farkli kaynaklarin (tz'li / tz'siz) endeksleri tek DataFrame'de birlesebilsin diye tz'siz gune cevrilir.
         try:
-            ticker = bp.Ticker(s)
-            df = ticker.history(start=start_date, end=end_date, interval="1d")
-            if df is not None and not df.empty:
-                df.columns = [col.title() for col in df.columns]
-                all_closes[s] = df["Close"]
+            df = fetch_stock_data(s, start_date=start_date, end_date=end_date, interval="1d")
+            if df is None or df.empty or "Close" not in df.columns:
+                return s, None
+            idx = pd.DatetimeIndex(df.index)
+            if idx.tz is not None:
+                idx = idx.tz_localize(None)
+            ser = pd.Series(df["Close"].astype(float).values, index=idx.normalize())
+            return s, ser[~ser.index.duplicated(keep="last")]
         except Exception:
-            continue
-    
+            return s, None
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for s, ser in ex.map(_close_series, list(stock_list)):
+            if ser is not None:
+                all_closes[s] = ser
+
     if not all_closes:
         return None
     
@@ -4454,38 +4554,54 @@ def main():
         st.session_state.authenticated = auth
         css = "status-realtime" if auth else "status-delayed"
         st.markdown(f'<div class="status-box {css}">{msg}</div>', unsafe_allow_html=True)
-        
+        scope_box = st.container()      # Kapsam (Tümü/TR/FOR) seçici: her sekmenin başı; aşağıda mode bilinince doldurulur
+
         with st.sidebar:
             st.header("⚙️ Settings")
             mode = st.radio("Mode", ["📊 Single Stock", "🔍 Stock Screener", "📋 Market Summary", "💎 Value Finder", "🌍 Macro Analysis", "💰 Funds", "📄 Company Reports", "🔬 Stock Analyzer", "📐 Portfolio"])
+            scope = "TR"
+            if gd is not None and mode in SCOPE_PAGES:
+                with scope_box:
+                    scope = gd.scope_selector(mode, default="ALL" if mode == "💰 Funds" else "TR")
+            scan_key_tf = lambda tf: f"{scope}|{tf}"
             st.markdown("---")
             st.subheader("⏱️ Timeframe")
-            available_tf = {k: v for k, v in TIMEFRAMES.items() if not v["auth_required"] or auth}
+            available_tf = {k: v for k, v in TIMEFRAMES.items()
+                            if not v["auth_required"] or auth or scope == "FOR"}     # yfinance gunici veri icin giris istemez
             tf_options = {k: v["label"] for k, v in available_tf.items()}
-            selected_tf = st.selectbox("Select", list(tf_options.keys()), format_func=lambda x: tf_options[x])
+            tf_keys = list(tf_options.keys())
+            selected_tf = st.selectbox("Select", tf_keys, index=tf_keys.index("1d") if "1d" in tf_keys else 0,
+                                       format_func=lambda x: tf_options[x], key="tf_select")
             st.session_state.current_timeframe = selected_tf
             
             if mode == "📊 Single Stock":
                 st.markdown("---")
-                st.subheader("🏛️ Index Filter")
-                selected_index = st.selectbox(
-                    "Filter by Index",
-                    list(INDEX_FILTERS.keys()),
-                    index=2,  # Default to "All Stocks"
-                    key="index_filter"
-                )
-                index_stocks = INDEX_FILTERS[selected_index]
-                # Only keep stocks that exist in the main IMKB list
-                index_stocks = sorted([s for s in index_stocks if s in IMKB])
-                
-                st.caption(f"{len(index_stocks)} stocks in {selected_index}")
-                
+                if scope in ("TR", "ALL"):
+                    st.subheader("🏛️ Index Filter")
+                    selected_index = st.selectbox(
+                        "Filter by Index",
+                        list(INDEX_FILTERS.keys()),
+                        index=2,  # Default to "All Stocks"
+                        key="index_filter"
+                    )
+                    index_stocks = INDEX_FILTERS[selected_index]
+                    # Only keep stocks that exist in the main IMKB list
+                    index_stocks = sorted([s for s in index_stocks if s in IMKB])
+                    st.caption(f"{len(index_stocks)} stocks in {selected_index}")
+                else:
+                    index_stocks = []
+                foreign_stocks = gd.foreign_symbols() if (gd is not None and scope in ("FOR", "ALL")) else []
+                if scope in ("FOR", "ALL"):
+                    st.caption(f"🌎 {len(foreign_stocks)} yabancı hisse (fon portföylerindeki; yfinance)")
+                index_stocks = index_stocks + foreign_stocks
+
                 st.markdown("---")
                 filter_c = st.checkbox("🔍 Show Only Chosen", value=st.session_state.filter_chosen_only)
                 st.session_state.filter_chosen_only = filter_c
+                chosen_list = st.session_state.chosen_stocks.get(scan_key_tf(selected_tf))
                 if filter_c:
-                    if selected_tf in st.session_state.chosen_stocks and st.session_state.chosen_stocks[selected_tf]:
-                        chosen_symbols = [s['symbol'] for s in st.session_state.chosen_stocks[selected_tf]]
+                    if chosen_list:
+                        chosen_symbols = [s['symbol'] for s in chosen_list]
                         # Intersect chosen stocks with selected index
                         stocks = sorted([s for s in chosen_symbols if s in index_stocks])
                         if not stocks:
@@ -4496,12 +4612,18 @@ def main():
                         stocks = index_stocks
                 else:
                     stocks = index_stocks
-                stock = st.selectbox("Stock", stocks)
+                if not stocks:
+                    st.warning("Bu kapsamda hisse listesi alınamadı (yabancı liste fon veritabanından gelir).")
+                    st.stop()
+                stock = st.selectbox(
+                    "Stock", stocks,
+                    format_func=lambda s: (("🌎 " + gd.foreign_label(s)) if gd is not None and gd.is_foreign(s) else s))
             else:
                 if st.button("🚀 Run Screener", use_container_width=True):
                     with st.spinner("Screening..."):
-                        scanned = screen_chosen_stocks(IMKB, interval=selected_tf)
-                        st.session_state.screener_scan[selected_tf] = scanned
+                        scan_list = _scope_universe(scope, IMKB)
+                        scanned = screen_chosen_stocks(scan_list, interval=selected_tf)
+                        st.session_state.screener_scan[scan_key_tf(selected_tf)] = scanned
                         st.session_state.screener_val_cache.setdefault(selected_tf, {})
                     if not scanned:
                         st.warning("⚠️ Tarama tamamlandı ama hiç hisse için veri çekilemedi "
@@ -4510,8 +4632,9 @@ def main():
             if mode == "📋 Market Summary":
                 if st.button("🔎 Scan All Stocks", use_container_width=True):
                     with st.spinner("Scanning entire market..."):
-                        sentiment_counts, above_sma50, below_sma50, sma50_na = scan_market_summary(IMKB, interval=selected_tf)
-                        st.session_state.market_summary[selected_tf] = {
+                        sentiment_counts, above_sma50, below_sma50, sma50_na = scan_market_summary(
+                            _scope_universe(scope, IMKB), interval=selected_tf)
+                        st.session_state.market_summary[scan_key_tf(selected_tf)] = {
                             'sentiment': sentiment_counts,
                             'above_sma50': above_sma50,
                             'below_sma50': below_sma50,
@@ -4524,21 +4647,28 @@ def main():
             if mode == "💎 Value Finder":
                 st.markdown("---")
                 st.subheader("💎 Value Finder")
-                vf_index = st.selectbox(
-                    "Scan scope",
-                    ["🏦 BIST 30", "📊 BIST 100", "📈 All Stocks"],
-                    key="vf_index"
-                )
+                tr_opts = ["🏦 BIST 30", "📊 BIST 100", "📈 All Stocks"]
+                fr_opts = ["🌎 Top 100 yabancı (en çok fon tutan)", "🌎 Tüm yabancı hisseler"]
+                vf_opts = (tr_opts if scope == "TR" else fr_opts if scope == "FOR"
+                           else tr_opts + fr_opts + ["🌍 Hepsi (TR + yabancı)"])
+                vf_index = st.selectbox("Scan scope", vf_opts, key=f"vf_index_{scope}")
                 if "BIST 30" in vf_index:
                     vf_stocks = sorted([s for s in BIST_30 if s in IMKB])
                 elif "BIST 100" in vf_index:
                     vf_stocks = sorted([s for s in BIST_100 if s in IMKB])
+                elif "Top 100 yabancı" in vf_index:
+                    vf_stocks = gd.foreign_symbols(100)
+                elif "Tüm yabancı" in vf_index:
+                    vf_stocks = gd.foreign_symbols()
+                elif "Hepsi" in vf_index:
+                    vf_stocks = list(IMKB) + gd.foreign_symbols()
                 else:
                     vf_stocks = IMKB
                 st.caption(f"{len(vf_stocks)} stocks to scan")
                 
-                if not st.session_state.financial_store:
-                    st.warning("⚠️ Import financials first for best results!")
+                if scope != "FOR" and not st.session_state.financial_store:
+                    st.warning("⚠️ Import financials first for best results! (BIST hisseleri için; yabancı hisselerin "
+                               "çarpanları yfinance'tan gelir.)")
                 
                 if st.button("💎 Scan for Value", use_container_width=True, type="primary"):
                     # ANA THREAD'de snapshot alinir - asagidaki ThreadPoolExecutor
@@ -4582,6 +4712,7 @@ def main():
 
                     prog.empty()
                     stat.empty()
+                    st.session_state.setdefault("vf_by_scope", {})[scope] = vf_results
                     st.session_state.value_finder_results = vf_results
                     st.success(f"✅ Analyzed {len(vf_results)} stocks!")
                     st.rerun()
@@ -4655,6 +4786,7 @@ def main():
                     # anlamsiz kalirdi.
                     _delete_financial_store_from_db()
                     get_financial_margin_snapshot.clear()
+                    get_financial_margin_snapshot_for_periods.clear()
                     get_financial_store_summary.clear()
                     _get_financial_store_db_ticker_count.clear()
                     st.rerun()
@@ -4663,7 +4795,10 @@ def main():
             days = TIMEFRAMES[selected_tf]["days"]
             start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
             end = datetime.now().strftime("%Y-%m-%d")
-            with st.spinner(f"Loading {stock}..."):
+            stock_is_foreign = gd is not None and gd.is_foreign(stock)
+            stock_name = stock[len("FOR:"):] if stock_is_foreign else stock       # ekranda 'FOR:' öneki olmadan
+            st.session_state["_ccy_sym"] = gd.ccy_symbol(gd.currency_of(stock)) if stock_is_foreign else "₺"
+            with st.spinner(f"Loading {stock_name}..."):
                 df = fetch_stock_data(stock, start_date=start, end_date=end, interval=selected_tf)
             if df is not None and not df.empty:
                 df = calculate_all_indicators(df)
@@ -4674,7 +4809,7 @@ def main():
                 sentiment_text, sentiment_emoji, sentiment_class, confidence = calculate_sentiment(
                     ind, vol, latest['RSI'], latest['Diff'], price_change_pct
                 )
-                st.subheader(f"📈 {stock} - {TIMEFRAMES[selected_tf]['label']}")
+                st.subheader(f"📈 {stock_name} - {TIMEFRAMES[selected_tf]['label']}")
                 st.markdown(f"""
                 <div class="{sentiment_class}">
                     {sentiment_emoji} SENTIMENT: {sentiment_text}
@@ -4686,7 +4821,7 @@ def main():
                 ch = latest['Close'] - prev['Close']
                 r1c1, r1c2 = st.columns(2)
                 with r1c1:
-                    st.metric("Price", f"₺{latest['Close']:.2f}", f"{ch:.2f} ({price_change_pct:.2f}%)")
+                    st.metric("Price", f"{_cs()}{latest['Close']:.2f}", f"{ch:.2f} ({price_change_pct:.2f}%)")
                 with r1c2:
                     st.metric("Volume", f"{latest['Volume']:,.0f}")
                 r2c1, r2c2 = st.columns(2)
@@ -4786,34 +4921,34 @@ def main():
                     sma50 = latest.get('SMA50', None)
                     
                     if close > sma5 > sma22:
-                        sma_emoji, sma_text = "🟢", f"**Bullish Alignment** — Price (₺{close:.2f}) > SMA5 (₺{sma5:.2f}) > SMA22 (₺{sma22:.2f}). Short and medium-term trends are both up. This is the ideal structure for trend followers."
+                        sma_emoji, sma_text = "🟢", f"**Bullish Alignment** — Price ({_cs()}{close:.2f}) > SMA5 ({_cs()}{sma5:.2f}) > SMA22 ({_cs()}{sma22:.2f}). Short and medium-term trends are both up. This is the ideal structure for trend followers."
                     elif close < sma5 < sma22:
-                        sma_emoji, sma_text = "🔴", f"**Bearish Alignment** — Price (₺{close:.2f}) < SMA5 (₺{sma5:.2f}) < SMA22 (₺{sma22:.2f}). Both short and medium-term trends are pointing down. Avoid long entries until this reverses."
+                        sma_emoji, sma_text = "🔴", f"**Bearish Alignment** — Price ({_cs()}{close:.2f}) < SMA5 ({_cs()}{sma5:.2f}) < SMA22 ({_cs()}{sma22:.2f}). Both short and medium-term trends are pointing down. Avoid long entries until this reverses."
                     elif close > sma5:
-                        sma_emoji, sma_text = "🟡", f"**Mixed — Short-term Bullish** — Price is above SMA5 (₺{sma5:.2f}) but SMA5 hasn't crossed above SMA22 (₺{sma22:.2f}) yet. The short-term is recovering but the medium-term trend hasn't confirmed."
+                        sma_emoji, sma_text = "🟡", f"**Mixed — Short-term Bullish** — Price is above SMA5 ({_cs()}{sma5:.2f}) but SMA5 hasn't crossed above SMA22 ({_cs()}{sma22:.2f}) yet. The short-term is recovering but the medium-term trend hasn't confirmed."
                     else:
-                        sma_emoji, sma_text = "🟡", f"**Mixed — Short-term Weak** — Price (₺{close:.2f}) is below SMA5 (₺{sma5:.2f}). Short-term momentum is weak. Watch for a close above SMA5 as an early reversal signal."
+                        sma_emoji, sma_text = "🟡", f"**Mixed — Short-term Weak** — Price ({_cs()}{close:.2f}) is below SMA5 ({_cs()}{sma5:.2f}). Short-term momentum is weak. Watch for a close above SMA5 as an early reversal signal."
                     st.markdown(f"{sma_emoji} **Moving Averages:** {sma_text}")
                     
                     # SMA50 position
                     if sma50 is not None and pd.notna(sma50):
                         if close > sma50:
-                            st.markdown(f"📈 **SMA 50:** Price is **above** the 50-period SMA (₺{sma50:.2f}) — the medium-term trend supports the bulls.")
+                            st.markdown(f"📈 **SMA 50:** Price is **above** the 50-period SMA ({_cs()}{sma50:.2f}) — the medium-term trend supports the bulls.")
                         else:
-                            st.markdown(f"📉 **SMA 50:** Price is **below** the 50-period SMA (₺{sma50:.2f}) — the medium-term trend favors the bears.")
+                            st.markdown(f"📉 **SMA 50:** Price is **below** the 50-period SMA ({_cs()}{sma50:.2f}) — the medium-term trend favors the bears.")
                     
                     # Bollinger Bands
                     bb_upper = latest['bb_bbh']
                     bb_lower = latest['bb_bbl']
                     bb_mid = latest['bb_bbm']
                     if close > bb_upper:
-                        st.markdown(f"⚡ **Bollinger Bands:** Price (₺{close:.2f}) is **above the upper band** (₺{bb_upper:.2f}). The stock is extended — this can mean strong breakout momentum or a potential snapback.")
+                        st.markdown(f"⚡ **Bollinger Bands:** Price ({_cs()}{close:.2f}) is **above the upper band** ({_cs()}{bb_upper:.2f}). The stock is extended — this can mean strong breakout momentum or a potential snapback.")
                     elif close < bb_lower:
-                        st.markdown(f"⚡ **Bollinger Bands:** Price (₺{close:.2f}) is **below the lower band** (₺{bb_lower:.2f}). The stock is oversold relative to its recent range — potential bounce zone.")
+                        st.markdown(f"⚡ **Bollinger Bands:** Price ({_cs()}{close:.2f}) is **below the lower band** ({_cs()}{bb_lower:.2f}). The stock is oversold relative to its recent range — potential bounce zone.")
                     elif close > bb_mid:
-                        st.markdown(f"📊 **Bollinger Bands:** Price is in the **upper half** of the bands (mid: ₺{bb_mid:.2f}). Mild bullish positioning within the normal range.")
+                        st.markdown(f"📊 **Bollinger Bands:** Price is in the **upper half** of the bands (mid: {_cs()}{bb_mid:.2f}). Mild bullish positioning within the normal range.")
                     else:
-                        st.markdown(f"📊 **Bollinger Bands:** Price is in the **lower half** of the bands (mid: ₺{bb_mid:.2f}). Mild bearish positioning within the normal range.")
+                        st.markdown(f"📊 **Bollinger Bands:** Price is in the **lower half** of the bands (mid: {_cs()}{bb_mid:.2f}). Mild bearish positioning within the normal range.")
 
                     st.markdown("---")
 
@@ -4866,15 +5001,15 @@ def main():
                     is_chosen = ind > 2.5 and vol > 1
 
                     if is_chosen and ind >= 6:
-                        st.success(f"✅ **{stock} qualifies as a CHOSEN STOCK** with a strong indicator score of {ind:.0f}/10 backed by {vol:.2f}x average volume. Multiple technical indicators are aligned bullish with sufficient volume confirmation. This is one of the strongest technical setups in the current scan.")
+                        st.success(f"✅ **{stock_name} qualifies as a CHOSEN STOCK** with a strong indicator score of {ind:.0f}/10 backed by {vol:.2f}x average volume. Multiple technical indicators are aligned bullish with sufficient volume confirmation. This is one of the strongest technical setups in the current scan.")
                     elif is_chosen:
-                        st.success(f"✅ **{stock} qualifies as a CHOSEN STOCK** (Indicator > 2.5 and Volume > 1). The stock shows {ind:.0f} fresh buy crossovers with adequate volume ({vol:.2f}x). A moderate setup — not the strongest signal but enough for the screener criteria.")
+                        st.success(f"✅ **{stock_name} qualifies as a CHOSEN STOCK** (Indicator > 2.5 and Volume > 1). The stock shows {ind:.0f} fresh buy crossovers with adequate volume ({vol:.2f}x). A moderate setup — not the strongest signal but enough for the screener criteria.")
                     elif ind > 2.5 and vol <= 1:
-                        st.warning(f"⚠️ **{stock} has good indicator signals ({ind:.0f}/10) but volume is insufficient** ({vol:.2f}x). Technical signals without volume backing are less reliable. The buy setup exists but lacks conviction from market participants.")
+                        st.warning(f"⚠️ **{stock_name} has good indicator signals ({ind:.0f}/10) but volume is insufficient** ({vol:.2f}x). Technical signals without volume backing are less reliable. The buy setup exists but lacks conviction from market participants.")
                     elif ind <= 2.5 and vol > 1:
-                        st.warning(f"⚠️ **{stock} has decent volume ({vol:.2f}x) but few buy signals** ({ind:.0f}/10). Volume is present but the technical indicators haven't aligned. This could mean distribution (selling with volume) rather than accumulation.")
+                        st.warning(f"⚠️ **{stock_name} has decent volume ({vol:.2f}x) but few buy signals** ({ind:.0f}/10). Volume is present but the technical indicators haven't aligned. This could mean distribution (selling with volume) rather than accumulation.")
                     else:
-                        st.info(f"ℹ️ **{stock} does not currently meet the screener criteria.** Both indicator score ({ind:.0f}/10) and volume ({vol:.2f}x) are below thresholds. The stock lacks a clear technical entry signal at this time.")
+                        st.info(f"ℹ️ **{stock_name} does not currently meet the screener criteria.** Both indicator score ({ind:.0f}/10) and volume ({vol:.2f}x) are below thresholds. The stock lacks a clear technical entry signal at this time.")
 
                 # Gauge in an expander (optional detail, not blocking mobile view)
                 with st.expander("📊 Detailed Gauge Charts"):
@@ -4891,7 +5026,7 @@ def main():
                     st.markdown('<div class="chosen-stock"><h3>⭐ CHOSEN STOCK! ⭐</h3></div>', unsafe_allow_html=True)
                 
                 st.subheader("📊 Price Chart")
-                st.plotly_chart(create_candlestick(df, stock), use_container_width=True, config=PLOTLY_CONFIG)
+                st.plotly_chart(create_candlestick(df, stock_name), use_container_width=True, config=PLOTLY_CONFIG)
                 
                 # Tabs for additional charts and analysis
                 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -4905,25 +5040,31 @@ def main():
                 with tab3:
                     st.plotly_chart(create_rsi_chart(df), use_container_width=True, config=PLOTLY_CONFIG)
                 with tab4:
-                    display_pattern_tab(df, stock)
+                    display_pattern_tab(df, stock_name)
                 with tab5:
-                    run_monte_carlo(df, stock)
+                    run_monte_carlo(df, stock_name)
                 with tab6:
-                    display_fibonacci_tab(df, stock)
+                    display_fibonacci_tab(df, stock_name)
                 
                 # Raw data expander
                 with st.expander("📋 View Raw Data"):
                     st.dataframe(df[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'MACD']].tail(100), use_container_width=True)
                 
                 # Fundamental data section
-                display_balance_sheet(stock, current_price=latest['Close'])
+                if stock_is_foreign:
+                    display_foreign_fundamentals(stock, price=latest['Close'])
+                else:
+                    display_balance_sheet(stock, current_price=latest['Close'])
+
+                # Sirket profili / analist gorusleri / haberler (BIST + yabanci, yfinance)
+                display_company_profile(stock, price=latest['Close'])
             else:
-                st.error(f"❌ No data available for {stock}")
+                st.error(f"❌ No data available for {stock_name}")
         
         elif mode == "🔍 Stock Screener":
             st.subheader("🔍 Chosen Stocks")
 
-            scanned = st.session_state.screener_scan.get(selected_tf)
+            scanned = st.session_state.screener_scan.get(scan_key_tf(selected_tf))
             results = None
             rank_col = 'indicator_score'
             indicator_label = "Tümü (10 indikatör toplamı)"
@@ -4945,7 +5086,7 @@ def main():
                 val_cache = st.session_state.screener_val_cache.setdefault(selected_tf, {})
                 with st.spinner("Sıralanıyor..."):
                     results = _rank_and_enrich(scanned, rank_col, val_cache, top_n=20)
-                st.session_state.chosen_stocks[selected_tf] = results
+                st.session_state.chosen_stocks[scan_key_tf(selected_tf)] = results
 
             if results:
                 is_single = rank_col != 'indicator_score'
@@ -4955,6 +5096,15 @@ def main():
                                  else "Indicator Score > 2.5 VE Volume Score > 1")
 
                 df_c = pd.DataFrame(results).sort_values(rank_col, ascending=False)
+                if gd is not None:
+                    # Yabancı hisselerde fiyat yerel para biriminde ($, €...), BIST'te ₺; metin olarak gösterilir
+                    cs_map = {s: (gd.ccy_symbol(gd.currency_of(s)) if gd.is_foreign(s) else '₺') for s in df_c['symbol']}
+                    df_c['price_txt'] = [f"{cs_map[s]}{p:,.2f}" for s, p in zip(df_c['symbol'], df_c['price'])]
+                else:
+                    df_c['price_txt'] = ['₺%.2f' % p for p in df_c['price']]
+                df_c['symbol_raw'] = df_c['symbol']
+                if gd is not None:
+                    df_c['symbol'] = df_c['symbol'].map(gd.display_symbol)
 
                 # Display summary metrics
                 n_qualifies = int(df_c['qualifies'].sum()) if 'qualifies' in df_c.columns else 0
@@ -4981,7 +5131,7 @@ def main():
 
                 # Format display columns
                 df_c['Kriter'] = df_c['qualifies'].map(lambda v: '✅' if v else '—') if 'qualifies' in df_c.columns else '—'
-                display_cols = ['symbol', 'price', 'chg%', 'RSI', rank_col, 'volume_score', 'Kriter',
+                display_cols = ['symbol', 'price_txt', 'chg%', 'RSI', rank_col, 'volume_score', 'Kriter',
                                'Fon Net Alımı',
                                'P/E', 'PD/DD', 'EV/EBITDA', 'Fwd P/E', 'Fwd PD/DD', 'Fwd EV/EBITDA', 'P/E Δ', 'EV/EBITDA Δ']
                 if is_single and 'indicator_score' in df_c.columns:
@@ -4990,7 +5140,7 @@ def main():
                     # genelde nasil" sorusuna cevap versin diye.
                     display_cols.insert(display_cols.index('volume_score'), 'indicator_score')
                 available_display = [c for c in display_cols if c in df_c.columns]
-                rename_map = {rank_col: score_header, 'volume_score': 'Volume Score'}
+                rename_map = {rank_col: score_header, 'volume_score': 'Volume Score', 'price_txt': 'price'}
                 if is_single:
                     rename_map['indicator_score'] = 'Toplam (10) Score'
 
@@ -5006,7 +5156,6 @@ def main():
                     return f"{sign}{v:,.0f}"
 
                 fmt_dict = {
-                    'price': '₺{:.2f}',
                     'chg%': '{:+.2f}%',
                     'RSI': '{:.1f}',
                     score_header: score_fmt,
@@ -5046,7 +5195,7 @@ def main():
                         score_str = f"{score_val:.2f}" if is_single else f"{score_val:.1f}"
                         st.markdown(f"""
                         <div class="chosen-stock">
-                            <h4>{badge}{s['symbol']} — ₺{s['price']:.2f}</h4>
+                            <h4>{badge}{s['symbol']} — {s['price_txt']}</h4>
                             <p><b>{score_header}:</b> {score_str} | <b>Vol:</b> {s['volume_score']}</p>
                             <p><b>P/E:</b> {pe_str} → {fpe_str} | <b>PD/DD:</b> {pb_str}</p>
                             <p><b>EV/EBITDA:</b> {ev_str} → {fev_str}</p>
@@ -5062,8 +5211,8 @@ def main():
         elif mode == "📋 Market Summary":
             st.subheader(f"📋 Market Summary - {TIMEFRAMES[selected_tf]['label']}")
             
-            if selected_tf in st.session_state.market_summary:
-                data = st.session_state.market_summary[selected_tf]
+            if scan_key_tf(selected_tf) in st.session_state.market_summary:
+                data = st.session_state.market_summary[scan_key_tf(selected_tf)]
                 sentiment = data['sentiment']
                 above_sma50 = data['above_sma50']
                 below_sma50 = data['below_sma50']
@@ -5174,14 +5323,13 @@ def main():
                 
                 if st.button("📊 Calculate SMA50 Breadth (3M)", use_container_width=True):
                     with st.spinner("Computing SMA50 breadth for all stocks..."):
-                        breadth_df = compute_sma50_breadth_history(IMKB, days=90)
+                        breadth_df = compute_sma50_breadth_history(_scope_universe(scope, IMKB), days=90)
                         st.session_state.sma50_breadth = breadth_df
                     if breadth_df is not None:
                         st.success("✅ Breadth calculation complete!")
                 
                 breadth_df = st.session_state.get("sma50_breadth")
                 if breadth_df is not None and not breadth_df.empty:
-                    total_stocks = len(IMKB)
                     q1_line = 25  # 25% = first quartile
                     q3_line = 75  # 75% = third quartile
                     
@@ -5206,7 +5354,8 @@ def main():
                         annotation_font_color="#ffc107")
                     
                     fig_breadth.update_layout(
-                        title="% of BIST Stocks Above 50-Day SMA (3-Month History)",
+                        title="% of Stocks Above 50-Day SMA (3-Month History) — "
+                              + {"TR": "BIST", "FOR": "yabancı", "ALL": "BIST + yabancı"}[scope],
                         height=400, margin=dict(l=40, r=20, t=40, b=60),
                         yaxis=dict(title="% Above SMA50", range=[0, 100]),
                         xaxis_title="",
@@ -5233,12 +5382,12 @@ def main():
                     stock_list_for_cat = sentiment.get(label, [])
                     if stock_list_for_cat:
                         with st.expander(f"{emoji} {label} — {len(stock_list_for_cat)} stocks"):
-                            st.write(", ".join(sorted(stock_list_for_cat)))
-                
+                            st.write(", ".join(sorted(_disp(s) for s in stock_list_for_cat)))
+
                 with st.expander(f"📈 Above SMA 50 — {len(above_sma50)} stocks"):
-                    st.write(", ".join(sorted(above_sma50)))
+                    st.write(", ".join(sorted(_disp(s) for s in above_sma50)))
                 with st.expander(f"📉 Below SMA 50 — {len(below_sma50)} stocks"):
-                    st.write(", ".join(sorted(below_sma50)))
+                    st.write(", ".join(sorted(_disp(s) for s in below_sma50)))
             else:
                 st.info("👆 Click 'Scan All Stocks' in the sidebar to generate the market summary.")
         
@@ -5246,7 +5395,7 @@ def main():
             st.subheader("💎 Value Finder — Discover Undervalued Stocks")
             st.caption("Compares current valuation multiples with AI-forecasted forward multiples to find stocks that are expected to become cheaper based on earnings growth.")
             
-            vf_data = st.session_state.value_finder_results
+            vf_data = st.session_state.get("vf_by_scope", {}).get(scope)       # kapsam bazlı sonuç
             if vf_data:
                 df_vf = pd.DataFrame(vf_data)
                 
@@ -5258,7 +5407,13 @@ def main():
                     'pe_delta': 'P/E Δ', 'pb_delta': 'PD/DD Δ', 'ev_ebitda_delta': 'EV/EBITDA Δ',
                 }
                 df_vf = df_vf.rename(columns=col_map)
-                
+                if gd is not None:
+                    # Fiyat yerel para biriminde (yabancı: $, €, ...; BIST: ₺) metin olarak; sembol 🌎 ile
+                    ccys = df_vf['ccy'] if 'ccy' in df_vf.columns else pd.Series([None] * len(df_vf), index=df_vf.index)
+                    df_vf['Price'] = [f"{gd.ccy_symbol(c) if isinstance(c, str) and c else '₺'}{p:,.2f}"
+                                      for c, p in zip(ccys, df_vf['Price'])]
+                    df_vf['Symbol'] = df_vf['Symbol'].map(gd.display_symbol)
+
                 # Summary
                 total = len(df_vf)
                 has_pe = df_vf['P/E'].notna().sum()
@@ -5291,7 +5446,6 @@ def main():
                 available_cols = [c for c in display_cols if c in df_vf.columns]
                 
                 format_dict = {
-                    'Price': '₺{:.2f}',
                     'P/E': '{:.1f}x', 'Fwd P/E': '{:.1f}x', 'P/E Δ': '{:+.1f}',
                     'PD/DD': '{:.2f}x', 'Fwd PD/DD': '{:.2f}x', 'PD/DD Δ': '{:+.2f}',
                     'EV/EBITDA': '{:.1f}x', 'Fwd EV/EBITDA': '{:.1f}x', 'EV/EBITDA Δ': '{:+.1f}',
@@ -5337,7 +5491,7 @@ def main():
                                 <div class="mobile-score-card" style="border-top: 3px solid gold;">
                                     <p class="score-label">{medal} #{ci+1}</p>
                                     <p class="score-value">{sym}</p>
-                                    <p class="score-max">₺{row['Price']:.2f} | {sort_col}: {sv_str}</p>
+                                    <p class="score-max">{row['Price']} | {sort_col}: {sv_str}</p>
                                     <p style="font-size:0.8rem;">P/E: {pe_str} → {fpe_str}</p>
                                 </div>
                                 """, unsafe_allow_html=True)
@@ -5371,13 +5525,25 @@ def main():
                 st.info("Some data sources may be temporarily unavailable. Try refreshing the page.")
         elif mode == "💰 Funds":
             try:
-                display_funds_analysis()
+                display_funds_analysis(scope=scope if gd is not None else None)
             except Exception as e:
                 st.error(f"Funds analysis error: {str(e)}")
                 st.info("Database connection may be temporarily unavailable.")
         elif mode == "📄 Company Reports":
             try:
-                display_company_reports(financial_margins=get_financial_margin_snapshot())
+                if scope == "FOR":
+                    st.info("📄 Company Reports, Türk şirketlerinin KAP / yatırımcı sunumlarını AI ile özetler ve "
+                            "İş Yatırım finansallarıyla doğrulanan marj puanları ile sektör analizi üretir — bu "
+                            "veriler yabancı şirketler için yok. Yabancı bir hissenin iş modeli, haberleri ve analist "
+                            "hedefleri için **📊 Single Stock › 🌎 Yabancı** seçip en alttaki "
+                            "**🏢 Şirket Profili** bölümüne bakın. Raporları görmek için kapsamı Yerli (TR) ya da "
+                            "Tümü yapın.")
+                else:
+                    if scope == "ALL":
+                        st.caption("ℹ️ Şirket raporları yalnızca Türk şirketleri içindir (yabancı hisseler için "
+                                   "Single Stock › Şirket Profili).")
+                    display_company_reports(financial_margins=get_financial_margin_snapshot(),
+                                            margins_for_periods_fn=get_financial_margin_snapshot_for_periods)
             except Exception as e:
                 st.error(f"Company reports error: {str(e)}")
                 st.info("Database connection may be temporarily unavailable.")
@@ -5386,7 +5552,8 @@ def main():
                 display_stock_analyzer(
                     fetch_stock_data, valuation_fn=compute_stock_valuations,
                     valuation_history_fn=compute_valuation_history,
-                    financial_loader=_load_financial_store_for)
+                    financial_loader=_load_financial_store_for,
+                    scope=scope if gd is not None else "TR", fetch_fn_try=fetch_stock_data_try)
             except Exception as e:
                 st.error(f"Stock Analyzer error: {str(e)}")
                 st.info("Database or price data source may be temporarily unavailable.")
@@ -5395,7 +5562,8 @@ def main():
                 display_portfolio_builder(
                     fetch_stock_data, valuation_fn=compute_stock_valuations,
                     valuation_history_fn=compute_valuation_history,
-                    financial_loader=_load_financial_store_for)
+                    financial_loader=_load_financial_store_for,
+                    scope=scope if gd is not None else "TR", fetch_fn_try=fetch_stock_data_try)
             except Exception as e:
                 st.error(f"Portfolio error: {str(e)}")
                 st.info("Database or price data source may be temporarily unavailable.")

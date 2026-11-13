@@ -1710,7 +1710,33 @@ def compute_sector_rollup(yil, donem, financial_margins=None):
     return n_sektor, sirket_toplam
 
 
-def refresh_all_margin_scores(financial_margins):
+_DONEM_AY = {"Q1": 3, "Q2": 6, "Q3": 9, "Q4": 12, "FY": 12}
+
+
+def period_key(yil, donem):
+    """Rapor (yil, donem) -> import edilmis finansallardaki donem etiketi
+    (orn. 2025 + Q2 -> "2025/6"; Turkiye'de kumulatif YTD: Q1=3, Q2=6, Q3=9,
+    Q4/FY=12). Taninmayan donem icin None."""
+    ay = _DONEM_AY.get(donem)
+    if ay is None or yil is None:
+        return None
+    return f"{int(yil)}/{ay}"
+
+
+def _margins_by_period(margins_for_periods_fn, pairs):
+    """pairs: [(yil, donem), ...] -> {donem_etiketi: {ticker: snapshot}}.
+    margins_for_periods_fn yoksa/hata verirse None (cagiran en-son-donem
+    snapshot'ina geri duser)."""
+    if margins_for_periods_fn is None:
+        return None
+    keys = sorted({k for k in (period_key(y, d) for y, d in pairs) if k})
+    try:
+        return margins_for_periods_fn(tuple(keys)) if keys else {}
+    except Exception:
+        return None
+
+
+def refresh_all_margin_scores(financial_margins, margins_for_periods_fn=None):
     """Company Reports'ta ŞİMDİYE KADAR kayıtlı TÜM (ticker, yıl, dönem)
     raporlarının TÜM marj skorlarını (FAVÖK/Net Kâr Puanı, Marj Puanı,
     FAVÖK/Net Kâr Gelişim Puanı, Marj Gelişim Puanı (+Yıllık), Marj Toplam
@@ -1727,13 +1753,21 @@ def refresh_all_margin_scores(financial_margins):
     ticker'lardan kurulur (yeniden sınıflandırma YAPILMAZ) - sektörü boş
     olan raporlar için sadece gelişim skorları hesaplanır.
 
+    DONEM-DUYARLI: margins_for_periods_fn verilirse (tuple(donem_etiketleri)
+    -> {etiket: {ticker: snapshot}}) her rapor KENDI doneminin (orn. Q2 2025 ->
+    "2025/6") marjlariyla puanlanir; hissenin o donem icin importlu verisi
+    yoksa o rapor ATLANIR (eski skorlari, hisseye ait baska bir donemin
+    rakamiyla EZILMEZ). Verilmezse eski davranis: financial_margins (hissenin
+    en son donemi) tum raporlara uygulanir.
+
     Donus: dict(rapor_sayisi, marj_puani_hesaplanan, marj_gelisim_hesaplanan,
                  marj_gelisim_yillik_hesaplanan, marj_toplam_hesaplanan,
-                 buyume_puani_hesaplanan)."""
+                 buyume_puani_hesaplanan, atlanan_veri_yok)."""
     conn = _get_live_connection()
     stats = {"rapor_sayisi": 0, "marj_puani_hesaplanan": 0,
               "marj_gelisim_hesaplanan": 0, "marj_gelisim_yillik_hesaplanan": 0,
-              "marj_toplam_hesaplanan": 0, "buyume_puani_hesaplanan": 0}
+              "marj_toplam_hesaplanan": 0, "buyume_puani_hesaplanan": 0,
+              "atlanan_veri_yok": 0}
     if conn is None:
         return stats
     financial_margins = financial_margins or {}
@@ -1747,15 +1781,26 @@ def refresh_all_margin_scores(financial_margins):
         return stats
     stats["rapor_sayisi"] = len(df)
 
+    by_period = _margins_by_period(
+        margins_for_periods_fn,
+        list(df[['yil', 'donem']].drop_duplicates().itertuples(index=False, name=None)))
+
     with conn.cursor() as cur:
         for (yil, donem), grp in df.groupby(['yil', 'donem']):
+            if by_period is not None:
+                fm_period = by_period.get(period_key(yil, donem)) or {}
+            else:
+                fm_period = financial_margins
             for sektor, sgrp in grp.groupby('sektor', dropna=False):
                 sektor_tickers = list(sgrp['ticker']) if pd.notna(sektor) else None
                 for _, row in sgrp.iterrows():
                     ticker = row['ticker']
+                    if by_period is not None and ticker not in fm_period:
+                        stats["atlanan_veri_yok"] += 1
+                        continue
                     gorunum_puani = row['gorunum_puani'] if pd.notna(row['gorunum_puani']) else None
                     set_values = _apply_margin_scores(
-                        cur, ticker, yil, donem, sektor_tickers, financial_margins, gorunum_puani)
+                        cur, ticker, yil, donem, sektor_tickers, fm_period, gorunum_puani)
                     if "marj_current_puani" in set_values:
                         stats["marj_puani_hesaplanan"] += 1
                     if "marj_development_puani" in set_values:
@@ -1883,13 +1928,26 @@ def _render_margin_score_block(r):
     return True
 
 
-def display_company_reports(financial_margins=None):
+def display_company_reports(financial_margins=None, margins_for_periods_fn=None):
     """financial_margins: streamlit_app.get_financial_margin_snapshot()'un
     ciktisi - {ticker: {net_margin, net_margin_prev, gross_margin, ...}}.
     Verilmezse ({} / None) Marj Gelişim Puanı LLM tahminine, Marj Puanı ise
     hesaplanamadigi icin bos ('—') kalir - modul streamlit_app olmadan da
-    (izole testlerde) calismaya devam eder."""
+    (izole testlerde) calismaya devam eder.
+    margins_for_periods_fn: streamlit_app.get_financial_margin_snapshot_for_
+    periods - (tuple(donem etiketleri)) -> {etiket: {ticker: snapshot}}.
+    Verilirse marj skorlari raporun KENDI donemiyle hesaplanir (yeni analiz,
+    sektor analizi, toplu tazeleme); verilmezse hissenin en son donemi."""
     financial_margins = financial_margins or {}
+
+    def _fm_for(yil_, donem_):
+        """(yil, donem) icin marj snapshot'i; donemli yukleyici yoksa/basarisizsa
+        en son donem snapshot'i."""
+        by_p = _margins_by_period(margins_for_periods_fn, [(yil_, donem_)])
+        if by_p is None:
+            return financial_margins
+        return by_p.get(period_key(yil_, donem_)) or {}
+
     st.markdown("### 📄 Şirket Yatırımcı Raporu Analizi")
     st.caption("Bir KAP bildirim linki veya şirketin kendi yatırımcı ilişkileri "
                "sayfasındaki doğrudan PDF linkini yapıştırın — AI ile özetlenir ve "
@@ -1947,7 +2005,7 @@ def display_company_reports(financial_margins=None):
                 else:
                     with st.spinner(f"Gemini ile analiz ediliyor ({n_pages} sayfa, {len(text):,} karakter)..."):
                         kpis = _summarize_with_gemini(text, ticker, DONEM_LABELS[donem], int(yil), prior,
-                                                       financial_margins=financial_margins)
+                                                       financial_margins=_fm_for(int(yil), donem))
 
                     if kpis.get('_parse_failed'):
                         # Bozuk/yarim sonucu KALICI olarak kaydetmiyoruz - aksi halde
@@ -2065,11 +2123,13 @@ def display_company_reports(financial_margins=None):
                       help="Şimdiye kadar kayıtlı TÜM raporların FAVÖK/Net Kâr Puanı, Marj "
                            "Puanı, FAVÖK/Net Kâr Gelişim Puanı, Marj Gelişim Puanı (+Yıllık), "
                            "Marj Toplam Puanı ve Overall Puan'ını import edilmiş finansallardan "
-                           "yeniden hesaplar - sektör ataması, Görünüm Puanı ve metin özeti "
-                           "DEĞİŞMEZ, Gemini'ye sorulmaz. Yeni bir toplu 'Import Financials' "
+                           "yeniden hesaplar - HER RAPOR KENDİ DÖNEMİNİN (örn. 2. Çeyrek 2025 → "
+                           "2025/6) finansalıyla puanlanır; o dönem için import edilmiş "
+                           "veri yoksa rapor atlanır. Sektör ataması, Görünüm Puanı ve metin "
+                           "özeti DEĞİŞMEZ, Gemini'ye sorulmaz. Yeni bir toplu 'Import Financials' "
                            "sonrası çalıştır."):
             with st.spinner("Tüm raporların marj skorları finansallardan tazeleniyor..."):
-                stats = refresh_all_margin_scores(financial_margins)
+                stats = refresh_all_margin_scores(financial_margins, margins_for_periods_fn)
             st.success(
                 f"✅ {stats['rapor_sayisi']} rapor tarandı — "
                 f"Marj Puanı: {stats['marj_puani_hesaplanan']}, "
@@ -2077,6 +2137,9 @@ def display_company_reports(financial_margins=None):
                 f"Marj Toplam Puanı: {stats['marj_toplam_hesaplanan']}, "
                 f"Büyüme Puanı: {stats['buyume_puani_hesaplanan']} rapor için gerçek "
                 f"finansal veriyle güncellendi."
+                + (f" {stats['atlanan_veri_yok']} rapor, o dönem için import edilmiş "
+                   f"finansal verisi olmadığından atlandı (skorları değişmedi)."
+                   if stats.get('atlanan_veri_yok') else "")
             )
 
     periods = get_available_periods_for_rollup()
@@ -2114,7 +2177,7 @@ def display_company_reports(financial_margins=None):
                     with st.spinner(f"{len(donem_raporlari)} şirket sektörlere göre "
                                      f"sınıflandırılıp analiz ediliyor..."):
                         n_sektor, n_sirket = compute_sector_rollup(sel_yil, sel_donem,
-                                                                    financial_margins=financial_margins)
+                                                                    financial_margins=_fm_for(sel_yil, sel_donem))
                     st.success(f"✅ {n_sirket} şirket, {n_sektor} sektöre ayrılarak "
                                f"{_period_fmt((sel_yil, sel_donem))} analizi güncellendi.")
                     st.session_state['_sektor_rollup_shown_period'] = (sel_yil, sel_donem)

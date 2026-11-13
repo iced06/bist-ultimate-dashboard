@@ -141,7 +141,7 @@ def _get_flow_ranking(yil, ay):
     if conn is None:
         return pd.DataFrame()
     df = pd.read_sql("""
-        SELECT s.ticker, s.ad, s.uyruk,
+        SELECT s.ticker, s.ad, s.uyruk, s.isin,
                f.fon_sayisi, f.toplam_fon_tutari,
                f.net_fon_akisi_tl, f.net_gercek_alim_satim_tl
         FROM stock_fund_flow_monthly f
@@ -313,6 +313,42 @@ def _get_market_caps(tickers):
     return caps
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_market_caps_foreign(pairs):
+    """Yabancı hisselerin piyasa değeri (TL): yfinance marketCap x güncel kur. pairs: ((ticker, isin), ...).
+    Çözülemeyen/verisi olmayan hisseler sonuçta yer almaz."""
+    try:
+        import global_data as gd
+    except Exception:
+        return {}
+    from datetime import date, timedelta
+    start = (date.today() - timedelta(days=20)).isoformat()
+
+    def one(p):
+        ticker, isin = p
+        y = gd.yahoo_symbol_for(ticker, isin)
+        if not y:
+            return ticker, None
+        info = gd.get_info(y)
+        cap = info.get("marketCap")
+        if not cap:
+            return ticker, None
+        ccy = info.get("currency") or "USD"
+        if ccy == "TRY":
+            return ticker, float(cap)
+        fx = gd.fx_series_to_try(ccy, start)
+        if fx is None or fx.empty:
+            return ticker, None
+        return ticker, float(cap) * float(fx.iloc[-1])
+
+    caps = {}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for t, c in ex.map(one, list(pairs)):
+            if c:
+                caps[t] = c
+    return caps
+
+
 def _fmt_tl(x):
     if x is None or pd.isna(x):
         return "-"
@@ -434,16 +470,18 @@ def _render_top_buys_sells(yil, ay, uyruk_filter=None):
                      use_container_width=True, hide_index=True)
 
 
-def _render_market_impact(yil, ay):
+def _render_market_impact(yil, ay, uyruk_filter=None):
     df = _get_flow_ranking(yil, ay)
-    df = df[df['uyruk'] == 'TC'].copy()
+    if uyruk_filter:
+        df = df[df['uyruk'] == uyruk_filter]
+    df = df.copy()
     if df.empty:
-        st.info("Bu dönem için yerli hisse verisi bulunamadı.")
+        st.info("Bu dönem için bu kapsamda hisse verisi bulunamadı.")
         return
 
-    st.caption("Piyasa değeri **borsapy üzerinden canlı** çekilir (bugünkü değer) — geçmiş "
-               "dönemler için yaklaşık bir referans olarak kullanılmalı, o ayki gerçek piyasa "
-               "değeri değildir. Sadece yerli (BIST) hisseler için hesaplanabilir.")
+    st.caption("Piyasa değeri **canlı** çekilir (bugünkü değer): yerli hisselerde borsapy, yabancı hisselerde "
+               "yfinance (yerel para birimindeki değer güncel kurla TL'ye çevrilir) — geçmiş dönemler için "
+               "yaklaşık bir referans olarak kullanılmalı, o ayki gerçek piyasa değeri değildir.")
     if df['metrik_yaklasik_mi'].any():
         st.caption("ℹ️ Adet verisi olmayan aylarda pay değişimi yerine ham TL değişimi kullanılıyor "
                    "(bkz. 'En Çok Alınan/Satılan' sekmesindeki not).")
@@ -458,7 +496,11 @@ def _render_market_impact(yil, ay):
     candidates = df.reindex(df['siralama_metrigi'].abs().sort_values(ascending=False).index).head(candidate_pool)
 
     with st.spinner(f"{len(candidates)} hisse için piyasa değeri çekiliyor..."):
-        caps = _get_market_caps(tuple(candidates['ticker'].unique()))
+        tc = candidates[candidates['uyruk'] == 'TC']
+        fr = candidates[candidates['uyruk'] == 'FOR'].drop_duplicates('ticker')
+        caps = _get_market_caps(tuple(tc['ticker'].unique())) if len(tc) else {}
+        if len(fr):
+            caps.update(_get_market_caps_foreign(tuple(zip(fr['ticker'], fr['isin']))))
 
     candidates = candidates.copy()
     candidates['market_cap'] = candidates['ticker'].map(caps)
@@ -940,7 +982,9 @@ def _render_kap_import_section():
                                     st.rerun()
 
 
-def display_funds_analysis():
+def display_funds_analysis(scope=None):
+    """scope: 'ALL' | 'TR' | 'FOR' (streamlit_app'in ortak Kapsam seçicisi, tüm sekmelerde aynı); None ise
+    eski davranış: bu sayfanın kendi 'Kapsam' radyosu."""
     st.markdown("### 💰 Fund Flow Analysis")
     st.caption("Aylık fon portföy değişimleri — KAP 'Portföy Dağılım Raporu' verisine dayanır. "
                "Yatırım tavsiyesi değildir.")
@@ -959,13 +1003,17 @@ def display_funds_analysis():
                    "Aktar' bölümünden başlayabilirsin.")
         return
 
-    pc1, pc2 = st.columns([2, 1])
-    with pc1:
+    if scope is None:
+        pc1, pc2 = st.columns([2, 1])
+        with pc1:
+            yil, ay = _period_selector(periods, key="main_period")
+        with pc2:
+            scope_label = st.radio("Kapsam", ["🌍 Tümü", "🇹🇷 Yerli (TR)", "🌎 Yabancı (FOR)"],
+                                    horizontal=True, key="uyruk_filter")
+        uyruk_filter = {"🌍 Tümü": None, "🇹🇷 Yerli (TR)": "TC", "🌎 Yabancı (FOR)": "FOR"}[scope_label]
+    else:
         yil, ay = _period_selector(periods, key="main_period")
-    with pc2:
-        scope_label = st.radio("Kapsam", ["🌍 Tümü", "🇹🇷 Yerli (TR)", "🌎 Yabancı (FOR)"],
-                                horizontal=True, key="uyruk_filter")
-    uyruk_filter = {"🌍 Tümü": None, "🇹🇷 Yerli (TR)": "TC", "🌎 Yabancı (FOR)": "FOR"}[scope_label]
+        uyruk_filter = {"ALL": None, "TR": "TC", "FOR": "FOR"}[scope]
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "📈 En Çok Alınan / Satılan",
@@ -976,11 +1024,7 @@ def display_funds_analysis():
     with tab1:
         _render_top_buys_sells(yil, ay, uyruk_filter)
     with tab2:
-        if uyruk_filter == 'FOR':
-            st.info("Piyasa değeri sadece BIST (yerli) hisseleri için hesaplanabiliyor "
-                    "(borsapy kaynaklı) — 'Yabancı (FOR)' kapsamında gösterilecek bir şey yok.")
-        else:
-            _render_market_impact(yil, ay)
+        _render_market_impact(yil, ay, uyruk_filter)
     with tab3:
         _render_stock_drilldown(uyruk_filter)
     with tab4:
